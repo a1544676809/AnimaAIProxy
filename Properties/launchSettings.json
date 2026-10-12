@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "AnimaAIProxy (Package)": {
+      "commandName": "MsixPackage"
+    },
+    "AnimaAIProxy (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}

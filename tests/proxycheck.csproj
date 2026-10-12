@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- 与应用同一个 TFM 代际（应用是 net10.0-windows10.0.19041.0），
+         刻意不带 -windows 后缀：这里编译的是纯 .NET 逻辑层。
+         它同时是一道**守卫**：哪天 Core/ 或 Vendor/ 里混进了 WinUI 类型，
+         这个工程会当场编译不过，而不是等到搬去别的宿主时才发现。 -->
+    <TargetFramework>net10.0</TargetFramework>
+    <Platforms>x64</Platforms>
+    <AppendPlatformToOutputPath>false</AppendPlatformToOutputPath>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <RootNamespace>AnimaAIProxy.Tests</RootNamespace>
+    <AssemblyName>proxycheck</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 与应用同版本，避免"测试跑过的代码路径和应用实际跑的不是同一套托管依赖"。 -->
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 直接编译真实源文件（不是副本），所以一改就会被测到。
+         用相对路径定位，clone 到任何地方都能构建。 -->
+    <Compile Include="..\Vendor\AnimaCaptioner\*.cs" />
+    <Compile Include="..\Core\*.cs" />
+    <Compile Include="Harness.cs" />
+    <Compile Include="Program.cs" />
+    <Compile Include="Vocab.cs" />
+    <Compile Include="Tools.cs" />
+    <Compile Include="Loop.cs" />
+    <Compile Include="Tokens.cs" />
+    <Compile Include="Merge.cs" />
+  </ItemGroup>
+</Project>

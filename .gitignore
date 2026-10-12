@@ -1,0 +1,10 @@
+# 构建产物
+bin/
+obj/
+.spike/
+*.user
+
+# 本机配置与日志（可能含上游密钥的 DPAPI 密文、令牌哈希）
+config.json
+logs/
+*.log

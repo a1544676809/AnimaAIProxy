@@ -1,0 +1,254 @@
+AnimaAIProxy 回归：all
+
+=== 1. 词库内核（vendored：VocabDb / TagSearch / TagSections） ===
+       词库：vocab.sqlite（113.0 MB）
+       seed：E:\ComfyUI\anima-vocab\seed.json
+       载入耗时 2051 ms
+  ok   标签数 > 30 万                                           True
+  ok   Anima 索引非空
+
+=== 2. ResolveEnglish / ResolveChinese：标签名与中文都能反查 ===
+  ok   ResolveEnglish("1girl") 命中                           "1girl"
+  --   blushing 的状态：alias → blush
+  ok   查不到的写法会如实报空或废弃，而不是编一个出来
+  ok   ResolveEnglish 大小写不敏感                                "1girl"
+  FAIL ResolveChinese("初音未来") 有命中
+       初音未来 → (无)
+
+=== 3. TagSections：归类与 IsKnownTag ===
+  ok   hatsune miku 归到某个大类
+       hatsune miku 的大类 = character / 标题 = 角色
+  ok   IsKnownTag("1girl")                                  True
+  ok   IsKnownTag("definitely_not_a_real_tag_xyzzy")        False
+
+=== 4. TagSearch：搜索与工具结果文本 ===
+  ok   搜 "white dress" 有命中
+  ok   结果条数不超过 ToolLimit                                    True
+  ok   整串命中时 splitMatch 为 false                             False
+       首条：white dress / 白色连衣裙
+  ..   ToToolContent 原文（这条文本会被原样回灌给模型）
+       | query: white dress
+       | matched 3 tag(s). Format: N. tag=<exact tag name> | cn=<Chinese meaning> | section=<category> | posts=<usage count>
+       | 1. tag=white dress | cn=白色连衣裙 | section=一般标签 | posts=460,878
+       | 2. tag=higuchi kaede (white dress) | cn=樋口枫（白色礼服） | section=角色 | posts=14
+       | 3. tag=hatsune miku (white dress) | cn=初音未来（白裙） | section=角色 | posts=10
+       | searches remaining: 2
+  ok   第一行是 query:
+  ok   每行都有 tag= 前缀（模型靠它认标签名的边界）
+  ok   结尾报告剩余次数
+  ok   查不到时命中为空                                             0
+  ok   查不到时如实说没匹配，并提示换词
+  ok   复合中文查询走覆盖兜底能查到东西
+  ok   兜底路径会置 splitMatch                                    True
+       白色蕾丝连衣裙 → white dress, lace-trimmed dress, aerith gainsborough (white floral dress)
+  ok   下划线写法也查得到（词库存的是空格形式）
+
+=== 5. SuspiciousMentions：模型编的标签名会被挑出来 ===
+  ok   只挑出编的那一个                                             1
+  ok   挑出来的正是编的那个                                           "totally_made_up_tag_qq"
+  ok   控制词 best quality 不误报                                 0
+
+=== 工具声明 ===
+  ok   共三个工具                                                3
+  ok   名字都带 danbooru_ 前缀，降低与平台自己的工具撞名的概率
+  ok   每个工具都有 object 参数块
+  ok   每个工具都写了说明（平台不会替我们介绍它）
+  ok   search 的 required 里确实有 query
+  ok   包出来是 type=function                                   "function"
+  ok   函数声明在 function 字段里
+  ok   函数名一致                                                "danbooru_search_tags"
+  ok   search 的说明里明确禁止凭记忆猜标签名
+
+=== 重名让路 ===
+  ok   不撞名时原名下发                                             "danbooru_search_tags"
+  ok   三个都在                                                 3
+  ok   IsOurs 认得自己的名字
+  ok   IsOurs 认不出别人的名字
+  ok   撞名的那两个加了后缀
+  ok   没撞的第三个保持原名
+  ok   让路之后 IsOurs 仍然认得
+  ok   也仍然能派发到正确的语义                                         Search
+  ok   二次撞名时继续让路，不覆盖客户端
+  ok   三个工具一个不少                                             3
+
+=== 工具参数读取（模型的手抖都要接住） ===
+  ok   标准对象                                                 "white dress"
+  ok   裸字符串（整个参数就是一个值）                                      "white dress"
+  ok   没加引号的裸值                                              ""
+  ok   纯文本参数                                                "white dress"
+  ok   字段名写错但只有一个字符串值 → 认它                                  "lace"
+  ok   数组包一层 → 取第一个                                         "lace"
+  ok   数字字段也认                                               "123"
+  ok   中文引号也剥掉                                              "lace"
+  ok   空参数                                                  ""
+  ok   空对象                                                  ""
+  ok   两个字符串字段时不敢猜（宁可为空）                                    ""
+  ok   limit 数字                                             5
+  ok   query 同时取出                                           "lace"
+  ok   limit 缺省用 ToolLimit                                  25
+  ok   limit 写成字符串也认                                        3
+
+=== 工具循环：客户端工具一个不许动 ===
+  ok   只调客户端工具时，上游只被问了一次                                    1
+  ok   客户端的 tool_call 原样保留                                  1
+  ok   保留的正是客户端那个                                           "read_file"
+  ok   finish_reason 保持 tool_calls                          "tool_calls"
+  ok   没有往 content 里塞我们的东西                                  ""
+  ok   我们的工具触发了第二轮上游调用                                      2
+  ok   最终响应里没有任何 tool_call（我们的被摘干净了）                        0
+  FAIL 最终内容是模型的回答                                           "蕾丝对应的标签是 lace。
+
+[tag database lookups already performed by the proxy]
+- 查「lace」→ 25 条
+Resu…"   (期望 "蕾丝对应的标签是 lace。")
+  ok   finish_reason 改回了 stop                               "stop"
+  ok   日志里记了工具调用
+  ok   影子历史里带上了 role:tool 的结果
+  ok   模型名换回了客户端要的那个                                        "client-model"
+  ok   混合场景下上游被问了两次                                         2
+  ok   交还客户端的工具调用恰好一个                                       1
+  ok   交还的是客户端那个而不是我们的                                      "read_file"
+  ok   它的 id 一字不差                                           "call_theirs"
+  ok   finish_reason 仍是 tool_calls（客户端还有活要干）                "tool_calls"
+  ok   客户端原名的工具还在
+  ok   我们让路改用了带后缀的名字
+  ok   工具总数 = 客户端 2 + 我们 3                                  5
+  ok   reasoning_effort 原样透传                                "high"
+  ok   enable_thinking 原样透传                                 True
+  ok   temperature 原样透传                                     0.42
+  ok   top_p 原样透传                                           0.9
+  ok   presence_penalty 原样透传                                1.5
+  ok   response_format 原样透传                                 "json_object"
+  ok   user 原样透传                                            "someone"
+  ok   chat_template_kwargs.enable_thinking 原样              True
+  ok   不认识的未来字段也原样带过去
+  ok   max_tokens 原样透传                                      2048
+  FAIL prompt_tokens 是两轮之和（10+20）                           null   (期望 30)
+  FAIL completion_tokens 是两轮之和（5+7）                         null   (期望 12)
+  FAIL total_tokens 是两轮之和（15+27）                            null   (期望 42)
+  ok   跑满轮数后多问了一次收尾                                         3
+  FAIL 收尾那一轮没有下发任何工具
+  ok   收尾提示里带上了已查到的摘要
+  ok   最终给客户端的仍然是纯回答                                        0
+  ok   上游失败时只问了一次（不重试）                                      1
+  ok   返回体里有 error 对象
+  ok   日志里记了失败
+  ok   客户端原有的系统提示还在（追加而不是替换）
+  ok   我们的工具说明被追加进去了
+  ok   仍然只有一条 system 消息                                     1
+  ok   关掉 AnnounceTools 后不再追加说明
+  ok   注入路径强制按非流式问上游                                        False
+
+=== 响应解析 ===
+  ok   content 取到                                           "你好"
+  ok   reasoning_content 单独取到（不与 content 混）                 "我先想一想"
+  ok   finish_reason 取到                                     "stop"
+  ok   没有工具调用                                               False
+  ok   reasoning 这个字段名也认                                    "另一种字段名"
+  ok   工具调用解析出来                                             1
+  ok   名字对                                                  "read_file"
+  ok   id 对                                                 "c1"
+  ok   arguments 保持原始字符串（不在这里 parse）                        "{"p":1}"
+  ok   没有 choices → null，不猜
+  ok   choices 为空 → null
+  ok   message 缺失 → null
+  ok   content 是 null 也不炸
+
+=== 摘除自有工具调用、保留客户端调用 ===
+  ok   tool_calls 被摘掉
+  ok   finish_reason 改回 stop（否则客户端会等一个不存在的工具）               "stop"
+  ok   只留下客户端那一个                                            1
+  ok   留下的正是客户端的                                            "read_file"
+  ok   finish_reason 保持 tool_calls                          "tool_calls"
+  ok   id 缺失的调用宁可多留也不吃掉                                     1
+
+=== 往 content 里追加（两种 content 形状都要能追加） ===
+  ok   字符串 content 追加成两段                                    "原文
+
+追加的"
+  ok   空 content 直接放追加内容                                    "只有追加"
+  ok   content 缺失时新建                                        "新建"
+  ok   数组 content 追加成了第二个 text 块                            2
+  ok   原有的块没被动                                              "看图说话"
+  ok   追加空串不改动                                              2
+
+=== usage 累加 ===
+  FAIL prompt_tokens 累加                                     null   (期望 30)
+  FAIL completion_tokens 累加                                 null   (期望 12)
+  FAIL total_tokens 累加                                      null   (期望 42)
+  FAIL 不认识的嵌套字段也一并带过（不做白名单）
+  ok   没有任何 usage 时返回 null
+  FAIL 只有一轮时原样                                              null   (期望 7)
+
+=== 模型名回写 ===
+  ok   模型名改成客户端请求用的那个                                       "client-wanted"
+  ok   空名字不覆盖（避免把上游的真名抹成空）                                  "client-wanted"
+
+=== 客户端工具名收集（两种声明形状） ===
+  ok   两种形状都收进来                                             2
+  ok   标准形状的名字对
+  ok   扁平形状的名字对
+  ok   没有 tools 时返回空表                                       0
+
+=== stream 判定 ===
+  ok   stream=true                                          True
+  ok   stream=false                                         False
+  ok   缺省视为非流式                                              False
+  ok   stream 写成字符串不当真                                      False
+
+=== 令牌：生成与校验 ===
+  ok   明文带 aip- 前缀（一眼看出是代理签发的）
+  ok   明文足够长
+  ok   库里不存明文，只存哈希                                          True
+  ok   哈希不是明文
+  ok   正确的令牌能通过
+  ok   通过之后记了一次使用                                           1
+  ok   使用时间被记下
+  ok   错误的令牌不通过
+  ok   空令牌不通过
+  ok   null 不通过
+  ok   前缀一样但后面不同也不通过
+  ok   停用后不再通过
+  ok   空库没有启用中的令牌                                           False
+  ok   空库里什么都通不过
+
+=== 令牌提取：三种常见写法 ===
+  ok   Bearer（OpenAI 标准）                                    "aip-abc"
+  ok   bearer 小写也认                                          "aip-abc"
+  ok   裸令牌                                                  "aip-abc"
+  ok   x-api-key 优先                                         "aip-from-header"
+  ok   都没有 → null                                           null
+  ok   空串 → null                                            null
+
+=== 配置：越界值拉回合法区间 ===
+  ok   端口越界 → 默认                                            48620
+  ok   超时过小 → 下限                                            5
+  ok   轮数越界 → 默认                                            4
+  ok   单次调用上限越界 → 默认                                        12
+  ok   监听范围非法 → local                                       "local"
+  ok   空上游地址 → 有默认值
+  ok   local 时只监听回环                                         "127.0.0.1"
+  ok   ModelMap 不会被清成 null
+  ok   LAN 归一化成小写                                           "lan"
+  ok   lan 时监听所有网卡                                          "0.0.0.0"
+
+=== 模型名映射 ===
+  ok   配了映射就换                                               "deepseek-v4-pro"
+  ok   大小写不敏感                                               "deepseek-v4-pro"
+  ok   没配映射的原样透传（不猜）                                        "some-local-model"
+  ok   空模型名原样                                               ""
+  ok   开了兜底时未映射的走兜底                                         "backup-model"
+  ok   默认不开兜底：静默换模型比报错更难查                                   False
+
+=== 上游密钥（DPAPI） ===
+  ok   没设密钥时明文为空                                            ""
+  ok   没设时 HasUpstreamKey 为假                                False
+  ok   设进去之后能读回来                                            "sk-secret-value-12345"
+  ok   HasUpstreamKey 为真                                    True
+  ok   落盘的是密文而不是明文
+  ok   序列化结果里不含明文密钥（JsonIgnore 生效）
+  ok   但密文在里面
+  ok   能清空                                                  ""
+  ok   清空后 HasUpstreamKey 为假                                False
+
+11 项失败。
