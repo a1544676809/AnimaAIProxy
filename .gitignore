@@ -4,6 +4,10 @@ obj/
 .spike/
 *.user
 
+# IDE 缓存（Visual Studio 会在 .vs/ 下写索引、.suo、文档布局等二进制，
+# 每次打开解决方案都会变，提交进来只会制造无意义的 diff）
+.vs/
+
 # 本机配置与日志（可能含上游密钥的 DPAPI 密文、令牌哈希）
 config.json
 logs/
