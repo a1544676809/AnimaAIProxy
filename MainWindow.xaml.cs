@@ -3,7 +3,6 @@ using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
-using System.Text;
 
 namespace AnimaAIProxy;
 
@@ -77,8 +76,8 @@ public sealed partial class MainWindow : Window
         {
             UpstreamUrlBox.Text = _cfg.UpstreamBaseUrl;
             UpstreamKeyState.Text = _cfg.HasUpstreamKey
-                ? "已设置密钥（DPAPI 加密后存在配置里，明文只在内存里）。"
-                : "未设置密钥。上游不需要密钥时留空即可。";
+                ? "已设置（加密存储）。"
+                : "未设置。上游不需要密钥时留空。";
             TimeoutBox.Value = _cfg.TimeoutSeconds;
             ModelMapBox.Text = string.Join(Environment.NewLine,
                 _cfg.ModelMap.Select(kv => kv.Key + "=" + kv.Value));
@@ -202,7 +201,7 @@ public sealed partial class MainWindow : Window
         {
             ProxyLog.Write("启动失败：" + ex.Message);
             await ShowAsync("启动失败",
-                ex.Message + "\n\n最常见的原因是端口被占用。换一个端口再试。");
+                ex.Message + "\n\n端口被占用是最常见的原因，换一个端口再试。");
         }
         finally
         {
@@ -264,26 +263,24 @@ public sealed partial class MainWindow : Window
             running ? "SystemFillColorSuccessBrush" : "SystemFillColorCriticalBrush"];
         StatusText.Text = running ? "运行中" : "已停止";
 
-        var hint = new StringBuilder();
-        if (running && _server is not null)
-        {
-            hint.Append("接入方看到的 Base URL：").Append(_server.BaseUrl);
-            if (_cfg.BindScope == "local")
-                hint.Append("（只监听回环，外部机器连不上）");
-            else if (_cfg.BindScope == "lan")
-                hint.Append("（局域网内可访问，把 127.0.0.1 换成本机 IP）");
-            else
-                hint.Append("（任意来源都能连，注意这是不安全的）");
-        }
-        else
-        {
-            hint.Append("代理没在跑。启动之后把下面那串 Base URL 填进 agent 平台。");
-        }
-
         BaseUrlText.Text = _server is null
             ? $"http://127.0.0.1:{_cfg.Port}/v1"
             : _server.BaseUrl;
-        HintText.Text = hint.ToString();
+
+        if (running)
+        {
+            HintText.Text = _cfg.BindScope switch
+            {
+                "local" => "把平台的 OpenAI Base URL 填成上面这个地址，API Key 填代理令牌。仅本机可访问。",
+                "lan" => "把平台的 OpenAI Base URL 填成上面这个地址（127.0.0.1 换成本机 IP），API Key 填代理令牌。",
+                _ => "把平台的 OpenAI Base URL 填成上面这个地址，API Key 填代理令牌。当前允许任意来源连接。"
+            };
+        }
+        else
+        {
+            HintText.Text = "启动后把上面这个地址填进 agent 平台的 OpenAI Base URL。";
+        }
+
         UptimeText.Text = running && _server is not null && _server.StartedAtText.Length > 0
             ? "启动于 " + _server.StartedAtText
             : "";
@@ -302,7 +299,17 @@ public sealed partial class MainWindow : Window
         var dp = new Windows.ApplicationModel.DataTransfer.DataPackage();
         dp.SetText(BaseUrlText.Text);
         Windows.ApplicationModel.DataTransfer.Clipboard.SetContent(dp);
-        HintText.Text = "已复制：" + BaseUrlText.Text;
+
+        // 复制反馈落在按钮上，不去覆盖 HintText —— 那是常驻的操作指引，
+        // 被一句一次性的提示顶掉之后，用户下次想看该填什么就得重启界面。
+        CopyBaseUrlButton.Content = "已复制";
+        _ = RestoreCopyButtonAsync();
+    }
+
+    private async Task RestoreCopyButtonAsync()
+    {
+        await Task.Delay(1200);
+        CopyBaseUrlButton.Content = "复制";
     }
 
     // ---------------- 上游 ----------------
@@ -322,7 +329,7 @@ public sealed partial class MainWindow : Window
             {
                 var node = ChatWire.TryParseObject(raw);
                 var count = (node?["data"] as System.Text.Json.Nodes.JsonArray)?.Count ?? 0;
-                UpstreamTestResult.Text = $"通。上游报了 {count} 个模型。";
+                UpstreamTestResult.Text = $"连通，共 {count} 个模型。";
                 ProxyLog.Write($"上游连接测试通过（{count} 个模型）");
             }
             else
@@ -370,8 +377,8 @@ public sealed partial class MainWindow : Window
     {
         var n = _tokens.EnabledCount;
         TokenSummaryText.Text = n == 0
-            ? "⚠ 一枚启用中的令牌都没有，代理会拒绝所有请求。先签发一枚再填进平台。"
-            : $"共 {_tokens.Tokens.Count} 枚，其中 {n} 枚启用中。令牌明文只在签发那一刻显示一次。";
+            ? "⚠ 没有启用中的令牌，代理会拒绝所有请求。请先签发一枚。"
+            : $"共 {_tokens.Tokens.Count} 枚，启用 {n} 枚。令牌明文只在签发时显示一次。";
     }
 
     private async void CreateToken_Click(object sender, RoutedEventArgs e)
@@ -398,8 +405,7 @@ public sealed partial class MainWindow : Window
         var panel = new StackPanel { Spacing = 10 };
         panel.Children.Add(new TextBlock
         {
-            Text = "把下面这串填进 agent 平台的 API Key。它只显示这一次，关掉就再也拿不回来了" +
-                   "（库里存的是哈希，不是明文）。",
+            Text = "填进 agent 平台的 API Key。只显示这一次，库里存的是哈希。",
             TextWrapping = TextWrapping.Wrap
         });
         panel.Children.Add(box);

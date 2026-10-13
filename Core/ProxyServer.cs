@@ -109,10 +109,18 @@ public sealed class ProxyServer : IAsyncDisposable
 
         _app = app;
         _startedAt = DateTimeOffset.Now;
-        ProxyLog.Write($"代理已启动：{BaseUrl}（监听范围 {_cfg.BindScope}，" +
+        ProxyLog.Write($"代理已启动：{BaseUrl}（监听 {ScopeText(_cfg.BindScope)}，" +
                        $"工具注入 {(_cfg.ToolsEnabled ? "开" : "关")}，" +
                        $"令牌 {_tokens.EnabledCount} 枚）");
     }
+
+    /// <summary>把内部的 BindScope 值翻成界面上看得懂的说法。</summary>
+    private static string ScopeText(string scope) => scope switch
+    {
+        "lan" => "局域网",
+        "wan" => "任意来源",
+        _ => "仅本机"
+    };
 
     public async Task StopAsync()
     {
@@ -166,8 +174,8 @@ public sealed class ProxyServer : IAsyncDisposable
         // 是先在代理里生成一枚令牌。
         if (!_tokens.HasEnabled)
         {
-            reject = "代理还没有生成任何令牌，已拒绝所有请求。请在代理界面里生成一枚令牌，" +
-                     "再把它填进 agent 平台的 API Key 里。";
+            reject = "代理尚未签发任何令牌，已拒绝所有请求。请在代理界面签发一枚令牌，" +
+                     "再填进 agent 平台的 API Key。";
             return false;
         }
 
@@ -268,8 +276,8 @@ public sealed class ProxyServer : IAsyncDisposable
         var payload = new JsonObject
         {
             ["service"] = "AnimaAIProxy",
-            ["hint"] = "把 agent 平台的 OpenAI Base URL 指到 " + BaseUrl +
-                       "，API Key 填代理签发的令牌（aip- 开头）。",
+            ["hint"] = "将 agent 平台的 OpenAI Base URL 指向 " + BaseUrl +
+                       "，API Key 填代理签发的令牌。",
             ["endpoints"] = new JsonArray { "/health", "/v1/chat/completions", "/v1/models" }
         };
         return ctx.Response.WriteAsync(ChatWire.ToJson(payload), ctx.RequestAborted);
@@ -281,7 +289,7 @@ public sealed class ProxyServer : IAsyncDisposable
     {
         if (!RemoteAllowed(ctx))
         {
-            ProxyLog.Write($"拒绝来自 {ctx.Connection.RemoteIpAddress} 的连接（BindScope={_cfg.BindScope}）");
+            ProxyLog.Write($"拒绝来自 {ctx.Connection.RemoteIpAddress} 的连接（监听 {ScopeText(_cfg.BindScope)}）");
             await RejectAsync(ctx, "来源地址不在允许的范围内。").ConfigureAwait(false);
             return;
         }
@@ -354,7 +362,7 @@ public sealed class ProxyServer : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            ProxyLog.Write("工具循环异常：" + ex);
+            ProxyLog.WriteException("工具循环异常", ex);
             ctx.Response.StatusCode = StatusCodes.Status502BadGateway;
             ctx.Response.ContentType = "application/json; charset=utf-8";
             await ctx.Response.WriteAsync(ChatWire.ToJson(new JsonObject
@@ -430,7 +438,7 @@ public sealed class ProxyServer : IAsyncDisposable
         // **在日志里标明这是流式路径。** 两条路产生的轮次/执行日志措辞一模一样，
         // 不标的话"这次工具有没有生效"在日志上分不出是哪种请求，
         // 而"客户端要的是流式"恰是历史上工具静默失效的那一种情况。
-        ProxyLog.Write("客户端要的是流式：注入按「正文实时转发 + 工具调用按轮缓冲」处理");
+        ProxyLog.Write("流式请求：正文实时转发，工具调用按轮处理");
 
         StreamLoop.Outcome outcome;
         try
@@ -444,7 +452,7 @@ public sealed class ProxyServer : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            ProxyLog.Write("流式工具循环异常：" + ex);
+            ProxyLog.WriteException("流式工具循环异常", ex);
             // 还没写出任何字节 → 还能如实回一个 502。
             // 已经写出去了 → 状态行早发出去了，只能往流里补一个 error 事件，
             // 否则客户端会一直等一个永远不来的 [DONE]。
@@ -686,16 +694,12 @@ public sealed class ProxyServer : IAsyncDisposable
 /// </summary>
 internal sealed class ProxyLoggerProvider : ILoggerProvider
 {
-    public ILogger CreateLogger(string categoryName) => new ProxyLogger(categoryName);
+    public ILogger CreateLogger(string categoryName) => new ProxyLogger();
 
     public void Dispose() { }
 
     private sealed class ProxyLogger : ILogger
     {
-        private readonly string _category;
-
-        public ProxyLogger(string category) => _category = category;
-
         public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
 
         public bool IsEnabled(LogLevel logLevel) => logLevel >= LogLevel.Warning;
@@ -704,10 +708,11 @@ internal sealed class ProxyLoggerProvider : ILoggerProvider
                                 Exception? exception, Func<TState, Exception?, string> formatter)
         {
             if (!IsEnabled(logLevel)) return;
-            var shortName = _category.Contains('.') ? _category[(_category.LastIndexOf('.') + 1)..] : _category;
+            // 只写正文，不带 "[Warning] Kestrel:" 这种前缀：日志面板是给用户看的，
+            // 级别与内部类名对他没有意义；真要排查时，异常本身已经被
+            // WriteException 拆成"摘要进面板、栈进文件"了。
             var text = formatter(state, exception);
-            if (exception is not null) text += " | " + exception.Message;
-            ProxyLog.Write($"[{logLevel}] {shortName}: {text}");
+            ProxyLog.Write(text, exception?.ToString());
         }
     }
 }

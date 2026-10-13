@@ -222,9 +222,26 @@ public sealed class ToolHost
             sb.Append("warning: this tag exists in the database but has no usage; treat it " +
                       "as unverified.\n");
 
-        summary = $"核对「{tag}」→ {resolved}（{status}）";
+        summary = $"核对「{tag}」→ {resolved}（{StatusText(status)}）";
         return sb.ToString();
     }
+
+    /// <summary>
+    /// 把内核的状态值翻成界面上的说法。
+    ///
+    /// 内核返回的是 <c>anima</c> / <c>valid</c> / <c>retired</c> / <c>unknown</c>
+    /// 这四个英文标识符，它们是给代码看的、不是给人看的。**只在显示这一层翻译**：
+    /// 内核的值原样保留（上面的 status= 行照旧写英文，那是给模型读的协议字段），
+    /// 日志里的摘要才用中文——否则用户会在日志面板上看到一串看不懂的单词。
+    /// </summary>
+    private static string StatusText(string status) => status switch
+    {
+        "anima" => "Anima 常用",
+        "valid" => "有效",
+        "retired" => "已废弃",
+        "unknown" => "无使用记录",
+        _ => status
+    };
 
     /// <summary>
     /// 词库里的中文名是不是**就是**这个词（或者只是多挂了一个括号限定）。

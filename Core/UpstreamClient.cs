@@ -125,7 +125,7 @@ public sealed class UpstreamClient : IUpstream, IDisposable
         }
         catch (Exception ex)
         {
-            ProxyLog.Write("上游请求异常：" + ex);
+            ProxyLog.WriteException("上游请求异常", ex);
             return UpstreamResult.Transport(ex.Message);
         }
     }
@@ -191,7 +191,7 @@ public sealed class UpstreamClient : IUpstream, IDisposable
         }
         catch (Exception ex)
         {
-            ProxyLog.Write("上游流式请求异常：" + ex);
+            ProxyLog.WriteException("上游流式请求异常", ex);
             return StreamStart.Transport(ex.Message);
         }
     }

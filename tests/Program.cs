@@ -9,6 +9,7 @@ namespace AnimaAIProxy.Tests;
 ///     proxycheck stream     # 流式工具循环：正文实时转发、tool_call 分片拼装、不劫持
 ///     proxycheck merge      # 请求体改写：思考字段一律不劫持
 ///     proxycheck tokens     # 代理令牌与鉴权
+///     proxycheck log        # 日志：摘要进界面面板，异常栈只进文件
 ///     proxycheck server     # HTTP 端点：真的起一次 Kestrel，走一遍路由与鉴权
 ///     proxycheck e2e        # 端到端：客户端 → 代理 → 桩上游，含流式分块到达
 ///     proxycheck all        # 上面全部（默认）
@@ -34,6 +35,7 @@ public static class Program
             case "stream": StreamLoopCheck.Run(); break;
             case "merge": Merge.Run(); break;
             case "tokens": Tokens.Run(); break;
+            case "log": LogCheck.Run(); break;
             case "server": Server.Run(); break;
             case "e2e": E2E.Run(args); break;
             case "live": Live.Run(args); break;
@@ -44,12 +46,13 @@ public static class Program
                 StreamLoopCheck.Run();
                 Merge.Run();
                 Tokens.Run();
+                LogCheck.Run();
                 Server.Run();
                 E2E.Run(args);
                 break;
             default:
                 Console.WriteLine("未知的检查项：" + which);
-                Console.WriteLine("可用：vocab | tools | loop | merge | tokens | server | e2e | all | live");
+                Console.WriteLine("可用：vocab | tools | loop | merge | tokens | log | server | e2e | all | live");
                 return 2;
         }
 

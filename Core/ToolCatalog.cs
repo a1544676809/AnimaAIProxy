@@ -196,7 +196,7 @@ public static class ToolCatalog
             kinds[name] = kind;
             decls.Add(decl with { Name = name });
             if (!string.Equals(name, decl.Name, StringComparison.Ordinal))
-                ProxyLog.Write($"工具重名：{decl.Name} 已被客户端占用，本次改用 {name}");
+                ProxyLog.Write($"工具重名：{decl.Name} 已被接入方占用，本次改用 {name}");
         }
 
         return new InjectionPlan(decls, kinds);

@@ -29,9 +29,22 @@ public static class ProxyLog
     /// <summary>有新日志时触发，供 UI 订阅。参数是已经格式化好的整行。</summary>
     public static event Action<string>? Written;
 
-    public static void Write(string message)
+    public static void Write(string message) => Write(message, null);
+
+    /// <summary>
+    /// 写一行日志。<paramref name="detail"/> 是**只进文件、不进界面面板**的补充信息。
+    ///
+    /// 存在的理由是异常栈：调用栈对排查有用，但它有几十行、全是
+    /// `at System...` 这种用户看不懂的东西。整条灌进实时日志面板，会把
+    /// 面板冲满、把真正有用的三两行挤出去——而用户看到的界面就该是
+    /// "出错了，原因是这个"。所以面板拿摘要、文件拿全文。
+    /// </summary>
+    public static void Write(string message, string? detail)
     {
         var line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + message;
+
+        var hasDetail = !string.IsNullOrEmpty(detail);
+        var full = hasDetail ? line + Environment.NewLine + detail : line;
 
         lock (Gate)
         {
@@ -48,11 +61,15 @@ public static class ProxyLog
                 Directory.CreateDirectory(Dir);
                 var fi = new FileInfo(FilePath);
                 if (fi.Exists && fi.Length > MaxBytes) Rotate();
-                File.AppendAllText(FilePath, line + Environment.NewLine, new UTF8Encoding(false));
+                File.AppendAllText(FilePath, full + Environment.NewLine, new UTF8Encoding(false));
             }
         }
         catch { /* 日志本身绝不能把代理拖垮 */ }
     }
+
+    /// <summary>记一次异常：摘要进界面，完整调用栈只进文件。</summary>
+    public static void WriteException(string context, Exception ex) =>
+        Write(context + "：" + ex.Message, ex.ToString());
 
     /// <summary>把 proxy.log 挪成 proxy.1.log，其余依次后移，超出的删掉。</summary>
     private static void Rotate()

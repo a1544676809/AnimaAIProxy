@@ -40,7 +40,7 @@ public sealed class VocabService
         if (_db is not null)
             return $"已载入 {Path.GetFileName(_loadedFrom)}（标签 {_db.TagCount:N0}）";
         if (_lastError.Length > 0) return _lastError;
-        return "尚未载入";
+        return "未载入";
     }
 
     /// <summary>
@@ -86,9 +86,11 @@ public sealed class VocabService
                 _db = db;
                 _loadedFrom = cfg.VocabDbPath;
                 _lastError = "";
-                ProxyLog.Write($"词库已载入：{cfg.VocabDbPath} " +
-                               $"tags={db.TagCount} anima={db.AnimaCount} alias={db.AliasCount} " +
-                               $"耗时={sw.ElapsedMilliseconds}ms");
+                ProxyLog.Write($"词库已载入（标签 {db.TagCount:N0}，别名 {db.AliasCount:N0}），" +
+                               $"耗时 {sw.ElapsedMilliseconds} ms",
+                               $"path={cfg.VocabDbPath} tags={db.TagCount} " +
+                               $"anima={db.AnimaCount} alias={db.AliasCount} " +
+                               $"elapsed={sw.ElapsedMilliseconds}ms");
                 return _db;
             }
             catch (Exception ex)

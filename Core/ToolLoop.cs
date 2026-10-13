@@ -101,7 +101,7 @@ public sealed class ToolLoop
             var parsed = res.Body is null ? null : ChatWire.Parse(res.Body);
             if (parsed is null)
             {
-                log.Add("上游响应结构不对（没有 choices/message）");
+                log.Add("上游返回的内容不完整，缺少回答正文");
                 return new Outcome(res.Body ?? ErrorResponse(res), log, true, upstreamCalls, 502);
             }
 
@@ -121,13 +121,13 @@ public sealed class ToolLoop
             var theirs = parsed.ToolCalls.Where(c => !plan.IsOurs(c.Name)).ToList();
 
             log.Add($"第 {upstreamCalls} 轮：调用 {parsed.ToolCalls.Count} 个" +
-                    $"（我们 {mine.Count} / 客户端 {theirs.Count}）");
+                    $"（词库 {mine.Count} / 接入方 {theirs.Count}）");
 
             // 一个我们的都没有 → 全是客户端的 → 原样回给客户端，循环结束。
             // 这是最常见的情况：模型在用它自己那套工具干活，我们只是路过。
             if (mine.Count == 0)
             {
-                log.Add("没有我们的工具调用，原样交还客户端");
+                log.Add("没有词库工具调用，原样交还接入方");
                 var asIs = res.Body!;
                 Finish(asIs, body, usageResponses, parsed, collected, log);
                 return new Outcome(asIs, log, true, upstreamCalls, 200);
@@ -252,7 +252,7 @@ public sealed class ToolLoop
             // 用**名字**判定而不是这一轮的 plan：收尾路径上的 plan 已经换成空集了，
             // 而这一轮响应的身份必须按它当时下发的名字来认。
             ChatWire.KeepOnlyToolCalls(response, theirs.Select(c => c.Id).ToList());
-            log.Add($"摘除 {mine.Count} 个代理自有工具调用，保留 {theirs.Count} 个客户端调用");
+            log.Add($"摘除 {mine.Count} 个词库工具调用，保留 {theirs.Count} 个接入方调用");
         }
 
         // 把我们查到的东西写进 content，让它跟着客户端自己的对话历史走。

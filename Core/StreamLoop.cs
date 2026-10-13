@@ -177,13 +177,13 @@ public sealed class StreamLoop
                 }
 
                 _log.Add($"第 {_upstreamCalls} 轮：调用 {calls.Count} 个" +
-                         $"（我们 {mine.Count} / 客户端 {theirs.Count}）");
+                         $"（词库 {mine.Count} / 接入方 {theirs.Count}）");
 
                 // ---- 收尾轮：不再执行，也不再把我们的调用交出去 ----
                 if (_wrappingUp)
                 {
                     if (mine.Count > 0)
-                        _log.Add($"收尾轮里模型仍调用了 {mine.Count} 个代理工具，已摘除");
+                        _log.Add($"收尾轮里模型仍调用了 {mine.Count} 个词库工具，已摘除");
 
                     if (theirs.Count > 0)
                     {
@@ -204,7 +204,7 @@ public sealed class StreamLoop
                 // 正文此刻已经流过去了，这里补上工具调用与 finish_reason。
                 if (mine.Count == 0)
                 {
-                    _log.Add("没有我们的工具调用，原样交还客户端");
+                    _log.Add("没有词库工具调用，原样交还接入方");
                     await CloseAsync(round.FinishReason.Length > 0 ? round.FinishReason : "tool_calls", calls)
                         .ConfigureAwait(false);
                     return Completed();

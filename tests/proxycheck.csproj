@@ -49,6 +49,7 @@
     <Compile Include="Stream.cs" />
     <Compile Include="Tokens.cs" />
     <Compile Include="Merge.cs" />
+    <Compile Include="LogCheck.cs" />
     <Compile Include="Server.cs" />
     <Compile Include="E2E.cs" />
     <!-- 要联网、要真密钥、花真 token，所以不进 all；见 Program.cs 的说明。 -->
