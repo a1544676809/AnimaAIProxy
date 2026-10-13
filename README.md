@@ -59,7 +59,7 @@
   - `ChatWire`（请求/响应读写） / `ToolLoop`（透明工具循环） / `UpstreamClient`
   - `ProxyServer`（Kestrel 端点、令牌鉴权、来源过滤、流式透传）
 - `Vendor/AnimaCaptioner/` —— 从 [AnimaCaptioner] 搬入的词库内核（零 WinUI / Windows API 引用）
-- `tests/` —— `net8.0` 纯 .NET 回归工程。它同时是一道**守卫**：Core/ 或 Vendor/ 一旦混进 WinUI 类型就编译不过
+- `tests/` —— `net10.0` 纯 .NET 回归工程。它同时是一道**守卫**：Core/ 或 Vendor/ 一旦混进 WinUI 类型就编译不过（TFM 代际必须与应用的 `net10.0-windows…` 保持一致，见文末「构建取舍」）
 - `docs/` —— 上游复用面的技术勘察报告（LlmClient、VocabDb）
 
 ## 回归测试
@@ -91,7 +91,7 @@ dotnet run --project tests\proxycheck.csproj all
 ```powershell
 # 应用（WinUI）。必须显式给平台，否则 MSIX 打包会拒绝 AnyCPU
 dotnet build AnimaAIProxy.csproj -p:Platform=x64
-bin\x64\Debug\net8.0-windows10.0.19041.0\win-x64\AnimaAIProxy.exe
+bin\x64\Debug\net10.0-windows10.0.19041.0\win-x64\AnimaAIProxy.exe
 
 # 回归（快得多，且不需要 Windows SDK）
 dotnet build tests\proxycheck.csproj
@@ -99,6 +99,14 @@ dotnet run --project tests\proxycheck.csproj all
 ```
 
 ### 构建取舍：非打包 + 全框架依赖（输出 42 MB）
+
+**TFM 是 `net10.0-windows10.0.19041.0`，与 AnimaCaptioner 同代。** 这两个工程的
+TFM 必须一起看：`tests/proxycheck.csproj` 是 `net10.0`（不带 `-windows`），它同时
+充当守卫。**两边代际必须相等**——这里曾一度出现应用 `net10.0`、测试 `net8.0`
+的错配（低两代），后果是 Core/ 里用 net10 API 测试照样全过、应用却编译不过，
+守卫静默失效。改 TFM 时两个文件一起改。相关的包版本也随之在 net10 线上：
+`Microsoft.Data.Sqlite` 10.0.12（与 AnimaCaptioner 同版）、
+`H.NotifyIcon.WinUI` 2.4.1（其 lib 只有 `net10.0-windows`，正是本线）。
 
 **以非打包（unpackaged）方式运行；`.NET` 与 `Windows App SDK` 都走框架依赖。**
 
@@ -123,7 +131,7 @@ dotnet run --project tests\proxycheck.csproj all
   `SemanticIndex.AiFabric` 3.8 + `Windows.Search` 3.3 + …），而本代理一个 API 都不调它们。
 
   代价与 AnimaCaptioner 同一取舍：目标机需要
-  **Windows App Runtime 2.x（2.5.1）+ .NET 8 Desktop Runtime**。
+  **Windows App Runtime 2.x（2.5.1）+ .NET 10 Desktop Runtime**。
   要发到没装运行时的机器上，把 `WindowsAppSDKSelfContained` 改回 `true` 即可，
   代码一行都不用改，代价是输出目录回到约 156 MB。
 
@@ -138,7 +146,7 @@ dotnet run --project tests\proxycheck.csproj all
   （`_SuppressWindowsMLNativeCopyLocalNative` 只堵了 build 那条资产拷贝路径）。
   症状是"build 42 MB、publish 81 MB"。csproj 里的
   `DropUnusedWindowsMLPayloadFromPublish` 按**元数据**（`AssetType=native` +
-  `NuGetPackageId`）而非文件名剔除，发布目录因此稳定在 **59 文件 / 42.1 MB**。
+  `NuGetPackageId`）而非文件名剔除，发布目录因此稳定在 **58 文件 / 42.1 MB**。
   这个 target 也按同一套标准验证过**确实在干活**：把它的两个钩子同时改名使其失效后发布为
   62 文件 / 81.5 MB（`onnxruntime.dll` 20.66 + `DirectML.dll` 17.83 回来了）。
 
@@ -157,7 +165,7 @@ Kestrel 端点与鉴权、WinUI 外壳（启停 / 上游 / 工具注入 / 监听
 `WM_CLOSE` 验证过），退出时端口正常释放。
 
 **发布产物同样实测可运行**（不只是 `build` 能跑）：`dotnet publish -c Release -r win-x64
--p:Platform=x64` 产出 59 文件 / **42.1 MB**，直接启动该产物得 `MainWindowHandle` 非 0、
+-p:Platform=x64` 产出 58 文件 / **42.1 MB**，直接启动该产物得 `MainWindowHandle` 非 0、
 `/health` 正常、未鉴权 `/v1/models` 得 401；`Microsoft.UI.Xaml.dll` 等确认从已安装的
 WindowsAppRuntime 2.5.1 加载。
 
@@ -167,7 +175,7 @@ WindowsAppRuntime 2.5.1 加载。
 **已验证的关键风险**：
 
 - Kestrel 可在 WinUI 进程内运行并被外部客户端访问（含 SSE 回流）。
-- 词库内核在纯 `net8.0`（不带 `-windows`）下编译并查询真实 113 MB 词库成功。
+- 词库内核在纯 `net10.0`（不带 `-windows`）下编译并查询真实 113 MB 词库成功。
 
 ## 词库中文解析的一个已知边界
 
