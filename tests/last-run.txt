@@ -1,9 +1,14 @@
+# 手工留存的回归快照（**不是自动生成的** —— 没有任何代码会写这个文件）。
+# 重新生成：dotnet run --project tests\proxycheck.csproj all
+# 用途：给手上没有 113 MB 真实词库的人看一遍带真库的输出长什么样。
+# 真库路径：E:\ComfyUI\anima-vocab\vocab.sqlite（从 AnimaCaptioner 的 settings.json 借）
+# 没有词库时第 1/2/6 节会跳过并以退出码 2 结束（= 没能验证，不等于通过）。
 AnimaAIProxy 回归：all
 
 === 1. 词库内核（vendored：VocabDb / TagSearch / TagSections） ===
        词库：vocab.sqlite（113.0 MB）
        seed：E:\ComfyUI\anima-vocab\seed.json
-       载入耗时 2051 ms
+       载入耗时 1219 ms
   ok   标签数 > 30 万                                           True
   ok   Anima 索引非空
 
@@ -12,8 +17,11 @@ AnimaAIProxy 回归：all
   --   blushing 的状态：alias → blush
   ok   查不到的写法会如实报空或废弃，而不是编一个出来
   ok   ResolveEnglish 大小写不敏感                                "1girl"
-  FAIL ResolveChinese("初音未来") 有命中
-       初音未来 → (无)
+  ok   裸形式查不到（库里存的是 `初音未来（VOCALOID）`）
+  ok   连括号一起打也查不到——character 在 JunkCategories 里，内核主动拒
+       ResolveChinese(初音未来（VOCALOID）) → (无) / wrong-category
+  ok   非 junk 类别的括号限定形式能精确命中                                "bow (weapon)"
+  ok   Search 按中文前缀能找到人物——模型查人物走的就是这条路
 
 === 3. TagSections：归类与 IsKnownTag ===
   ok   hatsune miku 归到某个大类
@@ -47,6 +55,17 @@ AnimaAIProxy 回归：all
   ok   只挑出编的那一个                                             1
   ok   挑出来的正是编的那个                                           "totally_made_up_tag_qq"
   ok   控制词 best quality 不误报                                 0
+
+=== 6. 工具层的中文解析回落（补上内核的括号限定缺口） ===
+  ok   danbooru_resolve_tag 能解析裸形式「弓」（内核落空 → 回落 Search）
+       resolve_tag(弓) → 核对「弓」→ bow (weapon)（anima）
+  ok   「箭头」→ arrow (symbol)
+       resolve_tag(箭头) → 核对「箭头」→ arrow (symbol)（anima）
+  ok   `少女` 仍是 NOT FOUND（回落让内核裁类别，不吃角色标签）
+  ok   前缀相似不算命中（`初音未` 仍是 NOT FOUND）
+  ok   人物名与内核保持一致（NOT FOUND），并把模型引向 search
+  ok   没有退而求其次挑一个冷门同名变体（不许变成 hatsune miku (cosplay)）
+  ok   英文标签仍然照常解析
 
 === 工具声明 ===
   ok   共三个工具                                                3
@@ -96,11 +115,7 @@ AnimaAIProxy 回归：all
   ok   没有往 content 里塞我们的东西                                  ""
   ok   我们的工具触发了第二轮上游调用                                      2
   ok   最终响应里没有任何 tool_call（我们的被摘干净了）                        0
-  FAIL 最终内容是模型的回答                                           "蕾丝对应的标签是 lace。
-
-[tag database lookups already performed by the proxy]
-- 查「lace」→ 25 条
-Resu…"   (期望 "蕾丝对应的标签是 lace。")
+  ok   最终内容是模型的回答                                           "蕾丝对应的标签是 lace。"
   ok   finish_reason 改回了 stop                               "stop"
   ok   日志里记了工具调用
   ok   影子历史里带上了 role:tool 的结果
@@ -110,6 +125,7 @@ Resu…"   (期望 "蕾丝对应的标签是 lace。")
   ok   交还的是客户端那个而不是我们的                                      "read_file"
   ok   它的 id 一字不差                                           "call_theirs"
   ok   finish_reason 仍是 tool_calls（客户端还有活要干）                "tool_calls"
+  ok   混合场景下把已查到的结果写回 content（客户端会带着历史再回来）
   ok   客户端原名的工具还在
   ok   我们让路改用了带后缀的名字
   ok   工具总数 = 客户端 2 + 我们 3                                  5
@@ -123,11 +139,12 @@ Resu…"   (期望 "蕾丝对应的标签是 lace。")
   ok   chat_template_kwargs.enable_thinking 原样              True
   ok   不认识的未来字段也原样带过去
   ok   max_tokens 原样透传                                      2048
-  FAIL prompt_tokens 是两轮之和（10+20）                           null   (期望 30)
-  FAIL completion_tokens 是两轮之和（5+7）                         null   (期望 12)
-  FAIL total_tokens 是两轮之和（15+27）                            null   (期望 42)
+  ok   prompt_tokens 是两轮之和（10+20）                           30
+  ok   completion_tokens 是两轮之和（5+7）                         12
+  ok   total_tokens 是两轮之和（15+27）                            42
   ok   跑满轮数后多问了一次收尾                                         3
-  FAIL 收尾那一轮没有下发任何工具
+  ok   收尾那一轮不再下发我们自己的工具（再带一次它多半还会继续调）
+  ok   收尾那一轮客户端的工具原样保留（那是接入方的能力，不是我们的）
   ok   收尾提示里带上了已查到的摘要
   ok   最终给客户端的仍然是纯回答                                        0
   ok   上游失败时只问了一次（不重试）                                      1
@@ -173,12 +190,12 @@ Resu…"   (期望 "蕾丝对应的标签是 lace。")
   ok   追加空串不改动                                              2
 
 === usage 累加 ===
-  FAIL prompt_tokens 累加                                     null   (期望 30)
-  FAIL completion_tokens 累加                                 null   (期望 12)
-  FAIL total_tokens 累加                                      null   (期望 42)
-  FAIL 不认识的嵌套字段也一并带过（不做白名单）
+  ok   prompt_tokens 累加                                     30
+  ok   completion_tokens 累加                                 12
+  ok   total_tokens 累加                                      42
+  ok   不认识的嵌套字段也一并带过（不做白名单）
   ok   没有任何 usage 时返回 null
-  FAIL 只有一轮时原样                                              null   (期望 7)
+  ok   只有一轮时原样                                              7
 
 === 模型名回写 ===
   ok   模型名改成客户端请求用的那个                                       "client-wanted"
@@ -251,4 +268,5 @@ Resu…"   (期望 "蕾丝对应的标签是 lace。")
   ok   能清空                                                  ""
   ok   清空后 HasUpstreamKey 为假                                False
 
-11 项失败。
+全部通过。
+

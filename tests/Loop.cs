@@ -204,6 +204,13 @@ public static class Loop
             Harness.Eq("finish_reason 仍是 tool_calls（客户端还有活要干）",
                        ChatWire.GetString((JsonObject)result.Response["choices"]![0]!, "finish_reason"),
                        "tool_calls");
+
+            // CarryFindings 的**正向**验证：这一轮客户端还有活要干、一定会带着自己的
+            // 历史再回来，所以必须把已查到的结果写进 content，否则模型下一轮看不见
+            // 我们查过什么，只好重查。上面"最终内容是模型的回答"那条钉的是它的反面。
+            Harness.True("混合场景下把已查到的结果写回 content（客户端会带着历史再回来）",
+                         (parsed.Content ?? "").Contains("already performed by the proxy",
+                                                         StringComparison.Ordinal));
         }
 
         // ---------- 4. 我们的工具名被客户端占用了 → 让路 + 仍能识别 ----------
@@ -293,8 +300,23 @@ public static class Loop
             var result = loop.RunAsync(ClientBody(), "tok", CancellationToken.None).GetAwaiter().GetResult();
 
             Harness.Eq("跑满轮数后多问了一次收尾", up.Calls, 3);
-            Harness.True("收尾那一轮没有下发任何工具",
-                         up.Received[2]["tools"] is null or JsonArray { Count: 0 });
+
+            // 收尾那一轮只关**我们自己的**工具，客户端的原样留着。
+            //
+            // 这条曾经写成"一个工具都不下发"，与代码里的论证相反。定夺的结果是
+            // 代码对、断言错：客户端的工具是接入方的能力，我们没有资格因为自己的
+            // 轮数用完就把它一起关掉——那会让客户端在"模型本该调它工具"的时刻收到
+            // 一个纯文本回答，它的 agent 就断在这一步。而收尾提示里那句
+            // "You have no more tool calls available" 说的是**我们**的工具没了，
+            // 一个都不发会让这句话变成谎话（模型看得见工具列表）。
+            var wrapNames = (up.Received[2]["tools"] as JsonArray)?
+                .Select(t => ChatWire.GetString(t!["function"] as JsonObject, "name"))
+                .ToList() ?? new List<string>();
+
+            Harness.True("收尾那一轮不再下发我们自己的工具（再带一次它多半还会继续调）",
+                         !wrapNames.Any(n => n.StartsWith("danbooru_", StringComparison.Ordinal)));
+            Harness.True("收尾那一轮客户端的工具原样保留（那是接入方的能力，不是我们的）",
+                         wrapNames.Contains("read_file"));
             Harness.True("收尾提示里带上了已查到的摘要",
                          up.Received[2]["messages"]!.AsArray().Any(m =>
                              (ChatWire.GetString(m as JsonObject, "content")).Contains("lace")));

@@ -192,7 +192,16 @@ public static class ChatWire
             total ??= new JsonObject();
             foreach (var kv in u)
             {
-                if (kv.Value is not JsonValue val) continue;
+                // 嵌套对象 / 数组（`prompt_tokens_details`、`completion_tokens_details`
+                // 之类）：跨轮相加没有意义（"缓存命中数"加起来是什么？），所以不加，
+                // 但也**绝不能让它消失**——客户端可能靠它做统计或计费，而字段静默
+                // 消失是不会报错的。原样带过第一轮那一份。
+                if (kv.Value is not JsonValue val)
+                {
+                    if (total[kv.Key] is null) total[kv.Key] = kv.Value?.DeepClone();
+                    continue;
+                }
+
                 if (TryLong(val, out var n))
                 {
                     var prev = total[kv.Key] is JsonValue pv && TryLong(pv, out var p) ? p : 0L;
@@ -200,6 +209,7 @@ public static class ChatWire
                 }
                 else if (total[kv.Key] is null)
                 {
+                    // 不是数字、也不是容器（字符串、布尔、null）：加不了，原样带过。
                     total[kv.Key] = val.DeepClone();
                 }
             }
@@ -216,17 +226,26 @@ public static class ChatWire
     /// token 数（几乎总是 int）会被判成"不是数字"，于是累加静默退化成
     /// "保留第一轮的值"——而 usage 少报的症状是用户拿它对不上上游账单，
     /// 没有任何报错。这条是被离线回归抓出来的。
+    ///
+    /// 浮点只在**整值**时才算数：<c>42.0</c> 是 42，<c>0.42</c> 不是 0。
+    /// 把 0.42 当成 0 会让"这个字段没有值"和"这个字段的值是 0"看起来一样。
     /// </summary>
     private static bool TryLong(JsonValue v, out long n)
     {
         if (v.TryGetValue<int>(out var i)) { n = i; return true; }
         if (v.TryGetValue<long>(out var l)) { n = l; return true; }
-        if (v.TryGetValue<double>(out var d)) { n = (long)d; return true; }
-        if (v.TryGetValue<decimal>(out var m)) { n = (long)m; return true; }
         if (v.TryGetValue<short>(out var s)) { n = s; return true; }
+        if (v.TryGetValue<byte>(out var b)) { n = b; return true; }
+        if (v.TryGetValue<double>(out var d) && IsWhole(d)) { n = (long)d; return true; }
+        if (v.TryGetValue<decimal>(out var m) && IsWhole(m)) { n = (long)m; return true; }
         n = 0;
         return false;
     }
+
+    private static bool IsWhole(double d) =>
+        !double.IsNaN(d) && !double.IsInfinity(d) && Math.Floor(d) == d;
+
+    private static bool IsWhole(decimal m) => decimal.Truncate(m) == m;
 
     // ---------------- 安全取值 ----------------
 
@@ -250,11 +269,24 @@ public static class ChatWire
         return null;
     }
 
+    /// <summary>
+    /// 取一个整数字段。
+    ///
+    /// 走的是与 usage 累加同一套类型识别（<see cref="TryLong"/>），而不是
+    /// 只试 <c>int</c>。这不是洁癖：我们自己写回去的 usage 是 <c>long</c>，
+    /// 只试 int 会让"刚累加好的 token 数"在下一次读出来时变成 null——
+    /// 同一份数据，写进去读不出来。
+    /// </summary>
     public static int? GetInt(JsonObject? obj, string key)
     {
         if (obj is null) return null;
-        if (obj[key] is JsonValue v && v.TryGetValue<int>(out var n)) return n;
-        return null;
+        if (obj[key] is not JsonValue v) return null;
+        if (!TryLong(v, out var n)) return null;
+        // 夹住而不是回绕：token 数不可能到这个量级，但真出现了也宁可报一个
+        // 极大值，不要因为溢出报出一个负数。
+        if (n > int.MaxValue) return int.MaxValue;
+        if (n < int.MinValue) return int.MinValue;
+        return (int)n;
     }
 
     public static string FirstNonEmpty(params string[] values)

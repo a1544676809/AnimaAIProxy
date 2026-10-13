@@ -127,6 +127,64 @@ public sealed class ToolHost
         var en = db.ResolveEnglish(tag);
         var cn = en.Tag is null ? db.ResolveChinese(tag) : new ResolveResult(null, "");
 
+        // 中文的括号限定形式回落。
+        //
+        // `ResolveChinese` 的精确键只认库里逐字存的那一个中文名，而词库
+        // 331,836 条中文名里有 **163,154 条（49%）带「（限定词）」后缀**：
+        // `弓（武器）`、`箭头（符号）`、`照片（媒介）`、`嘘（手势）`……
+        // 用户和 agent 不会连着括号一起打，于是最常用的那个写法反而查不到。
+        // 实测"裸形式不是精确键、且类别不是 junk"的条目有 **11,138 条**，
+        // 就是这一层要补的那一批。
+        //
+        // 修在**这一层而不是 vendored 的 VocabDb 里**：内核的
+        // "只允许词库键 ⊂ 用户输入"是它明确记着代价的决定，而 `Search` 那条路
+        // 本来就是好的（`cn.StartsWith(q)` 命中）。让内核保持与上游逐字一致、
+        // 把回落放在我们自己的解析工具里，既补上了这个洞，又不用去动一个
+        // 我们已经承诺"只搬运不修改"的依赖。
+        //
+        // 回落**必须收窄，而且要由内核自己来裁**：
+        //
+        //   * 只接受"中文名与输入完全相同"或"中文名 = 输入 + 括号限定"。
+        //     放宽到任意 `Search` 命中，就等于把内核特意堵上的坑重新挖开，
+        //     而且是挖在更外层（实测 `Search("少女")` 的前几条是
+        //     `少女前线`、`少女与战车`，全都要拒掉）。
+        //   * 就算形状对上了，也把**库里那个完整中文名**交回 `ResolveChinese`
+        //     再审一次；它认得，才说明这一条不在它的 JunkCategories
+        //     （artist / character / copyright / 原神角色）里。
+        //
+        //     这一手是必须的，不是保险：`少女（mokufuu）` 和 `弓（武器）`
+        //     的形状**一模一样**，差别只在类别（character vs general）。
+        //     实测不审类别的话 `少女` 会解析到 `girl (mokufuu)` ——
+        //     正是内核注释里点名的那个坑。
+        //
+        //     不自己抄一份类别黑名单：抄了就会和上游走偏，而"这个词库认不认
+        //     这个名字"本来就该由词库自己回答。
+        //   * 而且**只认用得最多的那一个同名变体**：形状对上的第一条如果内核
+        //     不肯认，就到此为止，不去挑一个更冷门的兄弟。这一条也是被实测逼
+        //     出来的——`初音未来` 的头号变体 `初音未来（VOCALOID）`（146,936 帖）
+        //     是 character 被拒，若继续往后挑就会挑到 `初音未来（Cosplay）`
+        //     （2,728 帖，category=general，能过审），于是"初音未来"被解析成
+        //     `hatsune miku (cosplay)`。那比查不到更糟：查不到时模型会去 search，
+        //     而一个**自信的错答案**会被它直接拿去用。
+        //
+        // 触发条件含 `fuzzy`：内核那条模糊路在中文里经常给出无关的短词，
+        // 而"同名或同名+括号限定"指向的是**同一个名字**，可信度严格更高。
+        if (en.Tag is null && (cn.Tag is null || cn.Status == "fuzzy"))
+        {
+            // limit 给大：Search 本身要线性扫完 33 万行，多返回一些几乎不要钱，
+            // 而少返回会让"最佳候选恰好排在 25 名之后"变成随机失败。
+            foreach (var hit in db.Search(tag, 200))
+            {
+                if (!IsSameNameOrQualified(hit.Cn, tag)) continue;
+
+                // Search 的排序是"分数升序 → 帖子数降序"，所以形状对上的第一条
+                // 就是这个同名变体里用得最多的那个。
+                var verdict = db.ResolveChinese(hit.Cn);
+                if (verdict.Tag is not null) cn = new ResolveResult(verdict.Tag, "qualified");
+                break;
+            }
+        }
+
         var sb = new StringBuilder();
         sb.Append("input: ").Append(tag).Append('\n');
 
@@ -166,6 +224,30 @@ public sealed class ToolHost
 
         summary = $"核对「{tag}」→ {resolved}（{status}）";
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// 词库里的中文名是不是**就是**这个词（或者只是多挂了一个括号限定）。
+    ///
+    /// 只认这两种写法，是因为它们指向同一个名字：`弓（武器）` 和 `弓` 说的是
+    /// 同一个概念，括号只是消歧后缀。放宽到任意包含就会把 `少女` 解析到
+    /// `少女前线` 之类的作品标签上——vendored 的 <c>ResolveChinese</c> 里
+    /// 明确记着这个坑，这里不能换个地方重新踩进去。
+    ///
+    /// **形状对上不等于可以用**：`少女（mokufuu）` 的形状和 `弓（武器）`
+    /// 完全一样。能不能用由 <see cref="ResolveChinese"/> 自己裁，见调用处。
+    ///
+    /// 半角括号也认（库里只有 44 条，但模型和用户都可能打出来）。
+    /// </summary>
+    private static bool IsSameNameOrQualified(string cn, string input)
+    {
+        if (cn.Length == 0) return false;
+        if (string.Equals(cn, input, StringComparison.Ordinal)) return true;
+        if (cn.Length <= input.Length) return false;
+        if (!cn.StartsWith(input, StringComparison.Ordinal)) return false;
+
+        var rest = cn[input.Length..];
+        return rest.StartsWith('（') || rest.StartsWith('(');
     }
 
     // ---------------- danbooru_scan_text ----------------

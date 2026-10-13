@@ -1,3 +1,4 @@
+using AnimaAIProxy.Core;
 using AnimaCaptioner.Core;
 
 namespace AnimaAIProxy.Tests;
@@ -83,9 +84,31 @@ public static class Vocab
 
         Harness.Eq("ResolveEnglish 大小写不敏感", vocab.ResolveEnglish("1GIRL").Tag, "1girl");
 
-        var cn = vocab.ResolveChinese("初音未来");
-        Harness.True("ResolveChinese(\"初音未来\") 有命中", cn.Tag is not null);
-        Harness.Info("初音未来 → " + (cn.Tag ?? "(无)"));
+        // 中文名的两条现状，都必须如实钉住——它们合起来决定了代理的中文策略。
+        //
+        // (1) 精确键只认库里逐字存的那一个名字。331,836 条中文名里有 163,154 条
+        //     （49%）带「（限定词）」后缀，裸形式查不到：`初音未来` 精确匹配 0 条。
+        // (2) 就算连着括号一起打，character / artist / copyright 这些类别也会被
+        //     JunkCategories 主动拒掉——`初音未来（VOCALOID）` 正是 character。
+        //
+        // 两条合起来：内核的中文路对**人物 / 作品名**整体是不可用的。这是它的
+        // 设计而非缺陷（它服务于打标时的自动转换，不该把场景词接到角色标签上），
+        // 所以代理**不去绕过它**。模型要查人物就走 danbooru_search_tags，
+        // 那条路（cn.StartsWith）是好的。
+        var bare = vocab.ResolveChinese("初音未来");
+        Harness.True("裸形式查不到（库里存的是 `初音未来（VOCALOID）`）", bare.Tag is null);
+
+        var qualified = vocab.ResolveChinese("初音未来（VOCALOID）");
+        Harness.True("连括号一起打也查不到——character 在 JunkCategories 里，内核主动拒",
+                     qualified.Tag is null);
+        Harness.Info($"ResolveChinese(初音未来（VOCALOID）) → {qualified.Tag ?? "(无)"} / {qualified.Status}");
+
+        // 非 junk 类别则能精确命中——这才是代理回落真正服务的那一批
+        Harness.Eq("非 junk 类别的括号限定形式能精确命中",
+                   vocab.ResolveChinese("弓（武器）").Tag, "bow (weapon)");
+
+        Harness.True("Search 按中文前缀能找到人物——模型查人物走的就是这条路",
+                     vocab.Search("初音未来", 200).Any(h => h.Tag == "hatsune miku"));
 
         // ---- 归类：Hit.Section 决定工具结果里的 section= 字段 ----
         Harness.Section("3. TagSections：归类与 IsKnownTag");
@@ -140,6 +163,58 @@ public static class Vocab
         Harness.Eq("挑出来的正是编的那个", sus.Count > 0 ? sus[0] : "", "totally_made_up_tag_qq");
         Harness.Eq("控制词 best quality 不误报",
                    TagSearch.SuspiciousMentions("用 `best quality` 吧。", vocab).Count, 0);
+
+        // ---- 代理对用户的保证：工具层把内核那个括号缺口补上 ----
+        Harness.Section("6. 工具层的中文解析回落（补上内核的括号限定缺口）");
+
+        var host = new ToolHost(new VocabService());
+        var toolCfg = new ProxyConfig { VocabDbPath = db };
+
+        // 裸形式不是精确键、类别又不是 junk 的那 11,138 条：代理要能直接解析出来。
+        // 挑的都是**没被 Anima 索引或别名表接住**的（否则走的是别的路，测不到回落）。
+        var bow = host.Execute(toolCfg, ToolKind.Resolve, "{\"tag\":\"弓\"}", out var s1);
+        Harness.True("danbooru_resolve_tag 能解析裸形式「弓」（内核落空 → 回落 Search）",
+                     bow.Contains("result: FOUND", StringComparison.Ordinal) &&
+                     bow.Contains("tag=bow (weapon)", StringComparison.Ordinal));
+        Harness.Info("resolve_tag(弓) → " + s1);
+
+        var arrow = host.Execute(toolCfg, ToolKind.Resolve, "{\"tag\":\"箭头\"}", out var s2);
+        Harness.True("「箭头」→ arrow (symbol)",
+                     arrow.Contains("tag=arrow (symbol)", StringComparison.Ordinal));
+        Harness.Info("resolve_tag(箭头) → " + s2);
+
+        // 回落必须收窄，而且类别要由**内核**来裁：
+        // `少女（mokufuu）` 的形状和 `弓（武器）` 一模一样，差别只在类别
+        // （character vs general）。实测不审类别的话 `少女` 会解析到
+        // `girl (mokufuu)` —— 正是内核注释里点名的那个坑。
+        var shojo = host.Execute(toolCfg, ToolKind.Resolve, "{\"tag\":\"少女\"}", out _);
+        Harness.True("`少女` 仍是 NOT FOUND（回落让内核裁类别，不吃角色标签）",
+                     shojo.Contains("result: NOT FOUND", StringComparison.Ordinal));
+
+        // 形状不对（多出来的是普通字而不是括号限定）也不算命中
+        var partial = host.Execute(toolCfg, ToolKind.Resolve, "{\"tag\":\"初音未\"}", out _);
+        Harness.True("前缀相似不算命中（`初音未` 仍是 NOT FOUND）",
+                     partial.Contains("result: NOT FOUND", StringComparison.Ordinal));
+
+        // 人物名与内核保持一致（不绕过 JunkCategories），但必须把模型引到
+        // search 那条好路上——否则模型会以为"这个词库连初音未来都没有"。
+        //
+        // 这一条还钉着一个更隐蔽的陷阱：`初音未来` 的头号变体
+        // `初音未来（VOCALOID）`（146,936 帖）是 character 会被拒，但
+        // `初音未来（Cosplay）`（2,728 帖）是 general **能过审**。若回落写成
+        // "往后继续挑"，就会把 `初音未来` 解析成 `hatsune miku (cosplay)`——
+        // 一个自信的错答案，比查不到更糟。所以下面同时断言它**没有**变成那个。
+        var miku = host.Execute(toolCfg, ToolKind.Resolve, "{\"tag\":\"初音未来\"}", out _);
+        Harness.True("人物名与内核保持一致（NOT FOUND），并把模型引向 search",
+                     miku.Contains("result: NOT FOUND", StringComparison.Ordinal) &&
+                     miku.Contains(ToolCatalog.SearchName, StringComparison.Ordinal));
+        Harness.True("没有退而求其次挑一个冷门同名变体（不许变成 hatsune miku (cosplay)）",
+                     !miku.Contains("tag=hatsune miku (cosplay)", StringComparison.Ordinal));
+
+        // 英文那条路没有被回落影响
+        var en = host.Execute(toolCfg, ToolKind.Resolve, "{\"tag\":\"hatsune miku\"}", out _);
+        Harness.True("英文标签仍然照常解析",
+                     en.Contains("tag=hatsune miku", StringComparison.Ordinal));
     }
 }
 

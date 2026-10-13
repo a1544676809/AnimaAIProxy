@@ -327,7 +327,15 @@ public sealed class ToolLoop
         // "role:tool" 那条结果。若这一轮同时还有客户端的工具调用，客户端会带着
         // 自己的历史再来一次——而那时模型已经看不到我们查过什么了，只好重查，
         // 于是每次都多花一轮。回写到 content 里，这份结果就一直是它上下文的一部分。
-        if (_cfg.CarryFindings && collected.Count > 0 && response["choices"] is JsonArray ch &&
+        //
+        // **`theirs.Count > 0` 这个门槛是关键，不是保守。** 这段文字是给模型看的
+        // 内部记账，不是给用户看的答案。只在"客户端还有活要干、一定会再回来"时才
+        // 有意义；没有客户端调用时这一轮就是终稿，客户端会把这串
+        // `[tag database lookups already performed by the proxy]` 原样显示给用户，
+        // 等于把代理的内部结构漏到用户眼前。回归里"最终内容是模型的回答"那一条
+        // 钉的就是这件事。
+        if (_cfg.CarryFindings && collected.Count > 0 && theirs.Count > 0 &&
+            response["choices"] is JsonArray ch &&
             ch.Count > 0 && ch[0] is JsonObject c0 && c0["message"] is JsonObject msg)
         {
             var sb = new StringBuilder();
