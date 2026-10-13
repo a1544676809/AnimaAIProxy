@@ -70,6 +70,16 @@ dotnet run --project tests\proxycheck.csproj all
 
 分段：`vocab` | `tools` | `loop` | `merge` | `tokens` | `server` | `e2e` | `all`
 
+另有一条 `live`，**刻意不进 `all`**：它要联网、要一把真密钥、还会花掉真实 token。
+
+```powershell
+dotnet run --project tests\proxycheck.csproj live
+```
+
+它接**真实上游**（默认读 `proxy.config.json` 里的 base url 与密钥）跑完整链路，回答的正是
+桩上游永远答不了的问题：真实模型的 `tool_calls` 长什么样、它认不认我们这套工具声明、
+`reasoning_effort` 透传过去上游有没有反应、以及**关掉思考之后它还发不发 `tool_calls`**。
+
 退出码：`0` 全通过 / `1` 有断言失败 / `2` **没能验证**（缺词库等外部输入，与"通过"区分开）。
 
 词库路径解析顺序：`--db=<path>` > 环境变量 `AIP_VOCABDB` > AnimaCaptioner 的 `settings.json`。
@@ -169,8 +179,20 @@ Kestrel 端点与鉴权、WinUI 外壳（启停 / 上游 / 工具注入 / 监听
 `/health` 正常、未鉴权 `/v1/models` 得 401；`Microsoft.UI.Xaml.dll` 等确认从已安装的
 WindowsAppRuntime 2.5.1 加载。
 
-**尚未验证**：接一个**真实上游**（DeepSeek 等）跑一遍真实对话。这需要密钥，
-所以不在回归里；代理到上游那一段的行为由 `e2e` 那一段的桩上游覆盖。
+**真实上游已实测**（`proxycheck live`，DeepSeek `api.deepseek.com/v1`，模型 `deepseek-flash`）：
+
+- 真实模型**主动调用了**我们的词库工具，并由代理在本地执行（实测一轮里要求 20 次、
+  执行 12 次 —— 上限正好卡住，`达到单次请求的工具调用上限` 恰好出现 8 次，自洽）。
+  也就是说真实上游认了这套工具声明，`announceTools` 写进系统提示那一段是有效的。
+- `reasoning_effort` 原样透传到上游且被接受：`high` 那一轮上游吐了 `reasoning_content`，
+  `none` 那一轮没有 —— 这个字段确实生效了。
+- 接入方的工具（`read_file`）与我们的工具并存时，它的 `tool_call` 原样交还、`id` 一字不差、
+  `finish_reason` 保持 `tool_calls`、我们的调用一个都没混进去。
+- **关掉思考后模型照样发 `tool_calls`**（high/none 两轮都执行了 2 次，且 high 有 reasoning、
+  none 没有，A/B 成立）。这与 AnimaCaptioner 记录的现象**不同** —— 那边是本地
+  llama-server + `chat_template_kwargs` 的路径，与云端上游不是一回事。
+  两种结果都指向同一个结论：这个开关的效果取决于上游与模型，**代理没有资格替接入方决定**，
+  所以 `reasoning_effort` / `chat_template_kwargs` / `temperature` / `top_p` 一律原样透传。
 
 **已验证的关键风险**：
 

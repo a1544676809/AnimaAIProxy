@@ -12,7 +12,9 @@ namespace AnimaAIProxy.Tests;
 ///     proxycheck e2e        # 端到端：客户端 → 代理 → 桩上游，含流式分块到达
 ///     proxycheck all        # 上面全部（默认）
 ///
-/// 一条**要联网、要真实上游**的诊断不在这组里，见 README。
+/// 另有一条**要联网、要真密钥、会花真 token** 的联调，刻意不进 all：
+///
+///     proxycheck live       # 客户端 → 代理 → 真实上游，看真实模型认不认我们的工具
 /// </summary>
 public static class Program
 {
@@ -32,6 +34,7 @@ public static class Program
             case "tokens": Tokens.Run(); break;
             case "server": Server.Run(); break;
             case "e2e": E2E.Run(args); break;
+            case "live": Live.Run(args); break;
             case "all":
                 Vocab.Run(args);
                 Tools.Run();
@@ -43,7 +46,7 @@ public static class Program
                 break;
             default:
                 Console.WriteLine("未知的检查项：" + which);
-                Console.WriteLine("可用：vocab | tools | loop | merge | tokens | server | e2e | all");
+                Console.WriteLine("可用：vocab | tools | loop | merge | tokens | server | e2e | all | live");
                 return 2;
         }
 
