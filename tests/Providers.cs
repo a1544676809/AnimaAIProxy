@@ -401,6 +401,39 @@ public static class Providers
         Harness.Eq("名字去空白", dup.Name, "名字");
         Harness.Eq("同名模型只留一条（两条会让开关看起来失灵）", dup.Models.Count, 1);
 
+        // "从未拉过"的两种写法必须等价。空串会让按需拉取的判据永远得到"拉过了"，
+        // 于是**拉取根本不发生，日志里连一行失败都没有**——用户看到的是模型表永远
+        // 空着，原因藏在两个字符里。这个陷阱真的发生过。
+        var blank = new ProviderProfile { ModelsFetchedAt = "   " };
+        blank.Normalize();
+        Harness.Eq("空白的「从未拉过」收敛为 null", blank.ModelsFetchedAt, null);
+
+        var stamped = new ProviderProfile { ModelsFetchedAt = "2026-10-13 22:10:02" };
+        stamped.Normalize();
+        Harness.Eq("已有时间戳的原样保留（别把真值也当成空白清掉）",
+                   stamped.ModelsFetchedAt, "2026-10-13 22:10:02");
+
+        // 钉住"应用自己不会制造出上面那个陷阱"：没拉过就该是**字段缺失**。
+        // 只测 Normalize 的话，Save 那边哪天改成写空串也照样全绿。
+        var probe = Path.Combine(Path.GetTempPath(),
+                                 "aip-cfg-" + Guid.NewGuid().ToString("N")[..8] + ".json");
+        var prevPath = ProxyConfig.FilePathOverride;
+        try
+        {
+            ProxyConfig.FilePathOverride = probe;
+            var fresh = new ProxyConfig { Port = 46001 };
+            fresh.Normalize();
+            fresh.Save();
+            var text = File.ReadAllText(probe);
+            Harness.True("全新配置里「没拉过」写成字段缺失，而不是空串",
+                         !text.Contains("\"modelsFetchedAt\""));
+        }
+        finally
+        {
+            ProxyConfig.FilePathOverride = prevPath;
+            try { File.Delete(probe); } catch { /* 删不掉不影响结论 */ }
+        }
+
         Harness.Eq("显示名回落：没起名时用主机名",
                    new ProviderProfile { BaseUrl = "api.deepseek.com" }.DisplayName, "api.deepseek.com");
         Harness.Eq("没有 scheme 也解析得出主机名（用户常常先敲半截）",

@@ -523,6 +523,22 @@ public sealed class ProxyServer : IAsyncDisposable
     private readonly object _autoFetchLock = new();
 
     /// <summary>
+    /// 按需拉取成功、模型表真的变了时触发，供界面重建列表。
+    ///
+    /// 存在的理由：按需拉取是**接入方调 /v1/models 时触发的**，而界面上的列表是
+    /// 上一次重建时的快照。少了这个通知，界面会一直停在"尚未拉取模型 / 还没有模型"，
+    /// 用户既看不到、也就无法开关那些**实际已经在对外提供**的模型——而这时候
+    /// 平台那边已经在正常使用了。这个错位只在"平台先调了 /v1/models"这种
+    /// 真实顺序下才出现，点一次"刷新模型"就会消失，所以格外难被发现。
+    /// </summary>
+    public static event Action? ModelsChanged;
+
+    private static void RaiseModelsChanged()
+    {
+        try { ModelsChanged?.Invoke(); } catch { /* 订阅方自己的异常不该影响代理 */ }
+    }
+
+    /// <summary>
     /// 对外公布的模型表 = **用户勾选过的结果**，不是上游的原样透传。
     ///
     /// 只有已启用站点的已启用模型会出现在这里。这一点是本功能的核心：
@@ -561,7 +577,11 @@ public sealed class ProxyServer : IAsyncDisposable
         lock (_autoFetchLock)
         {
             pending = _cfg.Providers
-                .Where(p => p.Enabled && p.AutoFetchModels && p.ModelsFetchedAt is null &&
+                // 判据是"从未拉过"，所以要同时认 null 与空串两种写法：空串本应被
+                // ProviderProfile.Normalize 收敛成 null，这里再容错一次是因为拉取
+                // 一旦被跳过就**完全没有痕迹**（不记日志、不发请求），而症状是模型表
+                // 永远空着——不值得让这一个判断承担那么高的排查成本。
+                .Where(p => p.Enabled && p.AutoFetchModels && string.IsNullOrWhiteSpace(p.ModelsFetchedAt) &&
                             !string.IsNullOrWhiteSpace(p.BaseUrl) &&
                             _autoFetchTried.Add(p.Id))
                 .ToList();
@@ -591,7 +611,13 @@ public sealed class ProxyServer : IAsyncDisposable
             ProxyLog.Write($"{r.Provider.DisplayName}：拉到 {r.Ids.Count} 个模型");
         }
 
-        if (changed) _cfg.Save();
+        if (changed)
+        {
+            _cfg.Save();
+            // 只在真的拉到东西时才通知：失败的站点进 _autoFetchTried 后不再重试，
+            // 每次 GET 都通知界面重建列表纯属白费。
+            RaiseModelsChanged();
+        }
     }
 
     // ---------------- /v1/** 通用透传 ----------------

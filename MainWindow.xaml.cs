@@ -53,6 +53,9 @@ public sealed partial class MainWindow : Window
         // 而不是从打开这一刻开始的一片空白。
         foreach (var line in ProxyLog.Snapshot()) _logLines.Add(line);
         ProxyLog.Written += OnLogWritten;
+        // 按需拉取是接入方调 /v1/models 时触发的，改的是内存里的模型表；
+        // 界面列表是快照，不刷新就会一直显示"尚未拉取模型"（见 ProxyServer.ModelsChanged）。
+        ProxyServer.ModelsChanged += OnModelsChanged;
 
         LogPathText.Text = ProxyLog.FilePath;
 
@@ -819,6 +822,11 @@ public sealed partial class MainWindow : Window
         var target = _tokens.Tokens.FirstOrDefault(t => t.Id == row.Id);
         if (target is null) return;
 
+        // ToggleSwitch 没有 Click 事件，Toggled **在程序化改值时也会触发**（列表重建时
+        // ListView 复用行容器，控件会按新行的值重设 IsOn）。值没变就说明不是用户在操作，
+        // 直接返回：否则重建一次列表会刷出一串"已启用/停用"，还会把复用时残留的状态写错行。
+        if (target.Enabled == ts.IsOn) return;
+
         target.Enabled = ts.IsOn;
         row.Enabled = ts.IsOn;
         _tokens.Save();
@@ -890,6 +898,12 @@ public sealed partial class MainWindow : Window
             if (_logLines.Count > 0) LogList.ScrollIntoView(_logLines[^1]);
         });
 
+    /// <summary>
+    /// 按需拉取改了模型表 → 重建界面列表。事件来自 Kestrel 的请求线程，
+    /// 所以交给 <see cref="DeferRefreshLists"/>（它自己会 marshal 到 UI 线程）。
+    /// </summary>
+    private void OnModelsChanged() => DeferRefreshLists();
+
     private void ClearLog_Click(object sender, RoutedEventArgs e) => _logLines.Clear();
 
     private void OpenLogFile_Click(object sender, RoutedEventArgs e) => Open(ProxyLog.FilePath);
@@ -949,6 +963,7 @@ public sealed partial class MainWindow : Window
     {
         _exiting = true;
         ProxyLog.Written -= OnLogWritten;
+        ProxyServer.ModelsChanged -= OnModelsChanged;
 
         // 顺序要紧：先把 Kestrel 停干净（释放端口、把在途请求处理完），
         // 再退进程。直接 Exit 的话端口会处于 TIME_WAIT / 未释放状态，
@@ -1008,6 +1023,7 @@ public sealed partial class MainWindow : Window
         // 兜底再停一次：万一哪天有人把 Closing 的处理去掉了，
         // 端口也不至于一直被占着。
         ProxyLog.Written -= OnLogWritten;
+        ProxyServer.ModelsChanged -= OnModelsChanged;
         try
         {
             if (_server is not null) await _server.DisposeAsync();

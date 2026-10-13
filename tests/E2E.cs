@@ -615,6 +615,25 @@ public static class E2E
                     stub2.StopAsync().GetAwaiter().GetResult();
                 }
             }
+
+            // ===== 4b. 「从未拉过」写成空串的站点，同样要被拉取 =====
+            // 空串与 null 都表示"没拉过"。只认 null 时拉取会被**静默跳过**：不发请求、
+            // 不记日志，用户只看到模型表永远空着——原因藏在两个字符里。这个陷阱真的发生过。
+            {
+                var pb = Fixture.AddProvider(cfg, stub.BaseUrl, name: "空串时间戳站点");
+                pb.ModelsFetchedAt = "";
+
+                using var r3 = http.SendAsync(new HttpRequestMessage(HttpMethod.Get,
+                    $"http://127.0.0.1:{cfg.Port}/v1/models")
+                {
+                    Headers = { { "Authorization", "Bearer " + token } }
+                }).GetAwaiter().GetResult();
+
+                Harness.Eq("空串时间戳的站点：/v1/models 仍然 200", (int)r3.StatusCode, 200);
+                Harness.True("空串被当成「从未拉过」，拉取真的发生了（而不是被静默跳过）",
+                             !string.IsNullOrWhiteSpace(pb.ModelsFetchedAt));
+                Harness.True("拉到的模型进了它自己的表", pb.FindModel("stub-model") is not null);
+            }
         }
         finally
         {

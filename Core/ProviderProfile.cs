@@ -161,6 +161,13 @@ public sealed class ProviderProfile
         Name = (Name ?? "").Trim();
         BaseUrl = (BaseUrl ?? "").Trim();
         CustomHeaders = CustomHeaders ?? "";
+        // "从未拉过"只留一种表示：null。
+        //
+        // 空串是手写配置里很容易出现的第三种写法（配置文件是刻意做成可手改的
+        // JSON），而它会让按需拉取的判据——"这个站点的模型表还没拉过吗"——永远
+        // 得到"拉过了"，于是**拉取根本不发生，日志里连一行失败都没有**。用户看到
+        // 的是模型表永远空着，而唯一的原因藏在两个字符里。
+        if (string.IsNullOrWhiteSpace(ModelsFetchedAt)) ModelsFetchedAt = null;
         if (string.IsNullOrWhiteSpace(Id)) Id = NewId();
         Models ??= new List<ModelEntry>();
 
