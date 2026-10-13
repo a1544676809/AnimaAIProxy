@@ -1,16 +1,9 @@
-# 手工留存的回归快照（**不是自动生成的** —— 没有任何代码会写这个文件）。
-# 重新生成：dotnet run --project tests\proxycheck.csproj all
-# 用途：给手上没有 113 MB 真实词库的人看一遍带真库的输出长什么样。
-# 真库路径：E:\ComfyUI\anima-vocab\vocab.sqlite（从 AnimaCaptioner 的 settings.json 借）
-# 没有词库时第 1/2/6 节会跳过并以退出码 2 结束（= 没能验证，不等于通过）。
-# server / e2e 两节会真的起 Kestrel，但令牌库指向临时目录、上游是死端口或本进程内的
-# 桩上游，既不碰用户真实数据、也不需要网络。
 AnimaAIProxy 回归：all
 
 === 1. 词库内核（vendored：VocabDb / TagSearch / TagSections） ===
        词库：vocab.sqlite（113.0 MB）
        seed：E:\ComfyUI\anima-vocab\seed.json
-       载入耗时 1471 ms
+       载入耗时 1320 ms
   ok   标签数 > 30 万                                           True
   ok   Anima 索引非空
 
@@ -158,6 +151,95 @@ AnimaAIProxy 回归：all
   ok   关掉 AnnounceTools 后不再追加说明
   ok   注入路径强制按非流式问上游                                        False
 
+=== SSE 解析：按字节找事件边界，多字节字符被切开也不坏 ===
+  ok   三个事件都完整读出来（role / 正文 / DONE）                         3
+  ok   最后一个是 [DONE]
+  ok   被切成三字节一段的中文没坏
+  ok   CRLF 空行也认                                            2
+  ok   注释心跳行不产生事件                                           1
+  ok   注释后面的 data 正常取到                                      "{"a":1}"
+
+=== 流式：tool_call 分片拼装 ===
+  ok   上游被问了两次（第一轮工具 + 第二轮收尾）                               2
+  ok   分片的 arguments 被拼完整并执行（影子历史里有 role:tool）
+  ok   拼出来的 arguments 逐字正确                                  "{"query":"lace"}"
+  ok   名字分片相加后仍被认作我们的工具（所以触发了第二轮）                           2
+
+=== 流式：正文实时转发、我们的调用不外泄 ===
+  ok   跑完了
+  ok   客户端看到的正文是模型的最终回答，且两段拼起来                              "蕾丝对应的标签是 lace。"
+  ok   我们自己的 tool_call 一个都没发给客户端                            0
+  ok   finish_reason 是 stop                                 "stop"
+  ok   发了 [DONE]
+  ok   中间轮的 finish_reason=tool_calls 没有外泄
+
+=== 流式：首块必须在整段回答之前就出去（不是攒到最后） ===
+  ok   第一个正文块就是第一轮的正文（说明它当场就发出去了）                           "先查一下。"
+  ok   客户端最终看到两轮正文拼接                                        "先查一下。查到了：lace。"
+  ok   usage 只出现一次（不是每轮一次）                                  1
+  ok   prompt_tokens 跨轮累加（20+30）                            50
+  ok   completion_tokens 跨轮累加（7+9）                          16
+  ok   total_tokens 跨轮累加（27+39）                             66
+  ok   正文里没有代理的内部记账文字
+
+=== 流式：客户端的工具原样交还 ===
+  ok   跑完了
+  ok   只问了一次上游（没有我们的调用，不循环）                                 1
+  ok   客户端的 tool_call 被交还                                   1
+  ok   交还的是它那个                                              "read_file"
+  ok   id 一字不差                                              "call_theirs"
+  ok   arguments 拼完整                                        "{"path":"/tmp/a"}"
+  ok   finish_reason 保持 tool_calls                          "tool_calls"
+
+=== 流式：混合（我们的 + 客户端的） ===
+  ok   交还客户端的调用恰好一个（第二轮那个）                                  1
+  ok   是我们摘掉自己的之后剩下的                                        "read_file"
+  ok   我们自己的调用没交给客户端
+
+=== 流式：轮数用尽 → 不带我们的工具收尾 ===
+  ok   跑满轮数后多问了一次收尾                                         3
+  ok   收尾轮不再下发我们自己的工具
+  ok   收尾轮客户端的工具原样保留
+  ok   最终给客户端的是纯回答                                          "根据已查到的结果……"
+  ok   一个 tool_call 都没外泄                                    0
+
+=== 流式：上游在吐字节之前失败 → 如实回状态码 ===
+  ok   没写完（状态码还能改）                                          False
+  ok   状态码是 502（连不上上游）                                      502
+  ok   一个字节都没发出去                                            0
+  ok   上游 429 时状态码照抄                                        429
+  ok   没写出任何字节                                              0
+
+=== 流式：流内的 error 事件 ===
+  ok   没吐过字节 → 回真正的状态码（不是 200）                              False
+  ok   错误体里带了 429 就用它                                       429
+  ok   什么都没写进流                                              0
+  ok   以完成告终（状态码已经发出去了，改不了）
+  ok   流里补了一个 error 事件
+  ok   并且补了 [DONE]（否则客户端会一直等）
+  ok   已经转出去的那段正文还在                                         "先查一下。"
+  ok   字符串 code 不会被当成 HTTP 状态码
+  ok   仍然补了 [DONE]
+
+=== 流式：思考字段与未知字段一律不劫持 ===
+  ok   reasoning_effort 原样透传                                "high"
+  ok   enable_thinking 原样透传                                 True
+  ok   top_p 原样透传                                           0.9
+  ok   chat_template_kwargs 原样                              True
+  ok   不认识的未来字段也带过去
+  ok   流式路径确实按流式问上游                                         True
+  ok   reasoning_content 增量原样转给客户端
+
+=== 流式：模型名与信封字段 ===
+  ok   所有 chunk 的模型名都是客户端要的那个（上游报的是 up-model）
+  ok   所有 chunk 的 object 都是 chat.completion.chunk
+  ok   所有 chunk 共用同一个 id
+  ok   第一条 delta 里有 role=assistant
+
+=== 流式：工具重名让路后仍认得自己的调用 ===
+  ok   让路后的调用仍被执行（触发了第二轮）                                   2
+  ok   并且没有外泄给客户端                                           0
+
 === 响应解析 ===
   ok   content 取到                                           "你好"
   ok   reasoning_content 单独取到（不与 content 混）                 "我先想一想"
@@ -286,7 +368,7 @@ AnimaAIProxy 回归：all
   ok   上游连不上 → 502                                          502
   ok   错误体里有 error.message
   ok   错误信息说清了是连不上上游，而不是含糊的「请求失败」
-       上游不可达时的响应：{"error":{"message":"连不上上游：由于目标计算机积极拒绝，无法连接。 (127.0.0.1:52264)","type":"upstream_error"}}
+       上游不可达时的响应：{"error":{"message":"连不上上游：由于目标计算机积极拒绝，无法连接。 (127.0.0.1:49415)","type":"upstream_error"}}
   ok   坏 JSON → 400                                         400
   ok   上游 /models 挂了，但回退到配置里的映射表 → 200                      200
   ok   映射表里的名字出现在模型列表里（平台启动时会拿它校验配置）
@@ -323,14 +405,21 @@ AnimaAIProxy 回归：all
   ok   流式请求 200                                             200
   ok   content-type 是 event-stream
   ok   SSE 内容完整（4 块 + [DONE]）
-  ok   流式路径不注入工具（这一阶段如实纯透传）                                 1
+  ok   流式路径也被问了一次上游                                         1
   ok   上游收到的 stream 是 true                                  True
-  ok   上游请求里没有我们的工具（流式不做注入）
-  ok   数据是分多次到达的（收到 5 次读，不是一次）
-  ok   首块远早于最后一块（首块 0ms / 总 613ms）
-       流式时序：读次数=5，首块=0ms，总耗时=613ms
+  ok   流式路径也注入了我们的工具（旧行为是不注入）
+  ok   流式路径也带了 reasoning_effort（不劫持）                        "high"
+  ok   数据是分多次到达的（收到 6 次读，不是一次）
+  ok   首块远早于最后一块（首块 0ms / 总 1069ms）
+       流式时序：读次数=6，首块=0ms，总耗时=1069ms
+  ok   流式注入：上游被问了两次（工具轮 + 收尾轮）                              2
+  ok   第二轮请求里带上了 role:tool 的工具结果
+  ok   流式路径里工具是真的在本地执行的（弓 → bow (weapon)）
+  ok   客户端拿到的正文是模型的最终回答
+  ok   客户端的流里没有我们的 tool_call（连名字都搜不到）
+  ok   客户端的流里有 finish_reason=stop
+  ok   客户端的流里以 [DONE] 收尾
   ok   /v1/models 200                                       200
   ok   上游的模型出现在列表里
 
 全部通过。
-

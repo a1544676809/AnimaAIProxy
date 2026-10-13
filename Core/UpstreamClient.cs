@@ -131,23 +131,27 @@ public sealed class UpstreamClient : IUpstream, IDisposable
     }
 
     /// <summary>
-    /// 发一次**流式**请求并把上游的响应原封不动交给 <paramref name="onChunk"/>。
+    /// 发一次**流式**请求，把上游的响应体流交给 <paramref name="onStream"/>。
     ///
-    /// 这条路径上代理**什么都不改**：不改请求体（除了换模型名与密钥）、
-    /// 不解析 SSE、不注入工具。strea=true 先做纯透传是这个阶段的既定范围，
-    /// 见 <see cref="ToolLoop"/> 的类注释。
+    /// 与旧实现的区别：这里**不解析、不注入、不改任何字节**，只负责把流交出去。
+    /// 工具注入的判断归 <see cref="StreamLoop"/>——传输层一旦开始理解 SSE 语义，
+    /// 就会出现"同一个决定在两个地方各写一遍"的分叉。
     ///
-    /// 返回上游的 HTTP 状态码与 content-type，让调用方照抄给客户端。
+    /// 用 <c>ResponseHeadersRead</c>：不复用 <c>ResponseContentRead</c>——
+    /// 那会等整个流读完才返回，流式就彻底失去意义（首字延迟等于整段时长）。
     /// </summary>
-    public async Task<(bool Ok, int Status, string ContentType, string Error)> StreamAsync(
-        JsonObject body, string clientToken, Func<Stream, Task> onChunk, CancellationToken ct)
+    public async Task<StreamStart> StreamAsync(JsonObject body, string clientToken,
+                                               Func<Stream, Task> onStream, CancellationToken ct)
     {
         try
         {
             var model = ChatWire.GetString(body, "model");
             var mapped = MapModel(model);
             if (mapped.Length > 0 && !string.Equals(mapped, model, StringComparison.Ordinal))
+            {
                 body["model"] = mapped;
+                ProxyLog.Write($"模型名映射：{model} → {mapped}");
+            }
 
             body["stream"] = true;
 
@@ -155,41 +159,40 @@ public sealed class UpstreamClient : IUpstream, IDisposable
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             cts.CancelAfter(TimeSpan.FromSeconds(_cfg.TimeoutSeconds));
 
-            // ResponseHeadersRead：不复用 ResponseContentRead —— 那会等整个流
-            // 读完才返回，流式就彻底失去意义（首字延迟等于整段时长）。
             using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, cts.Token)
                                       .ConfigureAwait(false);
 
             if (!resp.IsSuccessStatusCode)
             {
                 var raw = await resp.Content.ReadAsStringAsync(cts.Token).ConfigureAwait(false);
-                return (false, (int)resp.StatusCode, "application/json",
+                return new StreamStart(false, (int)resp.StatusCode, "application/json",
                     $"HTTP {(int)resp.StatusCode}：{Truncate(raw, 400)}");
             }
 
             var contentType = resp.Content.Headers.ContentType?.ToString() ?? "text/event-stream";
 
             await using var stream = await resp.Content.ReadAsStreamAsync(cts.Token).ConfigureAwait(false);
-            await onChunk(stream).ConfigureAwait(false);
+            await onStream(stream).ConfigureAwait(false);
 
-            return (true, (int)resp.StatusCode, contentType, "");
+            return new StreamStart(true, (int)resp.StatusCode, contentType, "");
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            return (false, 0, "", "客户端已取消本次请求");
+            // 客户端主动断开：不是错误，如实说一句就走。
+            return StreamStart.Transport("客户端已取消本次请求");
         }
         catch (OperationCanceledException)
         {
-            return (false, 0, "", $"上游流式请求超时（{_cfg.TimeoutSeconds} 秒）");
+            return StreamStart.Transport($"上游流式请求超时（{_cfg.TimeoutSeconds} 秒）");
         }
         catch (HttpRequestException ex)
         {
-            return (false, 0, "", "连不上上游：" + ex.Message);
+            return StreamStart.Transport("连不上上游：" + ex.Message);
         }
         catch (Exception ex)
         {
             ProxyLog.Write("上游流式请求异常：" + ex);
-            return (false, 0, "", ex.Message);
+            return StreamStart.Transport(ex.Message);
         }
     }
 

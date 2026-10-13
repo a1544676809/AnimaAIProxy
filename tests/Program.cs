@@ -6,6 +6,7 @@ namespace AnimaAIProxy.Tests;
 ///     proxycheck vocab      # 词库内核：搜索 / 归类 / 工具结果文本（缺库时退出码 2）
 ///     proxycheck tools      # 工具声明与合并（纯逻辑，无需任何外部输入）
 ///     proxycheck loop       # 透明工具循环：自有调用执行、外来调用放行、影子历史
+///     proxycheck stream     # 流式工具循环：正文实时转发、tool_call 分片拼装、不劫持
 ///     proxycheck merge      # 请求体改写：思考字段一律不劫持
 ///     proxycheck tokens     # 代理令牌与鉴权
 ///     proxycheck server     # HTTP 端点：真的起一次 Kestrel，走一遍路由与鉴权
@@ -30,6 +31,7 @@ public static class Program
             case "vocab": Vocab.Run(args); break;
             case "tools": Tools.Run(); break;
             case "loop": Loop.Run(); break;
+            case "stream": StreamLoopCheck.Run(); break;
             case "merge": Merge.Run(); break;
             case "tokens": Tokens.Run(); break;
             case "server": Server.Run(); break;
@@ -39,6 +41,7 @@ public static class Program
                 Vocab.Run(args);
                 Tools.Run();
                 Loop.Run();
+                StreamLoopCheck.Run();
                 Merge.Run();
                 Tokens.Run();
                 Server.Run();

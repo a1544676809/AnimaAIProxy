@@ -322,12 +322,14 @@ public sealed class ProxyServer : IAsyncDisposable
 
         if (ChatWire.WantsStream(body))
         {
-            // 流式这一阶段**不做注入**，理由写在 ToolLoop 的类注释里
-            // （要在增量 delta 上做工具循环，就得先整条读完再合成假流，
-            // 首字延迟等于整段回答时长）。但**必须在日志里说清楚**，
-            // 否则用户会以为"代理挂了工具"而实际上这次一个都没挂。
-            ProxyLog.Write("客户端要的是流式：本次不注入工具，按纯透传处理");
-            await StreamPassthrough(ctx, body, token).ConfigureAwait(false);
+            // 流式**也注入工具**。
+            //
+            // 早先这里是纯透传，理由是"要在增量 delta 上做工具循环，就得整条读完
+            // 再合成假流，首字延迟等于整段回答时长"。那个理由对"整条读完"成立，
+            // 但它不是唯一做法：正文增量**实时转发**，工具调用增量按轮缓冲，
+            // 轮末才裁定——首字延迟没有任何损失，而工具在流式下也能用上。
+            // 见 <see cref="StreamLoop"/>。
+            await RunStreamLoop(ctx, body, token).ConfigureAwait(false);
             return;
         }
 
@@ -379,54 +381,116 @@ public sealed class ProxyServer : IAsyncDisposable
         await ctx.Response.WriteAsync(json, ctx.RequestAborted).ConfigureAwait(false);
     }
 
-    // ---------------- 流式透传 ----------------
+    // ---------------- 流式注入 ----------------
 
-    private async Task StreamPassthrough(HttpContext ctx, JsonObject body, string token)
+    /// <summary>
+    /// 流式请求的 SSE 出口。它把 <see cref="StreamLoop"/> 的决定翻译成 HTTP。
+    ///
+    /// **头必须在第一个字节之前定下来**，所以"提交"这件事是显式的：
+    /// 第一次写之前设置状态码与响应头，之后就只能往流里写。
+    /// <see cref="Committed"/> 把这件事告诉循环，让它知道上游失败时
+    /// 还能不能如实回一个错误状态码。
+    /// </summary>
+    private sealed class SseSink : ISseSink
     {
-        var wroteAnything = false;
+        private readonly HttpContext _ctx;
 
-        var result = await _upstream.StreamAsync(body, token, async upstreamStream =>
+        public SseSink(HttpContext ctx) => _ctx = ctx;
+
+        public bool Committed { get; private set; }
+
+        public async Task WriteAsync(string sseEvent, CancellationToken ct)
         {
-            // 头必须**在第一个字节之前**定下来，所以放在回调里而不是调用之后。
-            ctx.Response.StatusCode = StatusCodes.Status200OK;
-            ctx.Response.ContentType = "text/event-stream; charset=utf-8";
-            ctx.Response.Headers["Cache-Control"] = "no-cache";
-            // 让可能存在的中间反向代理不要缓冲（nginx 认这个头）。
-            ctx.Response.Headers["X-Accel-Buffering"] = "no";
-            wroteAnything = true;
-
-            // 手工读写 + 每块 flush，**不用 CopyToAsync**：那个不保证每次读
-            // 都 flush，SSE 会被攒在 Kestrel 的缓冲里，首字延迟从几十毫秒
-            // 变成整段回答的时长——而流式的全部意义就在首字延迟。
-            var buffer = ArrayPool<byte>.Shared.Rent(8192);
-            try
+            if (!Committed)
             {
-                int n;
-                while ((n = await upstreamStream.ReadAsync(buffer, ctx.RequestAborted).ConfigureAwait(false)) > 0)
+                _ctx.Response.StatusCode = StatusCodes.Status200OK;
+                _ctx.Response.ContentType = "text/event-stream; charset=utf-8";
+                _ctx.Response.Headers["Cache-Control"] = "no-cache";
+                // 让可能存在的中间反向代理不要缓冲（nginx 认这个头）。
+                _ctx.Response.Headers["X-Accel-Buffering"] = "no";
+                Committed = true;
+            }
+
+            var bytes = Encoding.UTF8.GetBytes(sseEvent);
+            await _ctx.Response.Body.WriteAsync(bytes, ct).ConfigureAwait(false);
+
+            // **每个事件都要 flush。** 攒着不 flush 的话 SSE 会停在 Kestrel 的
+            // 缓冲里，首字延迟从几十毫秒变成整段回答的时长——而流式的全部
+            // 意义就在首字延迟。
+            await _ctx.Response.Body.FlushAsync(ct).ConfigureAwait(false);
+        }
+    }
+
+    private async Task RunStreamLoop(HttpContext ctx, JsonObject body, string token)
+    {
+        // 与非流式同样的理由：一次请求一个实例，计数才不会跨请求累加。
+        var loop = new StreamLoop(_upstream, new ToolHost(_vocab), _cfg);
+        var sink = new SseSink(ctx);
+
+        StreamLoop.Outcome outcome;
+        try
+        {
+            outcome = await loop.RunAsync(body, token, sink, ctx.RequestAborted).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // 客户端断开：上游那边也会被 ct 取消，这里只需安静收场。
+            return;
+        }
+        catch (Exception ex)
+        {
+            ProxyLog.Write("流式工具循环异常：" + ex);
+            // 还没写出任何字节 → 还能如实回一个 502。
+            // 已经写出去了 → 状态行早发出去了，只能往流里补一个 error 事件，
+            // 否则客户端会一直等一个永远不来的 [DONE]。
+            if (!sink.Committed)
+            {
+                ctx.Response.StatusCode = StatusCodes.Status502BadGateway;
+                ctx.Response.ContentType = "application/json; charset=utf-8";
+                await ctx.Response.WriteAsync(ChatWire.ToJson(new JsonObject
                 {
-                    await ctx.Response.Body.WriteAsync(buffer.AsMemory(0, n), ctx.RequestAborted)
-                             .ConfigureAwait(false);
-                    await ctx.Response.Body.FlushAsync(ctx.RequestAborted).ConfigureAwait(false);
-                }
+                    ["error"] = new JsonObject
+                    {
+                        ["message"] = "代理内部错误：" + ex.Message,
+                        ["type"] = "proxy_error"
+                    }
+                }), ctx.RequestAborted).ConfigureAwait(false);
             }
-            finally
+            else
             {
-                ArrayPool<byte>.Shared.Return(buffer);
+                try
+                {
+                    await sink.WriteAsync(Sse.Data(ChatWire.ToJson(new JsonObject
+                    {
+                        ["error"] = new JsonObject
+                        {
+                            ["message"] = "代理内部错误：" + ex.Message,
+                            ["type"] = "proxy_error"
+                        }
+                    })), ctx.RequestAborted).ConfigureAwait(false);
+                    await sink.WriteAsync(Sse.Done, ctx.RequestAborted).ConfigureAwait(false);
+                }
+                catch { /* 客户端可能已经断了 */ }
             }
-        }, ctx.RequestAborted).ConfigureAwait(false);
+            return;
+        }
 
-        if (result.Ok || wroteAnything) return;
+        foreach (var line in outcome.Log) ProxyLog.Write("  " + line);
 
-        // 还没写出任何字节 → 可以如实回一个错误状态码。
-        // 已经写出去了就只能断开，因为 HTTP 状态行早就发出去了。
-        ProxyLog.Write("流式上游失败：" + result.Error);
-        ctx.Response.StatusCode = result.Status > 0 ? result.Status : StatusCodes.Status502BadGateway;
+        // 循环说"没写完"，意思是它在吐出任何字节之前就失败了。这时才轮到我们
+        // 回一个真正的错误状态码——这正是流式路径上最容易丢掉的信息：
+        // 上游 429 / 401 / 模型名写错，若不在这里如实回报，客户端只会看到
+        // 一条空流然后超时。
+        if (outcome.Completed) return;
+
+        ProxyLog.Write("流式上游失败：" + outcome.Error);
+        ctx.Response.StatusCode = outcome.Status > 0 ? outcome.Status : StatusCodes.Status502BadGateway;
         ctx.Response.ContentType = "application/json; charset=utf-8";
         await ctx.Response.WriteAsync(ChatWire.ToJson(new JsonObject
         {
             ["error"] = new JsonObject
             {
-                ["message"] = result.Error.Length > 0 ? result.Error : "上游流式请求失败",
+                ["message"] = outcome.Error.Length > 0 ? outcome.Error : "上游流式请求失败",
                 ["type"] = "upstream_error"
             }
         }), ctx.RequestAborted).ConfigureAwait(false);

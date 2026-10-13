@@ -40,24 +40,38 @@
 | 端点 | 行为 |
 | --- | --- |
 | `GET /health` | 存活探测。**刻意不鉴权**（监控系统没有令牌），返回体里只有存活与词库就绪状态，不含上游地址/令牌数/路径 |
-| `POST /v1/chat/completions` | 主端点。`stream=false` → 透明注入工具并本地执行；`stream=true` → 纯透传（这一阶段不做注入，见下） |
+| `POST /v1/chat/completions` | 主端点。`stream=false` 与 `stream=true` **都**透明注入工具并本地执行；流式下正文增量实时转发（见下） |
 | `GET /v1/models` | 上游模型表；上游不可用时回退到配置里的模型映射表。配置里映射出来的名字会被补进列表（平台启动时会拿它校验配置） |
 | `/v1/**` 其它 | 原样透传（embeddings、completions……）。**刻意不逐个列端点**：OpenAI 兼容服务的端点集合一直在变，逐个列等于把自己焊死在一个快照上 |
 
-### 流式为什么这一阶段不注入
+### 流式也注入工具（怎么做到不损首字延迟）
 
-要在 SSE 的增量 delta 上做工具循环，就得先把整条流读完再自己合成一条假流给客户端，
-首字延迟等于整段回答的时长 —— 流式的全部意义就没了。所以 `stream=true` 时如实纯透传，
-**并在日志里写清"这次没注入工具，因为客户端要的是流式"**（否则用户会以为代理挂了工具，
-而实际上这次一个都没挂）。
+早先 `stream=true` 是纯透传，理由是"要在增量 delta 上做工具循环，就得整条读完再
+合成一条假流，首字延迟等于整段回答时长"。那个理由对"整条读完"成立，但它不是唯一
+做法。现在是：
+
+- **正文增量实时转发。** 收到一个 `delta.content` 就立刻写给客户端并 flush。
+  首字延迟没有任何损失 —— 这一点有断言钉着（"第一个正文块就是第一轮的正文"，
+  以及"首块到达时间远早于总耗时"，缓冲会当场失败）。
+- **工具调用增量按轮缓冲。** `delta.tool_calls` 不转发，先按 `index` 拼成完整调用
+  （`arguments` 在流里是**分片**下发的，不拼完整也执行不了）。一个调用在被裁定
+  "是我们的还是客户端的"之前，转发出去就是错的 —— 我们自己的调用绝不能让客户端看见。
+- **只有最终那一轮才收尾。** 中间轮不发 `finish_reason`、不发 usage、不发 `[DONE]`。
+  客户端看到的是一条连续的 assistant 消息，就好像模型自己查完资料再一路说下来。
+
+于是多轮在客户端眼里是**拼起来的**：`第1轮正文` + `第2轮正文`。这与"客户端自己做
+工具循环"时看到的形状一致，只是少了它自己那一段。usage 跨轮累加后只报一次
+（每轮都报是错的：客户端会在还没结束时就拿到一份"最终用量"）。
 
 ## 目录
 
 - `Core/` —— 代理逻辑层（纯 .NET，零 WinUI 依赖）
   - `ProxyConfig` / `Secrets`(DPAPI) / `ProxyLog` / `TokenStore`
   - `ToolCatalog`（工具声明） / `VocabService` / `ToolHost`（对真实词库执行）
-  - `ChatWire`（请求/响应读写） / `ToolLoop`（透明工具循环） / `UpstreamClient`
-  - `ProxyServer`（Kestrel 端点、令牌鉴权、来源过滤、流式透传）
+  - `ChatWire`（请求/响应读写） / `Sse`（SSE 读写） / `RequestShaper`（发往上游的报文，两条循环共用）
+  - `ToolLoop`（非流式透明工具循环） / `StreamLoop`（流式：正文实时转发、tool_call 按轮缓冲）
+  - `ToolCallAssembler`（流式分片的 `tool_calls` 拼装） / `UpstreamClient`
+  - `ProxyServer`（Kestrel 端点、令牌鉴权、来源过滤、SSE 出口）
 - `Vendor/AnimaCaptioner/` —— 从 [AnimaCaptioner] 搬入的词库内核（零 WinUI / Windows API 引用）
 - `tests/` —— `net10.0` 纯 .NET 回归工程。它同时是一道**守卫**：Core/ 或 Vendor/ 一旦混进 WinUI 类型就编译不过（TFM 代际必须与应用的 `net10.0-windows…` 保持一致，见文末「构建取舍」）
 - `docs/` —— 上游复用面的技术勘察报告（LlmClient、VocabDb）
@@ -68,7 +82,7 @@
 dotnet run --project tests\proxycheck.csproj all
 ```
 
-分段：`vocab` | `tools` | `loop` | `merge` | `tokens` | `server` | `e2e` | `all`
+分段：`vocab` | `tools` | `loop` | `stream` | `merge` | `tokens` | `server` | `e2e` | `all`
 
 另有一条 `live`，**刻意不进 `all`**：它要联网、要一把真密钥、还会花掉真实 token。
 
@@ -91,8 +105,13 @@ dotnet run --project tests\proxycheck.csproj live
 - `e2e` 的上游是**本进程内第二个 Kestrel**（桩上游），按剧本回话并记下收到的请求体 ——
   所以它验的是完整链路：工具声明真的进了发往上游的报文、工具结果真的回到了模型手上、
   最终交给客户端的那份 JSON 里我们的 `tool_call` 摘干净了、usage 跨轮累加了、
-  **流式是真的分块回来的**（断言"首块到达时间远早于总耗时"，缓冲会当场失败）。
+  **流式也是真的分块回来的**（断言"首块到达时间远早于总耗时"，缓冲会当场失败），
+  以及**流式下工具真的被注入并本地执行了**（能看到 `弓 → bow (weapon)` 那条真实查库结果）。
   它不需要网络。
+- `stream` 段是流式循环的离线控制流回归，用**真的 SSE 文本**驱动（假上游故意把字节切成
+  7 字节一段，逼着解析层处理"事件边界与多字节字符都落在块中间"）：`tool_call` 分片拼装、
+  正文实时转发、中间轮的 `finish_reason`/usage 不外泄、客户端工具原样交还、
+  流内 error 事件的两条路（还没吐字节 → 回真状态码；已吐字节 → 只能往流里补 error + `[DONE]`）。
 
 `tests/last-run.txt` 是**手工留存**的快照（没有任何代码会写它），给手上没有 113 MB 真实词库的人看。
 

@@ -140,6 +140,31 @@ public static class ToolCatalog
     public static List<ToolDecl> All() => new() { SearchTool, ResolveTool, ScanTool };
 
     /// <summary>
+    /// 一个工具名是不是代理自有的，**不管它这次实际下发的名字是什么**。
+    ///
+    /// 只按名字判、不查本次的 <see cref="InjectionPlan"/>，这是刻意的：
+    /// 收尾那一轮我们已经把 plan 换成空集了，而这一轮响应的身份必须按它
+    /// **当时下发的名字**来认——拿空 plan 去问"这是我们的吗"会把我们自己的
+    /// 调用当成客户端的，然后原样交还给客户端，客户端收到一个它根本没有的
+    /// <c>danbooru_*</c> 调用。
+    ///
+    /// 让路后缀（<c>_aip</c>、<c>_aip2</c>…）必须一起认，否则重名时我们
+    /// 自己下发、自己执行的调用会被判成外来者。
+    /// </summary>
+    public static bool IsProxyToolName(string? name)
+    {
+        if (string.IsNullOrEmpty(name)) return false;
+
+        foreach (var baseName in new[] { SearchName, ResolveName, ScanName })
+        {
+            if (string.Equals(name, baseName, StringComparison.OrdinalIgnoreCase)) return true;
+            if (name.StartsWith(baseName + CollisionSuffix, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
     /// 为一次具体请求算出"叫什么名字"。<paramref name="taken"/> 是客户端已经用掉的
     /// 工具名（大小写不敏感）。
     ///

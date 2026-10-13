@@ -179,16 +179,7 @@ public static class Live
                 // 按固定下标切会整体错位、一条都数不到（实测踩过：5 轮共 17 次调用
                 // 被数成 0 次，而断言却"通过"，因为另一个断言只要求 > 0）。
                 // 时间戳恰好 23 字符（yyyy-MM-dd HH:mm:ss.fff），这是唯一稳定的锚点。
-                static string MsgOf(string line) =>
-                    line.Length > 23 ? line[23..].TrimStart() : line.TrimStart();
-
-                var executed = lines.Count(l =>
-                {
-                    var m = MsgOf(l);
-                    return m.StartsWith("查「", StringComparison.Ordinal)
-                        || m.StartsWith("核对「", StringComparison.Ordinal)
-                        || m.StartsWith("切分", StringComparison.Ordinal);
-                });
+                var executed = lines.Count(l => IsToolExecution(MsgOf(l)));
 
                 Harness.Info(executed > 0
                     ? $"结论：真实模型**主动调用了**我们的词库工具——要求 {requested} 次，实际执行 {executed} 次" +
@@ -432,6 +423,126 @@ public static class Live
                                  parsed.FinishReason != "tool_calls");
                 }
             }
+
+            // ============ 4. 流式：真上游的 tool_calls 分片长什么样 ============
+            //
+            // 这一节只有真上游能回答：桩上游的分片形状是我们自己编的，而真实
+            // OpenAI 兼容实现的 <c>delta.tool_calls</c> 到底怎么切、<c>index</c>
+            // 给不给、<c>name</c> 会不会被拆开，只有接一次真的才知道。
+            // 拼错的表现是"工具查不到东西"，而模型照样能胡诌出一个答案。
+            {
+                Harness.Section("4. 流式注入：真上游的分片 tool_calls 能不能拼完整并执行");
+                var logMark = ProxyLog.Snapshot().Count;   // 见下方"只数本节的行"
+
+                var body = new JsonObject
+                {
+                    ["model"] = model,
+                    ["messages"] = new JsonArray
+                    {
+                        new JsonObject
+                        {
+                            ["role"] = "system",
+                            ["content"] = "你是助手。需要查 danbooru 标签时必须用工具查，不要凭记忆写。"
+                        },
+                        new JsonObject
+                        {
+                            ["role"] = "user",
+                            ["content"] = "查一下「弓」这个标签的准确英文名和帖子数，用一句话回答。"
+                        }
+                    },
+                    ["max_tokens"] = 1024,
+                    // **客户端要的是流式。** 这是本节的重点：早先这条路不做注入。
+                    ["stream"] = true
+                };
+
+                var (status, events, arrivals, raw) = PostStream(http, url, ChatWire.ToJson(body), token);
+
+                Harness.Eq("流式请求 200", status, 200);
+                Harness.True($"收到多个 SSE 事件（{events.Count} 个）", events.Count > 1);
+                if (arrivals.Count > 1)
+                    Harness.Info($"流式时序：读次数={arrivals.Count}，首块={arrivals[0]}ms，" +
+                                 $"总耗时={arrivals[^1]}ms");
+
+                // 客户端看到的正文（把所有 delta.content 拼起来）
+                var sb = new StringBuilder();
+                var leakedToolCalls = 0;
+                var sawStop = false;
+                var sawDone = false;
+                JsonObject? usage = null;
+
+                foreach (var ev in events)
+                {
+                    if (ev.IsDone) { sawDone = true; continue; }
+                    var node = ChatWire.TryParseObject(ev.Data);
+                    if (node is null) continue;
+
+                    if (node["usage"] is JsonObject u) usage = u;
+
+                    if (node["choices"] is not JsonArray cs) continue;
+                    foreach (var c in cs)
+                    {
+                        if (c is not JsonObject co) continue;
+                        if (co["delta"] is JsonObject d)
+                        {
+                            if (d["content"] is not null) sb.Append(ChatWire.GetString(d, "content"));
+                            if (d["tool_calls"] is JsonArray tc)
+                                foreach (var t in tc)
+                                    if (ChatWire.GetString(t?["function"] as JsonObject, "name")
+                                            .Contains("danbooru", StringComparison.OrdinalIgnoreCase))
+                                        leakedToolCalls++;
+                        }
+                        if (ChatWire.GetString(co, "finish_reason") == "stop") sawStop = true;
+                    }
+                }
+
+                var answer = sb.ToString();
+                Harness.Info("客户端拼出来的最终回答：" + Truncate(answer, 500));
+                Harness.True("拿到了非空的流式回答", answer.Trim().Length > 0);
+                Harness.True("我们的 tool_call 一个都没漏给客户端", leakedToolCalls == 0);
+                Harness.True("流里有 finish_reason=stop", sawStop);
+                Harness.True("流里有 [DONE]", sawDone);
+                Harness.Info("usage：" + (usage is null ? "(无)" : ChatWire.ToJson(usage)));
+
+                // **真正的证据在日志里**：我们自己的工具到底有没有被本地执行。
+                // 只看"回答里有没有提到标签"是不够的——模型完全可能凭记忆编一个
+                // 看起来对的答案，而那正是这套工具要防的事。
+                //
+                // **只数本节产生的行**：ProxyLog.Snapshot() 是累计的（进程内全部日志），
+                // 直接全量数会把前面几节的执行次数也算进来，"流式下工具执行了 N 次"
+                // 这句话就成了假的验证。从 logMark 开始截。
+                var lines = ProxyLog.Snapshot().Skip(logMark).ToList();
+                Harness.Info($"代理本节日志（{lines.Count} 行，取末尾）：");
+                foreach (var l in lines.TakeLast(25)) Harness.Info("  " + l);
+
+                var executedStream = 0;
+                var streamRounds = 0;
+                foreach (var l in lines)
+                {
+                    var t = MsgOf(l);
+                    if (IsToolExecution(t)) executedStream++;
+                    if (t.StartsWith("第 ", StringComparison.Ordinal) && t.Contains("轮：")) streamRounds++;
+                }
+
+                Harness.True($"流式路径下我们的工具真的被本地执行了（{executedStream} 次）",
+                             executedStream > 0);
+                Harness.Info($"流式路径跑了 {streamRounds} 轮（>1 说明先查库、再作答）");
+
+                if (hasDb)
+                {
+                    Harness.True("流式路径的回答里带着词库里的真实标签与帖子数",
+                                 answer.Contains("bow", StringComparison.OrdinalIgnoreCase) ||
+                                 System.Text.RegularExpressions.Regex.IsMatch(answer, @"\d[\d,]{3,}"));
+                }
+
+                // 流式路径上一轮的 usage 必须是**累加**过的（多轮跑完只报一次）。
+                if (usage is not null && streamRounds > 1)
+                {
+                    var pt = ChatWire.GetInt(usage, "prompt_tokens") ?? 0;
+                    Harness.True($"usage 是多轮累加的结果（prompt_tokens={pt}，只报了一次）", pt > 0);
+                }
+
+                _ = raw;
+            }
         }
         finally
         {
@@ -443,6 +554,26 @@ public static class Live
 
     private static string Truncate(string s, int n) =>
         string.IsNullOrEmpty(s) ? "(空)" : (s.Length <= n ? s : s[..n] + "…");
+
+    /// <summary>
+    /// 剥掉日志行的时间戳。时间戳恰好 23 字符（<c>yyyy-MM-dd HH:mm:ss.fff</c>），
+    /// 这是唯一稳定的锚点：调用方补的缩进是可变的，按固定下标切会整体错位。
+    /// </summary>
+    private static string MsgOf(string line) =>
+        line.Length > 23 ? line[23..].TrimStart() : line.TrimStart();
+
+    /// <summary>
+    /// 这一行是不是"我们的工具真的执行了一次"。
+    ///
+    /// 三种前缀对应三个工具（由 <c>ToolHost</c> 写出）。**两处口调用同一个函数**：
+    /// 之前第 4 节自己抄了一份判据、还用了 <c>Contains(']')</c> 当锚点，而这些行
+    /// 里根本没有 <c>]</c>，于是时间戳留在开头、一条都数不到，断言报 0 次——
+    /// 而真实情况是工具已经执行过了。判据只留一份才不会再次走偏。
+    /// </summary>
+    private static bool IsToolExecution(string message) =>
+        message.StartsWith("查「", StringComparison.Ordinal)
+        || message.StartsWith("核对「", StringComparison.Ordinal)
+        || message.StartsWith("切分", StringComparison.Ordinal);
 
     private sealed record HttpResult(int Status, string Text);
 
@@ -463,6 +594,65 @@ public static class Live
         {
             return new HttpResult(0, "请求异常：" + ex.Message);
         }
+    }
+
+    /// <summary>
+    /// 发一个**流式**请求，把 SSE 事件逐个读出来（不是一次性读完），
+    /// 并记录每次读到的时刻 —— 只有逐个读才能证明"首字真的早"。
+    /// </summary>
+    private static (int Status, List<SseEvent> Events, List<long> Arrivals, string Raw)
+        PostStream(HttpClient http, string url, string body, string token)
+    {
+        var events = new List<SseEvent>();
+        var arrivals = new List<long>();
+        var raw = new StringBuilder();
+
+        var req = new HttpRequestMessage(HttpMethod.Post, url)
+        {
+            Content = new StringContent(body, Encoding.UTF8, "application/json")
+        };
+        req.Headers.TryAddWithoutValidation("Authorization", "Bearer " + token);
+
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            using var resp = http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead)
+                                 .GetAwaiter().GetResult();
+            var status = (int)resp.StatusCode;
+
+            using var s = resp.Content.ReadAsStreamAsync().GetAwaiter().GetResult();
+            var buf = new byte[4096];
+            var pending = new StringBuilder();
+            int n;
+
+            while ((n = s.Read(buf, 0, buf.Length)) > 0)
+            {
+                var text = Encoding.UTF8.GetString(buf, 0, n);
+                raw.Append(text);
+                pending.Append(text);
+                arrivals.Add(sw.ElapsedMilliseconds);
+
+                // 把已经凑完整的事件切出来。SSE 的空行是事件边界。
+                var all = pending.ToString().Replace("\r\n", "\n");
+                int cut;
+                while ((cut = all.IndexOf("\n\n", StringComparison.Ordinal)) >= 0)
+                {
+                    var block = all[..(cut + 2)];
+                    all = all[(cut + 2)..];
+                    var ev = Sse.Parse(block);
+                    if (ev.DataLines.Count > 0) events.Add(ev);
+                }
+                pending.Clear();
+                pending.Append(all);
+            }
+        }
+        catch (Exception ex)
+        {
+            Harness.Note("流式请求异常：" + ex.Message);
+            return (0, events, arrivals, raw.ToString());
+        }
+
+        return (200, events, arrivals, raw.ToString());
     }
 }
 

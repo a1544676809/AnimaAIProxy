@@ -37,6 +37,15 @@ public static class Loop
             var resp = _script.Dequeue();
             return Task.FromResult(new UpstreamResult(true, 200, resp.ToJsonString(), resp, ""));
         }
+
+        /// <summary>
+        /// 非流式回归不该走到流式路径。真走到了就是**错误**，必须炸出来——
+        /// 返回一个"空成功流"会让这类断言静默变成"什么都没测到"。
+        /// </summary>
+        public Task<StreamStart> StreamAsync(JsonObject body, string clientToken,
+                                             Func<Stream, Task> onStream, CancellationToken ct)
+            => throw new InvalidOperationException(
+                "非流式回归里不该出现流式调用；流式的验证在 tests/Stream.cs。");
     }
 
     /// <summary>造一条上游的普通回答。</summary>

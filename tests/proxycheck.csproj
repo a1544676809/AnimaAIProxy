@@ -46,6 +46,7 @@
     <Compile Include="Vocab.cs" />
     <Compile Include="Tools.cs" />
     <Compile Include="Loop.cs" />
+    <Compile Include="Stream.cs" />
     <Compile Include="Tokens.cs" />
     <Compile Include="Merge.cs" />
     <Compile Include="Server.cs" />

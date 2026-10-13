@@ -54,6 +54,12 @@ public static class E2E
         public int StreamChunks { get; set; } = 4;
         public int StreamChunkDelayMs { get; set; } = 150;
 
+        /// <summary>
+        /// 流式模式下改吐这一串**原始 SSE 文本**（每项一段，逐段 flush）。
+        /// 用来演"流式里模型先调我们的工具、再逐字把答案说出来"。
+        /// </summary>
+        public Queue<string> StreamScript { get; } = new();
+
         public void Enqueue(JsonObject reply) => _replies.Enqueue(reply);
 
         public async Task StartAsync()
@@ -79,6 +85,27 @@ public static class E2E
                 if (StreamMode)
                 {
                     ctx.Response.ContentType = "text/event-stream";
+
+                    // 有剧本就按剧本吐原始 SSE（用来演多轮：先工具、后正文）。
+                    string[] pieces;
+                    lock (StreamScript)
+                    {
+                        pieces = StreamScript.Count > 0
+                            ? StreamScript.Dequeue().Split(new[] { "\u0000" }, StringSplitOptions.None)
+                            : new string[0];
+                    }
+
+                    if (pieces.Length > 0)
+                    {
+                        foreach (var p in pieces)
+                        {
+                            await ctx.Response.WriteAsync(p);
+                            await ctx.Response.Body.FlushAsync();
+                            await Task.Delay(StreamChunkDelayMs);
+                        }
+                        return;
+                    }
+
                     for (var i = 0; i < StreamChunks; i++)
                     {
                         await ctx.Response.WriteAsync(
@@ -347,12 +374,24 @@ public static class E2E
                 Harness.Eq("finish_reason 保持 tool_calls", parsed.FinishReason, "tool_calls");
             }
 
-            // ================= 3. 流式：真的透传，且真的分块回来 =================
+            // ================= 3. 流式：注入工具，且真的分块回来 =================
             {
                 stub.StreamMode = true;
                 stub.StreamChunks = 4;
                 stub.StreamChunkDelayMs = 150;
                 stub.Received.Clear();
+                stub.StreamScript.Clear();
+                // 剧本：4 段正文 + [DONE]。模型这一轮**不调工具**，
+                // 所以是纯透传形态，用来验时序（首块必须远早于末尾）。
+                stub.StreamScript.Enqueue(
+                    "data: {\"id\":\"s1\",\"object\":\"chat.completion.chunk\",\"model\":\"stub-model\"," +
+                    "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n\u0000" +
+                    "data: {\"id\":\"s1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"块0\"}}]}\n\n\u0000" +
+                    "data: {\"id\":\"s1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"块1\"}}]}\n\n\u0000" +
+                    "data: {\"id\":\"s1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"块2\"}}]}\n\n\u0000" +
+                    "data: {\"id\":\"s1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"块3\"}}]}\n\n\u0000" +
+                    "data: {\"id\":\"s1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\u0000" +
+                    "data: [DONE]\n\n");
 
                 var req = new HttpRequestMessage(HttpMethod.Post, url)
                 {
@@ -388,17 +427,20 @@ public static class E2E
                 Harness.True("SSE 内容完整（4 块 + [DONE]）",
                              text.ToString().Contains("块0") && text.ToString().Contains("块3") &&
                              text.ToString().Contains("[DONE]"));
-                Harness.Eq("流式路径不注入工具（这一阶段如实纯透传）", stub.Received.Count, 1);
+                Harness.Eq("流式路径也被问了一次上游", stub.Received.Count, 1);
                 Harness.Eq("上游收到的 stream 是 true", ChatWire.GetBool(stub.Received[0], "stream"), true);
-                Harness.True("上游请求里没有我们的工具（流式不做注入）",
-                             stub.Received[0]["tools"] is null ||
-                             !((JsonArray)stub.Received[0]["tools"]!).Any(t =>
+                // **这条以前断言的是反面**（"流式不做注入"）。现在流式也注入：
+                // 正文实时转发、工具调用按轮缓冲，首字延迟没有任何损失。
+                Harness.True("流式路径也注入了我们的工具（旧行为是不注入）",
+                             (stub.Received[0]["tools"] as JsonArray)?.Any(t =>
                                  ChatWire.GetString(t!["function"] as JsonObject, "name")
-                                     .StartsWith("danbooru_", StringComparison.Ordinal)));
+                                     .StartsWith("danbooru_", StringComparison.Ordinal)) == true);
+                Harness.Eq("流式路径也带了 reasoning_effort（不劫持）",
+                           ChatWire.GetString(stub.Received[0], "reasoning_effort"), "high");
 
                 // 这一条是流式路径的核心：分块到达，而不是攒到最后一次性给。
-                // 桩上游每块之间睡 150ms，4 块 ≈ 600ms；若代理做了缓冲，
-                // 客户端会在接近 600ms 时一次性收到全部内容。
+                // 桩上游每块之间睡 150ms，若代理做了缓冲，客户端会在接近末尾时
+                // 一次性收到全部内容。
                 Harness.True($"数据是分多次到达的（收到 {arrivals.Count} 次读，不是一次）",
                              arrivals.Count >= 3);
                 Harness.True($"首块远早于最后一块（首块 {arrivals[0]}ms / 总 {totalMs}ms）",
@@ -406,6 +448,73 @@ public static class E2E
                 Harness.Info($"流式时序：读次数={arrivals.Count}，首块={arrivals[0]}ms，总耗时={totalMs}ms");
 
                 stub.StreamMode = false;
+                stub.StreamScript.Clear();
+            }
+
+            // ================= 3b. 流式 + 我们的工具：本地执行后答案才出来 =================
+            {
+                stub.StreamMode = true;
+                stub.StreamChunkDelayMs = 0;
+                stub.Received.Clear();
+                stub.StreamScript.Clear();
+
+                // 第一轮：模型要调我们的工具（arguments 分片下发，逼真）
+                stub.StreamScript.Enqueue(
+                    "data: {\"id\":\"s2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n\u0000" +
+                    "data: {\"id\":\"s2\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0," +
+                    "\"id\":\"call_s1\",\"type\":\"function\",\"function\":{\"name\":\"" +
+                    ToolCatalog.SearchName + "\",\"arguments\":\"\"}}]}}]}\n\n\u0000" +
+                    "data: {\"id\":\"s2\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0," +
+                    "\"function\":{\"arguments\":\"{\\\"query\\\":\\\"弓\\\"}\"}}]}}]}\n\n\u0000" +
+                    "data: {\"id\":\"s2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\u0000" +
+                    "data: [DONE]\n\n");
+
+                // 第二轮：拿到工具结果后的最终回答
+                stub.StreamScript.Enqueue(
+                    "data: {\"id\":\"s3\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n\u0000" +
+                    "data: {\"id\":\"s3\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"弓 对应 bow (weapon)。\"}}]}\n\n\u0000" +
+                    "data: {\"id\":\"s3\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\u0000" +
+                    "data: [DONE]\n\n");
+
+                var req = new HttpRequestMessage(HttpMethod.Post, url)
+                {
+                    Content = new StringContent(ChatWire.ToJson(ClientBody(stream: true)),
+                                                Encoding.UTF8, "application/json")
+                };
+                req.Headers.TryAddWithoutValidation("Authorization", "Bearer " + token);
+
+                using var resp = http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead)
+                                     .GetAwaiter().GetResult();
+                var streamText = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+
+                Harness.Eq("流式注入：上游被问了两次（工具轮 + 收尾轮）", stub.Received.Count, 2);
+
+                // 第二轮请求里必须带上真实执行的工具结果
+                if (stub.Received.Count >= 2)
+                {
+                    var toolMsgs = ((JsonArray)stub.Received[1]["messages"]!).Where(m =>
+                        ChatWire.GetString(m as JsonObject, "role") == "tool").ToList();
+                    Harness.True("第二轮请求里带上了 role:tool 的工具结果", toolMsgs.Count == 1);
+                    if (toolMsgs.Count == 1 && hasDb)
+                    {
+                        var toolText = ChatWire.GetString(toolMsgs[0] as JsonObject, "content");
+                        Harness.True("流式路径里工具是真的在本地执行的（弓 → bow (weapon)）",
+                                     toolText.Contains("bow (weapon)", StringComparison.Ordinal));
+                    }
+                }
+
+                // 客户端看到的那条流里不该出现我们的 tool_call
+                Harness.True("客户端拿到的正文是模型的最终回答",
+                             streamText.Contains("弓 对应 bow (weapon)。", StringComparison.Ordinal));
+                Harness.True("客户端的流里没有我们的 tool_call（连名字都搜不到）",
+                             !streamText.Contains(ToolCatalog.SearchName, StringComparison.Ordinal));
+                Harness.True("客户端的流里有 finish_reason=stop",
+                             streamText.Contains("\"finish_reason\":\"stop\"", StringComparison.Ordinal));
+                Harness.True("客户端的流里以 [DONE] 收尾",
+                             streamText.Contains("[DONE]", StringComparison.Ordinal));
+
+                stub.StreamMode = false;
+                stub.StreamScript.Clear();
             }
 
             // ================= 4. /v1/models 走真实上游 =================
