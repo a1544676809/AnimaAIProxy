@@ -3,7 +3,7 @@ AnimaAIProxy 回归：all
 === 1. 词库内核（vendored：VocabDb / TagSearch / TagSections） ===
        词库：vocab.sqlite（113.0 MB）
        seed：E:\ComfyUI\anima-vocab\seed.json
-       载入耗时 1320 ms
+       载入耗时 1269 ms
   ok   标签数 > 30 万                                           True
   ok   Anima 索引非空
 
@@ -368,7 +368,7 @@ AnimaAIProxy 回归：all
   ok   上游连不上 → 502                                          502
   ok   错误体里有 error.message
   ok   错误信息说清了是连不上上游，而不是含糊的「请求失败」
-       上游不可达时的响应：{"error":{"message":"连不上上游：由于目标计算机积极拒绝，无法连接。 (127.0.0.1:49415)","type":"upstream_error"}}
+       上游不可达时的响应：{"error":{"message":"连不上上游：由于目标计算机积极拒绝，无法连接。 (127.0.0.1:60487)","type":"upstream_error"}}
   ok   坏 JSON → 400                                         400
   ok   上游 /models 挂了，但回退到配置里的映射表 → 200                      200
   ok   映射表里的名字出现在模型列表里（平台启动时会拿它校验配置）
@@ -410,8 +410,8 @@ AnimaAIProxy 回归：all
   ok   流式路径也注入了我们的工具（旧行为是不注入）
   ok   流式路径也带了 reasoning_effort（不劫持）                        "high"
   ok   数据是分多次到达的（收到 6 次读，不是一次）
-  ok   首块远早于最后一块（首块 0ms / 总 1069ms）
-       流式时序：读次数=6，首块=0ms，总耗时=1069ms
+  ok   首块远早于最后一块（首块 0ms / 总 1084ms）
+       流式时序：读次数=6，首块=0ms，总耗时=1084ms
   ok   流式注入：上游被问了两次（工具轮 + 收尾轮）                              2
   ok   第二轮请求里带上了 role:tool 的工具结果
   ok   流式路径里工具是真的在本地执行的（弓 → bow (weapon)）

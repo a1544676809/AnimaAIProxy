@@ -427,6 +427,11 @@ public sealed class ProxyServer : IAsyncDisposable
         var loop = new StreamLoop(_upstream, new ToolHost(_vocab), _cfg);
         var sink = new SseSink(ctx);
 
+        // **在日志里标明这是流式路径。** 两条路产生的轮次/执行日志措辞一模一样，
+        // 不标的话"这次工具有没有生效"在日志上分不出是哪种请求，
+        // 而"客户端要的是流式"恰是历史上工具静默失效的那一种情况。
+        ProxyLog.Write("客户端要的是流式：注入按「正文实时转发 + 工具调用按轮缓冲」处理");
+
         StreamLoop.Outcome outcome;
         try
         {
