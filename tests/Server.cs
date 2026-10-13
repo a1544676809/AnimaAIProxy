@@ -44,12 +44,15 @@ public static class Server
         var oldTokenPath = TokenStore.FilePathOverride;
         TokenStore.FilePathOverride = Path.Combine(tmpDir, "proxy.tokens.json");
 
+        // 配置也要重定向：ProxyServer 在"按需拉取模型表"时会 Save()，
+        // 不重定向的话跑一次回归就把用户的真配置盖成这份临时配置。
+        var oldCfgPath = ProxyConfig.FilePathOverride;
+        ProxyConfig.FilePathOverride = Path.Combine(tmpDir, "proxy.config.json");
+
         var cfg = new ProxyConfig
         {
             Port = FreePort(),
             BindScope = "local",
-            // 死端口：连接必然失败。我们断言的就是"上游不可达时客户端收到什么"。
-            UpstreamBaseUrl = $"http://127.0.0.1:{DeadPort()}/v1",
             RequireToken = true,
             ToolsEnabled = true,
             TimeoutSeconds = 5,
@@ -58,6 +61,12 @@ public static class Server
             VocabDbPath = Path.Combine(tmpDir, "no-such-vocab.sqlite"),
             SeedPath = Path.Combine(tmpDir, "no-such-seed.json")
         };
+
+        // 死端口：连接必然失败。我们断言的就是"上游不可达时客户端收到什么"。
+        var dead = Fixture.AddProvider(cfg, $"http://127.0.0.1:{DeadPort()}/v1", name: "死上游");
+        // 关掉按需拉取：否则 /v1/models 会去等一个死端口，白白多花几秒，
+        // 而这里要验的是"模型表读的是本地勾选结果"，不是拉取。
+        dead.AutoFetchModels = false;
 
         var tokens = new TokenStore();
         var good = TokenStore.Create("回归用", "servercheck", out var goodPlain);
@@ -76,6 +85,7 @@ public static class Server
             Harness.True("服务起来了（起不来后面的断言全部无意义）", false);
             Harness.Info("启动失败：" + ex.Message);
             TokenStore.FilePathOverride = oldTokenPath;
+            ProxyConfig.FilePathOverride = oldCfgPath;
             return;
         }
 
@@ -94,7 +104,7 @@ public static class Server
                 Harness.Eq("health 报 ok", ChatWire.GetString(json, "status"), "ok");
                 Harness.True("health 里不含上游地址（它是给局域网上任何人看的）",
                              !text.Contains("127.0.0.1", StringComparison.Ordinal) &&
-                             !text.Contains(cfg.UpstreamBaseUrl, StringComparison.Ordinal));
+                             !text.Contains(dead.BaseUrl, StringComparison.Ordinal));
             }
 
             // ---------- 根路径：给一句人话 ----------
@@ -153,9 +163,11 @@ public static class Server
                 Harness.Eq("坏 JSON → 400", (int)r.StatusCode, 400);
             }
 
-            // ---------- /v1/models：上游挂了也要把映射表报出去 ----------
+            // ---------- /v1/models：读的是勾选过的模型表，不是上游 ----------
             {
                 cfg.ModelMap["gpt-4o"] = "deepseek-chat";
+                dead.Models.Add(new ModelEntry { Id = "dead-model" });
+                dead.Models.Add(new ModelEntry { Id = "off-model", Enabled = false });
 
                 // 注意要带令牌：/v1/models 也要鉴权，不能因为是 GET 就放行
                 // （这一条上面单独断言过，这里顺带再确认一次没漏）。
@@ -165,12 +177,28 @@ public static class Server
                 var text = r.Content.ReadAsStringAsync().GetAwaiter().GetResult();
                 var json = ChatWire.TryParseObject(text);
 
-                Harness.Eq("上游 /models 挂了，但回退到配置里的映射表 → 200", (int)r.StatusCode, 200);
+                Harness.Eq("上游连不上也照常回 200（模型表是本地勾选的结果）", (int)r.StatusCode, 200);
                 var ids = (json?["data"] as JsonArray)?
                     .Select(n => ChatWire.GetString(n as JsonObject, "id")).ToList() ?? new List<string>();
-                Harness.True("映射表里的名字出现在模型列表里（平台启动时会拿它校验配置）",
+                Harness.True("勾选启用的模型在表里", ids.Contains("dead-model"));
+                Harness.True("关掉的模型不在表里（用户关它就是为了让它消失）",
+                             !ids.Contains("off-model"));
+                Harness.True("映射表里的名字也在（平台启动时会拿它校验配置）",
                              ids.Contains("gpt-4o"));
+
+                dead.Enabled = false;
+                using var r2 = http.SendAsync(new HttpRequestMessage(HttpMethod.Get, baseUrl + "/v1/models")
+                {
+                    Headers = { { "Authorization", "Bearer " + goodPlain } }
+                }).GetAwaiter().GetResult();
+                var ids2 = (ChatWire.TryParseObject(r2.Content.ReadAsStringAsync().GetAwaiter().GetResult())?["data"]
+                    as JsonArray)?.Select(n => ChatWire.GetString(n as JsonObject, "id")).ToList() ?? new List<string>();
+                Harness.True("停用整个站点 → 它下面的模型全部消失", !ids2.Contains("dead-model"));
+                Harness.True("映射表的名字不受站点开关影响", ids2.Contains("gpt-4o"));
+                dead.Enabled = true;
+
                 cfg.ModelMap.Clear();
+                dead.Models.Clear();
             }
 
             // ---------- 工具注入关掉时退化成纯反向代理 ----------
@@ -201,6 +229,7 @@ public static class Server
             }
 
             TokenStore.FilePathOverride = oldTokenPath;
+            ProxyConfig.FilePathOverride = oldCfgPath;
             try { Directory.Delete(tmpDir, recursive: true); } catch { /* 临时目录删不掉不影响结论 */ }
         }
     }

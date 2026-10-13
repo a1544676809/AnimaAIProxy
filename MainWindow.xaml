@@ -86,15 +86,56 @@
         <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
             <StackPanel Spacing="10">
 
-                <!-- ===== 上游 ===== -->
-                <Expander Header="上游" IsExpanded="True"
+                <!-- ===== 模型提供商 ===== -->
+                <Expander Header="模型提供商" IsExpanded="True"
                           HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
                     <StackPanel Spacing="10" Padding="4,10,4,4">
-                        <TextBox x:Name="UpstreamUrlBox" Header="上游 Base URL（须自带 /v1）"
-                                 PlaceholderText="https://api.deepseek.com/v1" />
-                        <PasswordBox x:Name="UpstreamKeyBox" Header="上游 API Key"
-                                     PlaceholderText="留空表示不改动" />
-                        <TextBlock x:Name="UpstreamKeyState" Opacity="0.6" Text="" />
+                        <TextBlock x:Name="ProviderSummaryText" Opacity="0.7" TextWrapping="Wrap" Text="" />
+
+                        <!-- 可选中：下面的"手工添加模型"要有个明确的目标站点。 -->
+                        <ListView x:Name="ProviderList" SelectionMode="Single" MaxHeight="260">
+                            <ListView.ItemTemplate>
+                                <DataTemplate x:DataType="local:ProviderRow">
+                                    <!-- AutomationProperties.Name：不设的话读屏器念的是内部类型名。 -->
+                                    <Grid ColumnSpacing="10" Padding="0,6"
+                                          AutomationProperties.Name="{x:Bind Title}">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+
+                                        <CheckBox Grid.Column="0" IsChecked="{x:Bind Enabled, Mode=TwoWay}"
+                                                  Checked="ProviderEnabled_Changed"
+                                                  Unchecked="ProviderEnabled_Changed"
+                                                  VerticalAlignment="Center"
+                                                  AutomationProperties.Name="启用此站点" />
+
+                                        <StackPanel Grid.Column="1" Spacing="2">
+                                            <TextBlock Text="{x:Bind Title}" FontWeight="SemiBold"
+                                                       TextWrapping="Wrap" />
+                                            <TextBlock Text="{x:Bind Subtitle}" Opacity="0.6"
+                                                       FontSize="12" TextWrapping="Wrap" />
+                                        </StackPanel>
+
+                                        <TextBlock Grid.Column="2" Text="{x:Bind DefaultMark}"
+                                                   Opacity="0.7" VerticalAlignment="Center" />
+                                        <Button Grid.Column="3" Content="设为默认"
+                                                Click="SetDefaultProvider_Click"
+                                                VerticalAlignment="Center" />
+                                        <Button Grid.Column="4" Content="编辑"
+                                                Click="EditProvider_Click"
+                                                VerticalAlignment="Center" />
+                                        <Button Grid.Column="5" Content="删除"
+                                                Click="DeleteProvider_Click"
+                                                VerticalAlignment="Center" />
+                                    </Grid>
+                                </DataTemplate>
+                            </ListView.ItemTemplate>
+                        </ListView>
 
                         <Grid ColumnSpacing="10">
                             <Grid.ColumnDefinitions>
@@ -102,18 +143,72 @@
                                 <ColumnDefinition Width="Auto" />
                                 <ColumnDefinition Width="*" />
                             </Grid.ColumnDefinitions>
-                            <Button Grid.Column="0" x:Name="TestUpstreamButton" Content="测试连接"
-                                    Click="TestUpstream_Click" />
-                            <Button Grid.Column="1" x:Name="ClearKeyButton" Content="清除密钥"
-                                    Click="ClearKey_Click" />
-                            <TextBlock Grid.Column="2" x:Name="UpstreamTestResult" Opacity="0.7"
-                                       TextWrapping="Wrap" VerticalAlignment="Center" />
+                            <Button Grid.Column="0" x:Name="AddProviderButton" Content="新增站点"
+                                    Style="{StaticResource AccentButtonStyle}"
+                                    Click="AddProvider_Click" />
+                            <Button Grid.Column="1" x:Name="RefreshModelsButton" Content="刷新模型"
+                                    Click="RefreshModels_Click" />
+                            <TextBlock Grid.Column="2" x:Name="ProviderStatusText" Opacity="0.7"
+                                       TextWrapping="Wrap" VerticalAlignment="Center" Text="" />
                         </Grid>
 
                         <NumberBox x:Name="TimeoutBox" Header="请求超时（秒）"
                                    Minimum="5" Maximum="3600" SpinButtonPlacementMode="Compact" />
+                    </StackPanel>
+                </Expander>
 
-                        <TextBlock Text="模型名映射：客户端名=上游名，每行一条。未列出的原样透传。"
+                <!-- ===== 模型 ===== -->
+                <Expander Header="模型" IsExpanded="True"
+                          HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                    <StackPanel Spacing="10" Padding="4,10,4,4">
+                        <TextBlock x:Name="ModelSummaryText" Opacity="0.7" TextWrapping="Wrap" Text="" />
+
+                        <ListView x:Name="ModelList" SelectionMode="None" MaxHeight="300">
+                            <ListView.ItemTemplate>
+                                <DataTemplate x:DataType="local:ModelRow">
+                                    <Grid ColumnSpacing="10" Padding="0,6"
+                                          AutomationProperties.Name="{x:Bind Title}">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+
+                                        <CheckBox Grid.Column="0" IsChecked="{x:Bind Enabled, Mode=TwoWay}"
+                                                  Checked="ModelEnabled_Changed"
+                                                  Unchecked="ModelEnabled_Changed"
+                                                  VerticalAlignment="Center"
+                                                  AutomationProperties.Name="对外提供此模型" />
+
+                                        <StackPanel Grid.Column="1" Spacing="2">
+                                            <TextBlock Text="{x:Bind Title}" FontWeight="SemiBold"
+                                                       TextWrapping="Wrap" />
+                                            <TextBlock Text="{x:Bind Subtitle}" Opacity="0.6"
+                                                       FontSize="12" TextWrapping="Wrap" />
+                                        </StackPanel>
+
+                                        <Button Grid.Column="2" Content="删除" Click="DeleteModel_Click"
+                                                Visibility="{x:Bind DeleteVisibility}"
+                                                VerticalAlignment="Center" />
+                                    </Grid>
+                                </DataTemplate>
+                            </ListView.ItemTemplate>
+                        </ListView>
+
+                        <Grid ColumnSpacing="10">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBox Grid.Column="0" x:Name="NewModelBox" Header="手工添加模型名"
+                                     PlaceholderText="本地服务不实现 /models 时用这个" />
+                            <Button Grid.Column="1" x:Name="AddModelButton" Content="添加"
+                                    Click="AddModel_Click" VerticalAlignment="Bottom" />
+                        </Grid>
+                        <TextBlock x:Name="ModelAddHint" Opacity="0.7" TextWrapping="Wrap" FontSize="12"
+                                   Text="加进当前选中的站点；没有选中时加进默认站点。手工条目在刷新模型时不会被删掉。" />
+
+                        <TextBlock Text="模型名映射：接入方报的名字=站点要的名字，每行一条。未列出的原样透传。"
                                    TextWrapping="Wrap" Opacity="0.7" />
                         <TextBox x:Name="ModelMapBox" AcceptsReturn="True" Height="80"
                                  FontFamily="Consolas" PlaceholderText="gpt-4o=deepseek-chat" />

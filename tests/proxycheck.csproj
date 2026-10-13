@@ -49,6 +49,7 @@
     <Compile Include="Stream.cs" />
     <Compile Include="Tokens.cs" />
     <Compile Include="Merge.cs" />
+    <Compile Include="Providers.cs" />
     <Compile Include="LogCheck.cs" />
     <Compile Include="Server.cs" />
     <Compile Include="E2E.cs" />

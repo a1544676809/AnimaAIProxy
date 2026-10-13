@@ -11,10 +11,15 @@ namespace AnimaAIProxy.Core;
 /// 只有两件事：**把请求原样送上去**，以及**把响应原样拿回来**。
 /// 这里刻意不做任何"聪明"的事：
 ///
-/// - 不改请求体（除了调用方明确要求的那几处，见 <see cref="ToolLoop"/>）；
+/// - 不改请求体（除了模型名与调用方明确要求的那几处，见 <see cref="ToolLoop"/>）；
 /// - 不改响应体；
 /// - 不重试（上游的 429 / 余额不足 / 模型名写错，重试只会再犯一次）；
-/// - 不缓存。
+/// - 不缓存响应。
+///
+/// **按站点取地址、密钥、请求头**：每个请求先经 <see cref="ModelCatalog.Resolve"/>
+/// 定出目标站点（见 <see cref="ProviderProfile"/>），再拿那个站点自己的配置发出去。
+/// 这是"一个代理带多个模型提供商"的全部实现方式——客户端只报模型名，
+/// 地址与密钥都不经过它。
 ///
 /// 超时用 <see cref="HttpClient.Timeout"/> 之外的做法（<c>CancellationTokenSource</c>）：
 /// <see cref="HttpClient"/> 一旦发过请求，Timeout 就不可改，而代理的配置是
@@ -33,6 +38,7 @@ public sealed class UpstreamClient : IUpstream, IDisposable
         {
             // 上游的连接复用：代理的访问模式是"长时间空闲、来了请求要立刻答"，
             // 不池化的话每次都要重新 TLS 握手，首字延迟白白多几十到几百毫秒。
+            // 多个站点共用一个连接池：池是按主机分的，不会串台。
             PooledConnectionLifetime = TimeSpan.FromMinutes(5),
             AutomaticDecompression = DecompressionMethods.All,
             // 不自带超时，由每次请求的 CTS 管（见类注释）。
@@ -43,28 +49,25 @@ public sealed class UpstreamClient : IUpstream, IDisposable
         };
     }
 
-    /// <summary>把客户端给我们的令牌换成上游的密钥。绝不把客户端的令牌送上去。</summary>
-    private string UpstreamKey => _cfg.UpstreamApiKey;
+    /// <summary>没有可用站点时的统一说法。用户看到的下一句应当是"去界面加一个"。</summary>
+    public const string NoProviderMessage =
+        "没有可用的模型提供商：请在代理界面添加一个站点并勾选启用。";
 
-    private Uri BuildUri(string suffix)
+    /// <summary>
+    /// 定出这次请求发往哪个站点。**每一步都先判定再发**：判定失败时连请求都不该建，
+    /// 否则症状是"配置为空时收到一个上游的 401"，而真正的原因是本地没配站点。
+    /// </summary>
+    private Routing Route(JsonObject? body)
     {
-        var baseUrl = (_cfg.UpstreamBaseUrl ?? "").TrimEnd('/');
-        return new Uri(baseUrl + suffix, UriKind.Absolute);
+        var r = ModelCatalog.Resolve(_cfg, ChatWire.GetString(body, "model"));
+        if (r.Notable) ProxyLog.Write(r.Note);
+        return r;
     }
 
-    /// <summary>模型名映射：客户端报的名字 → 上游要的名字。没配就原样透传。</summary>
-    public string MapModel(string? requested)
+    private static Uri BuildUri(ProviderProfile p, string suffix)
     {
-        var model = (requested ?? "").Trim();
-        if (model.Length == 0) return model;
-
-        if (_cfg.ModelMap.TryGetValue(model, out var mapped) && !string.IsNullOrWhiteSpace(mapped))
-            return mapped.Trim();
-
-        if (_cfg.FallbackModelEnabled && !string.IsNullOrWhiteSpace(_cfg.FallbackModel))
-            return _cfg.FallbackModel.Trim();
-
-        return model;
+        var baseUrl = (p.BaseUrl ?? "").TrimEnd('/');
+        return new Uri(baseUrl + suffix, UriKind.Absolute);
     }
 
     /// <summary>
@@ -75,20 +78,19 @@ public sealed class UpstreamClient : IUpstream, IDisposable
     {
         try
         {
-            var model = ChatWire.GetString(body, "model");
-            var mapped = MapModel(model);
-            if (mapped.Length > 0 && !string.Equals(mapped, model, StringComparison.Ordinal))
-            {
-                body["model"] = mapped;
-                ProxyLog.Write($"模型名映射：{model} → {mapped}");
-            }
+            var r = Route(body);
+            if (r.Provider is null) return UpstreamResult.Transport(NoProviderMessage);
+
+            if (r.UpstreamModel.Length > 0 &&
+                !string.Equals(r.UpstreamModel, ChatWire.GetString(body, "model"), StringComparison.Ordinal))
+                body["model"] = r.UpstreamModel;
 
             // 无论客户端要什么，我们都按非流式问上游：工具循环需要在完整的
             // message 对象上做判断。真正需要流式的场合在 ProxyServer 里
-            // 走另一条完全独立的透传路径，不经过这里。
+            // 走另一条完全独立的注入路径，不经过这里。
             body["stream"] = false;
 
-            using var req = BuildRequest(body, stream: false);
+            using var req = BuildRequest(r.Provider, body, stream: false);
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             cts.CancelAfter(TimeSpan.FromSeconds(_cfg.TimeoutSeconds));
 
@@ -145,17 +147,16 @@ public sealed class UpstreamClient : IUpstream, IDisposable
     {
         try
         {
-            var model = ChatWire.GetString(body, "model");
-            var mapped = MapModel(model);
-            if (mapped.Length > 0 && !string.Equals(mapped, model, StringComparison.Ordinal))
-            {
-                body["model"] = mapped;
-                ProxyLog.Write($"模型名映射：{model} → {mapped}");
-            }
+            var r = Route(body);
+            if (r.Provider is null) return StreamStart.Transport(NoProviderMessage);
+
+            if (r.UpstreamModel.Length > 0 &&
+                !string.Equals(r.UpstreamModel, ChatWire.GetString(body, "model"), StringComparison.Ordinal))
+                body["model"] = r.UpstreamModel;
 
             body["stream"] = true;
 
-            using var req = BuildRequest(body, stream: true);
+            using var req = BuildRequest(r.Provider, body, stream: true);
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             cts.CancelAfter(TimeSpan.FromSeconds(_cfg.TimeoutSeconds));
 
@@ -196,34 +197,49 @@ public sealed class UpstreamClient : IUpstream, IDisposable
         }
     }
 
-    /// <summary>拉上游的 /models，原样返回。客户端拿它列模型。</summary>
-    public async Task<(bool Ok, int Status, string Raw, string Error)> ModelsAsync(CancellationToken ct)
+    /// <summary>
+    /// 拉某个站点的 /models。
+    ///
+    /// 只给界面上的"测试连接 / 刷新模型"与 <see cref="ProxyServer"/> 的按需拉取用——
+    /// 对外公布的 <c>/v1/models</c> 读的是本地模型表
+    /// （<see cref="ModelCatalog.ToOpenAiModels"/>），因为那张表才是用户勾选过的结果。
+    ///
+    /// <paramref name="timeoutSeconds"/> 为 0 时用 <c>clamp(TimeoutSeconds, 5, 30)</c>。
+    /// 按需拉取会传一个更短的值：那是在一个 GET 里顺手做的事，不该让接入方
+    /// 在启动时干等半分钟。
+    /// </summary>
+    public async Task<(bool Ok, int Status, List<string> Ids, string Raw, string Error)> FetchModelsAsync(
+        ProviderProfile provider, CancellationToken ct, int timeoutSeconds = 0)
     {
         try
         {
-            using var req = new HttpRequestMessage(HttpMethod.Get, BuildUri("/models"));
-            Authorize(req);
+            using var req = new HttpRequestMessage(HttpMethod.Get, BuildUri(provider, "/models"));
+            Authorize(req, provider);
+
+            var seconds = timeoutSeconds > 0
+                ? Math.Clamp(timeoutSeconds, 2, 120)
+                : Math.Clamp(_cfg.TimeoutSeconds, 5, 30);
 
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            cts.CancelAfter(TimeSpan.FromSeconds(Math.Clamp(_cfg.TimeoutSeconds, 5, 30)));
+            cts.CancelAfter(TimeSpan.FromSeconds(seconds));
 
             using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseContentRead, cts.Token)
                                       .ConfigureAwait(false);
             var raw = await resp.Content.ReadAsStringAsync(cts.Token).ConfigureAwait(false);
 
             if (!resp.IsSuccessStatusCode)
-                return (false, (int)resp.StatusCode, raw,
+                return (false, (int)resp.StatusCode, new List<string>(), raw,
                     $"HTTP {(int)resp.StatusCode} {resp.StatusCode}：{Truncate(raw, 300)}");
 
-            return (true, (int)resp.StatusCode, raw, "");
+            return (true, (int)resp.StatusCode, ModelCatalog.ParseModelIds(raw), raw, "");
         }
         catch (OperationCanceledException)
         {
-            return (false, 0, "", "上游 /models 超时");
+            return (false, 0, new List<string>(), "", "请求 /models 超时");
         }
         catch (Exception ex)
         {
-            return (false, 0, "", ex.Message);
+            return (false, 0, new List<string>(), "", ex.Message);
         }
     }
 
@@ -232,15 +248,30 @@ public sealed class UpstreamClient : IUpstream, IDisposable
     ///
     /// 给 /v1 下的其它端点（embeddings、completions 之类）用。这些端点我们
     /// 不注入工具、也不该理解它们的语义——**理解得越多，兼容性越差**。
+    ///
+    /// 站点选择：从请求体里读 <c>model</c> 按模型表路由（embeddings 也带模型名），
+    /// 读不到就用默认站点。**只用来选站点，不改请求体一个字节**——透传就该是透传。
     /// </summary>
     public async Task<(bool Ok, int Status, string ContentType, byte[] Body, string Error)> PassthroughAsync(
         HttpMethod method, string path, string query, string? contentType, byte[] body, CancellationToken ct)
     {
         try
         {
-            var uri = BuildUri(path) + query;
+            var provider = _cfg.DefaultProvider;
+            if (body.Length > 0 && LooksJson(contentType))
+            {
+                var parsed = ChatWire.TryParseObject(Encoding.UTF8.GetString(body));
+                if (parsed is not null)
+                {
+                    var r = ModelCatalog.Resolve(_cfg, ChatWire.GetString(parsed, "model"));
+                    if (r.Provider is not null) provider = r.Provider;
+                }
+            }
+            if (provider is null) return (false, 0, "application/json", Array.Empty<byte>(), NoProviderMessage);
+
+            var uri = BuildUri(provider, path) + query;
             using var req = new HttpRequestMessage(method, uri);
-            Authorize(req);
+            Authorize(req, provider);
 
             if (body.Length > 0)
             {
@@ -271,13 +302,16 @@ public sealed class UpstreamClient : IUpstream, IDisposable
         }
     }
 
-    private HttpRequestMessage BuildRequest(JsonObject body, bool stream)
+    private static bool LooksJson(string? contentType) =>
+        contentType is null || contentType.Contains("json", StringComparison.OrdinalIgnoreCase);
+
+    private HttpRequestMessage BuildRequest(ProviderProfile provider, JsonObject body, bool stream)
     {
-        var req = new HttpRequestMessage(HttpMethod.Post, BuildUri("/chat/completions"))
+        var req = new HttpRequestMessage(HttpMethod.Post, BuildUri(provider, "/chat/completions"))
         {
             Content = new StringContent(body.ToJsonString(), new UTF8Encoding(false), "application/json")
         };
-        Authorize(req);
+        Authorize(req, provider);
 
         if (stream)
             req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
@@ -286,16 +320,25 @@ public sealed class UpstreamClient : IUpstream, IDisposable
     }
 
     /// <summary>
-    /// 挂上上游密钥。**只挂上游的**——客户端拿来鉴权的那枚代理令牌
-    /// 绝不能出现在发往上游的请求里，否则我们"不让客户端拿到真密钥"这件事
-    /// 就白做了（令牌泄露的上游账号虽不同，但等于把代理的鉴权边界
-    /// 泄露给了上游）。
+    /// 给请求装上认证与站点自定义头。三处调用点（chat / 流式 / models）共用它，
+    /// 免得各自记得"还要加自定义头"——漏一处就是那个功能在某条路径上静默失效，
+    /// 而症状只是"某个平台报 401"，很难追到是漏加头。
+    ///
+    /// 顺序有讲究：先设 <c>Authorization</c>，再应用自定义头。
+    /// <see cref="CustomHeaders.Parse"/> 已经拒绝了手填 Authorization，
+    /// 所以这里不存在互相覆盖的问题；万一将来放开，也应当是用户显式填的赢。
+    ///
+    /// **只挂目标站点的密钥**——客户端拿来鉴权的那枚代理令牌绝不能出现在发往上游的
+    /// 请求里，否则我们"不让客户端拿到真密钥"这件事就白做了。
     /// </summary>
-    private void Authorize(HttpRequestMessage req)
+    private static void Authorize(HttpRequestMessage req, ProviderProfile provider)
     {
-        var key = UpstreamKey;
+        var key = provider.ApiKey;
         if (!string.IsNullOrWhiteSpace(key))
             req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", key.Trim());
+
+        var custom = CustomHeaders.Parse(provider.CustomHeaders);
+        if (custom.Entries.Count > 0) CustomHeaders.Apply(req, custom);
     }
 
     private static string Truncate(string s, int max) =>

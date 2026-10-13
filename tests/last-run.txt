@@ -3,7 +3,7 @@ AnimaAIProxy 回归：all
 === 1. 词库内核（vendored：VocabDb / TagSearch / TagSections） ===
        词库：vocab.sqlite（113.0 MB）
        seed：E:\ComfyUI\anima-vocab\seed.json
-       载入耗时 1269 ms
+       载入耗时 1287 ms
   ok   标签数 > 30 万                                           True
   ok   Anima 索引非空
 
@@ -53,9 +53,9 @@ AnimaAIProxy 回归：all
 
 === 6. 工具层的中文解析回落（补上内核的括号限定缺口） ===
   ok   danbooru_resolve_tag 能解析裸形式「弓」（内核落空 → 回落 Search）
-       resolve_tag(弓) → 核对「弓」→ bow (weapon)（anima）
+       resolve_tag(弓) → 核对「弓」→ bow (weapon)（Anima 常用）
   ok   「箭头」→ arrow (symbol)
-       resolve_tag(箭头) → 核对「箭头」→ arrow (symbol)（anima）
+       resolve_tag(箭头) → 核对「箭头」→ arrow (symbol)（Anima 常用）
   ok   `少女` 仍是 NOT FOUND（回落让内核裁类别，不吃角色标签）
   ok   前缀相似不算命中（`初音未` 仍是 NOT FOUND）
   ok   人物名与内核保持一致（NOT FOUND），并把模型引向 search
@@ -297,6 +297,145 @@ AnimaAIProxy 回归：all
   ok   缺省视为非流式                                              False
   ok   stream 写成字符串不当真                                      False
 
+=== 回归进程默认不碰用户真数据（配置与令牌库已全局重定向） ===
+  ok   配置路径在跑第一节之前就已被重定向
+  ok   配置路径不指向真配置
+  ok   令牌库路径在跑第一节之前就已被重定向
+  ok   令牌库路径不指向真令牌库
+  ok   LoadReal 读真配置不抛异常
+  ok   LoadReal 不改动真配置一个字节
+  ok   LoadReal 读真配置之后，重定向仍然生效（没有被「读完恢复」拆掉）
+
+=== 配置路径可被测试重定向（回归不许写掉用户的真配置） ===
+  ok   重定向后 ConfigPath 指向临时文件                               "C:\Users\14947\AppData\Local\Temp\aip-cfg-90e404be.json"
+  ok   重定向后不再指向真配置
+  ok   Save 写的是临时文件
+  ok   读回来的就是刚写的那份                                          45999
+  ok   还原后回到进程级防线设的路径（而不是真配置）                               "C:\Users\14947\AppData\Local\Temp\aip-check-6b3125ed\proxy.config.json"
+  ok   还原后依然不指向真配置
+
+=== 自定义请求头：解析 ===
+  ok   注释与空行不算条目                                            3
+  ok   冒号形式的名字对                                             "x-opencode-session"
+  ok   冒号形式的值对（首尾空白去掉）                                      "abc123"
+  ok   等号形式也认，且值里的冒号不会被误切（取最早的分隔符）                          "https://example.com"
+  ok   等号形式的头名干净（不含被误切进来的片段）                                "HTTP-Referer"
+  ok   没有坏行                                                 0
+  ok   值里的等号不参与切分                                           "a=b"
+  ok   名字只到冒号为止                                             "X-Token"
+  ok   合法的只有 Dup 的第一条                                       1
+  ok   五条坏行各自被拒（不是静默丢掉）                                     5
+  ok   头名非法时说明原因
+  ok   空值被拒
+  ok   手填 Authorization 被拒（它会和 API Key 拼成一个坏 token）
+  ok   重复头被拒
+  ok   缺分隔符被拒
+  ok   DescribeProblems 把问题拼成一句话                            True
+  ok   没问题时 DescribeProblems 是空串                            ""
+
+=== 自定义请求头：应用到请求（含实体头的分流） ===
+  ok   头名非法时 TryAddWithoutValidation 返回 false 而不抛（静默失败的证据）  False
+  ok   普通头进了 Headers                                        "T"
+  ok   实体头在 Headers 上会抛（所以必须走 Content.Headers）
+  ok   实体头走的是 Content.Headers
+  ok   内容还没设时 Apply 兜底建了 Content（实体头才有地方放）
+  ok   兜底之后实体头确实生效了                                         "text/plain"
+
+=== 按模型名路由到站点 ===
+  ok   模型表命中站点A                                             "01855c7101bf"
+  ok   模型名大小写不敏感                                            "07b9972c5472"
+  ok   命中的是模型表里的那个名字（发往上游的就是它）                              "a1"
+  ok   客户端报的名字原样记着（响应里回写用它）                                 "a1"
+  ok   命中的判定值得进日志
+  ok   不在模型表里 → 默认站点                                        "01855c7101bf"
+  ok   不在模型表里 → 模型名原样透传（上游自己会回准确的错）                         "local-llama"
+  ok   这种判定不写日志（否则每个请求都刷一行）                                 False
+  ok   关掉的模型不再路由到它的站点                                       "07b9972c5472"
+  ok   模型名仍然原样发出（不猜、不改）                                     "a2"
+  ok   这是回落，不值得每个请求都写一行日志                                   False
+  ok   停用的站点不再接受路由                                          "01855c7101bf"
+  ok   模型名仍然原样发出                                            "b1"
+
+=== 模型名映射优先于模型表 ===
+  ok   映射先换名字                                               "b1"
+  ok   再按换过的名字路由到站点B                                        "07b9972c5472"
+  ok   映射的判定进日志（用户配了它就想看到生效）
+  ok   日志里说清了换成了什么
+
+=== 默认站点的选取与失效 ===
+  ok   指针指到谁就是谁                                             "07b9972c5472"
+  ok   指针失效 → 回落到第一个启用的站点（而不是让请求全废）                         "01855c7101bf"
+  ok   指针指向一个已停用的站点 → 回落到启用的那个                              "01855c7101bf"
+  ok   全部停用 → 没有可用站点（如实报错，而不是偷偷发给一个停用的站点）                   null
+  ok   此时路由也拿不到站点                                           null
+  ok   一个站点都没有时给 null（调用方据此报「没有可用的模型提供商」）                   null
+  ok   空配置也要有可用的默认站点（Normalize 之后）                          True
+
+=== 对外公布的模型表 = 勾选过的结果 ===
+  ok   启用的模型在表里
+  ok   关掉的模型不在表里（用户关它就是为了让它消失）
+  ok   第二个站点的模型也在
+  ok   一共两个                                                 2
+  ok   停用的站点整个从表里消失
+  ok   只剩站点A那一个                                             1
+  ok   映射表里的名字也报出去（平台启动时会拿它校验配置）
+  ok   映射到已存在的模型时不重复出现
+  ok   总数为 3                                                3
+  ok   owned_by 填的是站点显示名（一眼看出模型来自哪里）
+  ok   映射出来的名字标成 animaiproxy
+
+=== /models 响应的四种形状 ===
+  ok   标准 data 数组                                           "m1,m2"
+  ok   models 数组                                            "n1"
+  ok   裸字符串数组                                               "x,y"
+  ok   对象数组里取 model 字段                                      "z"
+  ok   重复的模型名只留一条                                           1
+  ok   不认识的形状 → 空表而不是抛                                      0
+  ok   不是 JSON → 空表而不是抛                                     0
+  ok   空串 → 空表                                              0
+
+=== 拉取模型表：保留用户的开关状态 ===
+  ok   上游不再报的模型被移除                                          null
+  ok   新拉到的默认启用
+  ok   **用户关掉的仍然是关的**（刷新不该把他的设置打开）
+  ok   手工加的条目刷新后还在（本地服务不实现 /models，填了又消失像 bug）
+  ok   记录下拉取时间                                              True
+  ok   条目总数为 4                                              4
+  ok   同一批里的重复与空白被清掉                                        1
+
+=== 站点自身的归一化 ===
+  ok   空 Id 补一个
+  ok   地址去空白                                                "http://y/v1"
+  ok   名字去空白                                                "名字"
+  ok   同名模型只留一条（两条会让开关看起来失灵）                                1
+  ok   显示名回落：没起名时用主机名                                       "api.deepseek.com"
+  ok   没有 scheme 也解析得出主机名（用户常常先敲半截）                         "api.deepseek.com"
+  ok   去掉端口                                                 "127.0.0.1"
+  ok   什么都没有时的占位                                            "未命名站点"
+
+=== 旧版单上游配置 → 模型提供商 ===
+  ok   迁移出一个站点                                              1
+  ok   地址原样搬过去                                              "https://api.deepseek.com/v1"
+  ok   名字从主机名派生（旧配置没有名字）                                    "api.deepseek.com"
+  ok   密文**原样**搬走（不解密再加密，少一次经手）                             "AQAAANCMnd8BFdERjHoAwE/Cl+sBAAAAOGt2ynk9wEmzfYBGqIqeCgAAAAACAAAAAAAQZgAAAAEAACAAAACSd3Ghup…"
+  ok   默认站点指向它                                              "bbb6cf1cd592"
+  ok   旧字段被置空（不留两份真值来源）
+  ok   旧密钥字段也置空
+  ok   迁移后密钥能正常读出来（缓存没挡住）                                   "sk-old-key-123456"
+  ok   HasKey 为真                                            True
+  ok   新配置里不再写旧字段（文件收敛到一种形状）
+
+=== 迁移不会重复执行、也不会覆盖已有站点 ===
+  ok   空配置给一个默认站点（界面一打开就有东西可编辑）                             1
+  ok   默认站点的地址是预填的那个                                        "https://api.deepseek.com/v1"
+  ok   已有站点时不再造第二个                                          1
+  ok   用的是已有的那个                                             "新站点"
+  ok   旧字段照样置空
+  ok   重复 Normalize 不会越迁越多                                  1
+
+=== 配置里的站点 Id 重复 ===
+  ok   重复 Id 被改掉（否则「按 Id 找站点」会随机命中）
+
 === 令牌：生成与校验 ===
   ok   明文带 aip- 前缀（一眼看出是代理签发的）
   ok   明文足够长
@@ -327,30 +466,40 @@ AnimaAIProxy 回归：all
   ok   轮数越界 → 默认                                            4
   ok   单次调用上限越界 → 默认                                        12
   ok   监听范围非法 → local                                       "local"
-  ok   空上游地址 → 有默认值
+  ok   空配置归一化后有一个默认站点（否则请求无处可发）
   ok   local 时只监听回环                                         "127.0.0.1"
   ok   ModelMap 不会被清成 null
   ok   LAN 归一化成小写                                           "lan"
   ok   lan 时监听所有网卡                                          "0.0.0.0"
 
-=== 模型名映射 ===
+=== 模型名映射（判定在 ModelCatalog，这里只确认它接进了配置） ===
   ok   配了映射就换                                               "deepseek-v4-pro"
   ok   大小写不敏感                                               "deepseek-v4-pro"
   ok   没配映射的原样透传（不猜）                                        "some-local-model"
   ok   空模型名原样                                               ""
+  ok   映射后按换过的名字路由到那个站点                                     "8eb4b8200566"
   ok   开了兜底时未映射的走兜底                                         "backup-model"
   ok   默认不开兜底：静默换模型比报错更难查                                   False
 
-=== 上游密钥（DPAPI） ===
+=== 站点密钥（DPAPI） ===
   ok   没设密钥时明文为空                                            ""
-  ok   没设时 HasUpstreamKey 为假                                False
+  ok   没设时密文为空                                              ""
   ok   设进去之后能读回来                                            "sk-secret-value-12345"
-  ok   HasUpstreamKey 为真                                    True
   ok   落盘的是密文而不是明文
   ok   序列化结果里不含明文密钥（JsonIgnore 生效）
   ok   但密文在里面
   ok   能清空                                                  ""
-  ok   清空后 HasUpstreamKey 为假                                False
+  ok   清空后密文也为空                                             ""
+
+=== 日志：摘要进界面面板，异常栈只进文件 ===
+  ok   异常确实带了调用栈（否则这一节什么都没测到）
+  ok   检测器有效：原始 ex.ToString() 里确实有调用栈行
+  ok   面板里收到了这次记录
+  ok   面板这一行里有摘要与原因
+  ok   面板这一行里**没有**调用栈
+  ok   面板里只有一行（栈没有被逐行摊进来）
+  ok   日志文件已经产生
+  ok   文件里有完整调用栈（排查靠它）
 
 === 代理 HTTP 端点（真的起一次 Kestrel） ===
   ok   服务起来了
@@ -368,10 +517,14 @@ AnimaAIProxy 回归：all
   ok   上游连不上 → 502                                          502
   ok   错误体里有 error.message
   ok   错误信息说清了是连不上上游，而不是含糊的「请求失败」
-       上游不可达时的响应：{"error":{"message":"连不上上游：由于目标计算机积极拒绝，无法连接。 (127.0.0.1:60487)","type":"upstream_error"}}
+       上游不可达时的响应：{"error":{"message":"连不上上游：由于目标计算机积极拒绝，无法连接。 (127.0.0.1:61927)","type":"upstream_error"}}
   ok   坏 JSON → 400                                         400
-  ok   上游 /models 挂了，但回退到配置里的映射表 → 200                      200
-  ok   映射表里的名字出现在模型列表里（平台启动时会拿它校验配置）
+  ok   上游连不上也照常回 200（模型表是本地勾选的结果）                           200
+  ok   勾选启用的模型在表里
+  ok   关掉的模型不在表里（用户关它就是为了让它消失）
+  ok   映射表里的名字也在（平台启动时会拿它校验配置）
+  ok   停用整个站点 → 它下面的模型全部消失
+  ok   映射表的名字不受站点开关影响
   ok   关掉工具注入后仍然只是转发，状态码照样如实
   ok   服务停了
   ok   停止后端口已释放
@@ -410,8 +563,8 @@ AnimaAIProxy 回归：all
   ok   流式路径也注入了我们的工具（旧行为是不注入）
   ok   流式路径也带了 reasoning_effort（不劫持）                        "high"
   ok   数据是分多次到达的（收到 6 次读，不是一次）
-  ok   首块远早于最后一块（首块 0ms / 总 1084ms）
-       流式时序：读次数=6，首块=0ms，总耗时=1084ms
+  ok   首块远早于最后一块（首块 0ms / 总 1090ms）
+       流式时序：读次数=6，首块=0ms，总耗时=1090ms
   ok   流式注入：上游被问了两次（工具轮 + 收尾轮）                              2
   ok   第二轮请求里带上了 role:tool 的工具结果
   ok   流式路径里工具是真的在本地执行的（弓 → bow (weapon)）
@@ -420,6 +573,17 @@ AnimaAIProxy 回归：all
   ok   客户端的流里有 finish_reason=stop
   ok   客户端的流里以 [DONE] 收尾
   ok   /v1/models 200                                       200
-  ok   上游的模型出现在列表里
+  ok   从未拉过的站点被按需拉了一次，模型出现在表里
+  ok   站点自己拉完就记下了时间（不会每次 GET 都重拉）
+  ok   响应是 OpenAI 的 list 形状                                 "list"
+  ok   关掉的模型从对外模型表里消失
+  ok   按模型名路由：整条链路走通                                        200
+  ok   请求真的发到了站点2                                           1
+  ok   默认站点一个字节都没收到（没有广播式重发）                                2
+  ok   站点2 收到的模型名就是它自己的那个                                   "only-on-2"
+  ok   站点自带的路由头发出去了
+  ok   第二个自定义头也发出去了
+  ok   站点1 的历史请求里没有站点2 的专属头
+  ok   响应里的模型名回写成客户端报的那个                                    "only-on-2"
 
 全部通过。

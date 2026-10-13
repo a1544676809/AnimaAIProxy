@@ -20,7 +20,18 @@ public sealed class ProxyConfig
     public static string Dir => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AnimaAIProxy");
 
-    public static string ConfigPath => Path.Combine(Dir, "proxy.config.json");
+    /// <summary>
+    /// 配置文件路径的**测试替身**。非 null 时一切读/写都走它。
+    ///
+    /// 为什么必须有：<see cref="Save"/> 会被 <c>ProxyServer</c> 在"按需拉取模型表"
+    /// 时调用，也就是说**一次 HTTP 请求就会写配置文件**。回归里若不重定向，
+    /// 测试用的临时配置会直接盖掉用户的真配置——而症状是"跑完回归，站点和密钥
+    /// 全没了"，且没有任何提示。这与 <see cref="TokenStore.FilePathOverride"/>
+    /// 是同一道防线，理由也一样。
+    /// </summary>
+    public static string? FilePathOverride { get; set; }
+
+    public static string ConfigPath => FilePathOverride ?? Path.Combine(Dir, "proxy.config.json");
 
     /// <summary>
     /// 词库位置的候选来源，按可信度从高到低。**第一优先是 AnimaCaptioner 的
@@ -94,32 +105,70 @@ public sealed class ProxyConfig
     /// <summary>启动后是否立刻开始监听。关掉之后要用界面上的开关手动开。</summary>
     public bool AutoStart { get; set; } = true;
 
-    // ---------------- 上游 ----------------
+    // ---------------- 模型提供商 ----------------
 
     /// <summary>
-    /// 上游 OpenAI 兼容接口的基地址，**必须自带 /v1**（与 AnimaCaptioner 的约定一致，
-    /// 不做路径自动补全：补全的规则永远猜不准别人的部署形状）。
+    /// 模型提供商站点。请求按模型名路由到对应站点，见 <see cref="ModelCatalog.Resolve"/>。
+    ///
+    /// 只有 <see cref="ProviderProfile.Enabled"/> 的站点会被拉取模型、出现在对外
+    /// 公布的模型表里、并接受请求。取消勾选等于"先放一边"，不必删配置。
     /// </summary>
-    public string UpstreamBaseUrl { get; set; } = "https://api.deepseek.com/v1";
-
-    /// <summary>上游密钥（DPAPI 加密后的 base64）。明文只在内存里出现。</summary>
-    public string UpstreamKeyProtected { get; set; } = "";
+    public List<ProviderProfile> Providers { get; set; } = new();
 
     /// <summary>
-    /// 上游密钥的明文视图。**永不序列化**（见 JsonIgnore），避免某次"顺手保存"
-    /// 把明文写进配置文件。
+    /// 默认站点：模型名不在任何站点模型表里时发给它（见
+    /// <see cref="ModelCatalog.Resolve"/> 第 3 条）。界面上的"设为默认"改的就是它。
     /// </summary>
-    [JsonIgnore]
-    public string UpstreamApiKey
+    public string DefaultProviderId { get; set; } = "";
+
+    /// <summary>新配置默认带的那个站点地址。**必须自带 /v1**（与 AnimaCaptioner 的约定一致，不做路径自动补全）。</summary>
+    public const string DefaultProviderBaseUrl = "https://api.deepseek.com/v1";
+
+    // ---- 旧版单上游配置：只用于读旧文件并迁移，见 MigrateLegacyUpstream ----
+
+    /// <summary>
+    /// 旧版字段。迁移后置为 null，新代码一律用 <see cref="Providers"/>。
+    ///
+    /// 可空是**为了让新配置文件里彻底不出现这两个键**：`WhenWritingDefault` 对
+    /// 字符串的"默认值"是 null 而不是空串，写成空串照样会被序列化出来，
+    /// 于是文件里永远留着两个没人读的字段——下次有人看到它们会以为还能手改。
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? UpstreamBaseUrl { get; set; }
+
+    /// <summary>旧版字段（DPAPI 密文）。迁移时**原样搬走**，不解密再加密。</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? UpstreamKeyProtected { get; set; }
+
+    /// <summary>按 Id 找站点。**不筛启用状态**：界面要能选中一个已停用的站点去编辑它。</summary>
+    public ProviderProfile? ProviderById(string? id)
     {
-        get => Secrets.TryUnprotect(UpstreamKeyProtected, Secrets.UpstreamEntropy) ?? "";
-        set => UpstreamKeyProtected = string.IsNullOrEmpty(value)
-            ? ""
-            : Secrets.Protect(value, Secrets.UpstreamEntropy);
+        var want = (id ?? "").Trim();
+        if (want.Length == 0) return null;
+        return Providers.FirstOrDefault(p => string.Equals(p.Id, want, StringComparison.Ordinal));
     }
 
+    /// <summary>
+    /// 默认站点：模型名不在任何站点模型表里时发给它（见
+    /// <see cref="ModelCatalog.Resolve"/> 第 3 条）。
+    ///
+    /// **只认启用中的站点**。指针指向一个已停用的站点时回落到第一个启用的——
+    /// 否则"取消勾选"这个动作在界面上看起来生效了，请求却照旧发给它，
+    /// 而这种不一致不会有任何症状。
+    ///
+    /// 全部站点都停用时返回 null，调用方如实报"没有可用的模型提供商"。
+    /// **刻意不偷偷挑一个停用的站点**：用户把它们全关掉，就是想让它别再往外发。
+    /// </summary>
     [JsonIgnore]
-    public bool HasUpstreamKey => !string.IsNullOrEmpty(UpstreamKeyProtected);
+    public ProviderProfile? DefaultProvider
+    {
+        get
+        {
+            var pinned = ProviderById(DefaultProviderId);
+            if (pinned is { Enabled: true }) return pinned;
+            return Providers.FirstOrDefault(p => p.Enabled);
+        }
+    }
 
     /// <summary>
     /// 模型名映射：客户端报的模型名 → 上游真正要的模型名。
@@ -218,6 +267,38 @@ public sealed class ProxyConfig
         Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
     };
 
+    /// <summary>
+    /// 只读地读**真实**配置文件，无视 <see cref="FilePathOverride"/>。
+    ///
+    /// 存在的理由：回归进程会把 <see cref="FilePathOverride"/> 全局指向临时目录
+    /// （见 tests/Program.cs），而 live 联调要用用户的真密钥。给它一条只读通道，
+    /// "会不会写掉用户配置"就不再取决于每个测试是否记得重定向。
+    ///
+    /// **绝不落盘**：文件缺失或损坏时返回内存里的默认值，而不是像 <see cref="Load"/>
+    /// 那样 Save()——否则这条"只读"通道本身就成了又一条写掉用户配置的路径。
+    /// </summary>
+    public static ProxyConfig LoadReal()
+    {
+        try
+        {
+            var path = Path.Combine(Dir, "proxy.config.json");
+            if (File.Exists(path))
+            {
+                var cfg = JsonSerializer.Deserialize<ProxyConfig>(File.ReadAllText(path), Options);
+                if (cfg is not null)
+                {
+                    cfg.Normalize();
+                    return cfg;
+                }
+            }
+        }
+        catch { /* 读不到就用默认值；这里刻意不记日志、不备份、不写盘 */ }
+
+        var fallback = new ProxyConfig();
+        fallback.Normalize();
+        return fallback;
+    }
+
     public static ProxyConfig Load()
     {
         try
@@ -264,16 +345,72 @@ public sealed class ProxyConfig
         if (TimeoutSeconds < 5) TimeoutSeconds = 5;
         if (MaxToolRounds is < 1 or > 12) MaxToolRounds = 4;
         if (MaxToolCallsPerRequest is < 1 or > 64) MaxToolCallsPerRequest = 12;
-        if (string.IsNullOrWhiteSpace(UpstreamBaseUrl)) UpstreamBaseUrl = "https://api.deepseek.com/v1";
         ModelMap ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        Providers ??= new List<ProviderProfile>();
+        MigrateLegacyUpstream();
+
+        foreach (var p in Providers) p.Normalize();
+        // 同一份配置里 Id 重复会让"按 Id 找站点"随机命中一个，而界面上两个条目
+        // 看起来都正常。手改配置文件才可能出现，所以在这里补一道。
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var p in Providers.Where(p => !ids.Add(p.Id)).ToList())
+        {
+            p.Id = ProviderProfile.NewId();
+            ids.Add(p.Id);
+        }
+
+        // 一个站点都没有时给一个空站点：这样"默认站点"永远存在，
+        // 界面一打开就有东西可编辑，请求也不会因为 Providers 为空而走进
+        // 一条没被任何回归覆盖的分支。
+        if (Providers.Count == 0)
+            Providers.Add(new ProviderProfile { Name = "默认站点", BaseUrl = DefaultProviderBaseUrl });
+
+        if (ProviderById(DefaultProviderId) is null) DefaultProviderId = Providers[0].Id;
     }
+
+    /// <summary>
+    /// 把旧版"单一上游"配置搬成一个站点。
+    ///
+    /// **密文原样搬走**（两边用同一个 DPAPI 熵），所以不必解密再加密——少一次
+    /// 经手就少一次出错的机会，而且即使当前账户解不开（换过机器）也不会因此丢东西。
+    ///
+    /// 搬完就把旧字段清空，让配置文件收敛到新形状：留着两份真值来源，
+    /// 下次改了一处而另一处没改，"设置里显示 A、实际请求发给 B"这类问题就来了。
+    /// </summary>
+    private void MigrateLegacyUpstream()
+    {
+        var hasLegacy = !string.IsNullOrWhiteSpace(UpstreamBaseUrl) ||
+                        !string.IsNullOrEmpty(UpstreamKeyProtected);
+
+        if (Providers.Count == 0 && hasLegacy)
+        {
+            var p = new ProviderProfile
+            {
+                Name = ProviderProfile.HostOf(UpstreamBaseUrl),
+                BaseUrl = string.IsNullOrWhiteSpace(UpstreamBaseUrl) ? DefaultProviderBaseUrl : UpstreamBaseUrl!.Trim(),
+                ApiKeyProtected = UpstreamKeyProtected ?? ""
+            };
+            Providers.Add(p);
+            DefaultProviderId = p.Id;
+            ProxyLog.Write("已把旧版单上游配置迁移为模型提供商：" + p.DisplayName);
+        }
+
+        UpstreamBaseUrl = null;
+        UpstreamKeyProtected = null;
+    }
+
+    private static readonly object SaveLock = new();
 
     public void Save()
     {
         try
         {
             Directory.CreateDirectory(Dir);
-            File.WriteAllText(ConfigPath, JsonSerializer.Serialize(this, Options));
+            var json = JsonSerializer.Serialize(this, Options);
+            // 加锁：界面保存与"按需拉取模型表"（来自 HTTP 请求线程）会同时写这个文件，
+            // 交错写下去会得到一个半截 JSON，而下次启动时它会被当成"配置坏了"备份掉。
+            lock (SaveLock) File.WriteAllText(ConfigPath, json);
         }
         catch (Exception ex)
         {

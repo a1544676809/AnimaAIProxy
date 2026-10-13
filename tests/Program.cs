@@ -1,3 +1,5 @@
+using AnimaAIProxy.Core;
+
 namespace AnimaAIProxy.Tests;
 
 /// <summary>
@@ -8,6 +10,7 @@ namespace AnimaAIProxy.Tests;
 ///     proxycheck loop       # 透明工具循环：自有调用执行、外来调用放行、影子历史
 ///     proxycheck stream     # 流式工具循环：正文实时转发、tool_call 分片拼装、不劫持
 ///     proxycheck merge      # 请求体改写：思考字段一律不劫持
+///     proxycheck providers  # 多模型提供商：请求头解析、按模型名路由、模型表聚合、旧配置迁移
 ///     proxycheck tokens     # 代理令牌与鉴权
 ///     proxycheck log        # 日志：摘要进界面面板，异常栈只进文件
 ///     proxycheck server     # HTTP 端点：真的起一次 Kestrel，走一遍路由与鉴权
@@ -25,6 +28,8 @@ public static class Program
         Harness.InitConsole();
         var which = args.Length > 0 ? args[0].Trim().ToLowerInvariant() : "all";
 
+        GuardUserData();
+
         Console.WriteLine("AnimaAIProxy 回归：" + which);
 
         switch (which)
@@ -34,6 +39,7 @@ public static class Program
             case "loop": Loop.Run(); break;
             case "stream": StreamLoopCheck.Run(); break;
             case "merge": Merge.Run(); break;
+            case "providers": Providers.Run(); break;
             case "tokens": Tokens.Run(); break;
             case "log": LogCheck.Run(); break;
             case "server": Server.Run(); break;
@@ -45,6 +51,7 @@ public static class Program
                 Loop.Run();
                 StreamLoopCheck.Run();
                 Merge.Run();
+                Providers.Run();
                 Tokens.Run();
                 LogCheck.Run();
                 Server.Run();
@@ -52,7 +59,7 @@ public static class Program
                 break;
             default:
                 Console.WriteLine("未知的检查项：" + which);
-                Console.WriteLine("可用：vocab | tools | loop | merge | tokens | log | server | e2e | all | live");
+                Console.WriteLine("可用：vocab | tools | loop | merge | providers | tokens | log | server | e2e | all | live");
                 return 2;
         }
 
@@ -64,5 +71,25 @@ public static class Program
         }
         Console.WriteLine($"{Harness.Failures} 项失败。");
         return 1;
+    }
+
+    /// <summary>
+    /// 把配置与令牌库**全局**重定向到临时目录，在跑任何一节之前。
+    ///
+    /// 为什么必须在这里做，而不是让各节自己重定向：这已经出过一次真实事故——
+    /// <c>ProxyServer</c> 在"按需拉取模型表"时会调用 <see cref="ProxyConfig.Save"/>，
+    /// 于是跑一次 <c>e2e</c> 就把用户的真配置盖成了测试用的临时配置，
+    /// 站点与密钥全没了、且没有任何提示。逐节重定向的问题是**它是可选的**：
+    /// 下次新写一节忘了写，事故就重演，而且同样无声。
+    ///
+    /// 放在这里之后，"忘了重定向"这个错误在结构上就不可能发生。
+    /// 需要读真配置的只有 <c>live</c>，它走 <see cref="ProxyConfig.LoadReal"/>（只读）。
+    /// </summary>
+    private static void GuardUserData()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "aip-check-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(dir);
+        ProxyConfig.FilePathOverride = Path.Combine(dir, "proxy.config.json");
+        TokenStore.FilePathOverride = Path.Combine(dir, "proxy.tokens.json");
     }
 }

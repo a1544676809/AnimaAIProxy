@@ -95,7 +95,8 @@ public static class Tokens
         Harness.Eq("轮数越界 → 默认", cfg.MaxToolRounds, 4);
         Harness.Eq("单次调用上限越界 → 默认", cfg.MaxToolCallsPerRequest, 12);
         Harness.Eq("监听范围非法 → local", cfg.BindScope, "local");
-        Harness.True("空上游地址 → 有默认值", cfg.UpstreamBaseUrl.Length > 0);
+        Harness.True("空配置归一化后有一个默认站点（否则请求无处可发）",
+                     cfg.DefaultProvider is not null);
         Harness.Eq("local 时只监听回环",
                    cfg.ListenAddress.ToString(), "127.0.0.1");
         Harness.True("ModelMap 不会被清成 null", cfg.ModelMap is not null);
@@ -105,47 +106,50 @@ public static class Tokens
         Harness.Eq("LAN 归一化成小写", lan.BindScope, "lan");
         Harness.Eq("lan 时监听所有网卡", lan.ListenAddress.ToString(), "0.0.0.0");
 
-        Harness.Section("模型名映射");
+        Harness.Section("模型名映射（判定在 ModelCatalog，这里只确认它接进了配置）");
 
         var m = new ProxyConfig();
+        var mp = Fixture.AddProvider(m, "http://up.example/v1", models: new[] { "deepseek-v4-pro" });
         m.ModelMap["gpt-4o"] = "deepseek-v4-pro";
-        var up = new UpstreamClient(m);
-        Harness.Eq("配了映射就换", up.MapModel("gpt-4o"), "deepseek-v4-pro");
-        Harness.Eq("大小写不敏感", up.MapModel("GPT-4O"), "deepseek-v4-pro");
-        Harness.Eq("没配映射的原样透传（不猜）", up.MapModel("some-local-model"), "some-local-model");
-        Harness.Eq("空模型名原样", up.MapModel(""), "");
-        up.Dispose();
+
+        Harness.Eq("配了映射就换", ModelCatalog.Resolve(m, "gpt-4o").UpstreamModel, "deepseek-v4-pro");
+        Harness.Eq("大小写不敏感", ModelCatalog.Resolve(m, "GPT-4O").UpstreamModel, "deepseek-v4-pro");
+        Harness.Eq("没配映射的原样透传（不猜）",
+                   ModelCatalog.Resolve(m, "some-local-model").UpstreamModel, "some-local-model");
+        Harness.Eq("空模型名原样", ModelCatalog.Resolve(m, "").UpstreamModel, "");
+        Harness.Eq("映射后按换过的名字路由到那个站点",
+                   ModelCatalog.Resolve(m, "gpt-4o").Provider?.Id, mp.Id);
 
         var fb = new ProxyConfig { FallbackModelEnabled = true, FallbackModel = "backup-model" };
-        var up2 = new UpstreamClient(fb);
-        Harness.Eq("开了兜底时未映射的走兜底", up2.MapModel("whatever"), "backup-model");
+        Harness.Eq("开了兜底时未映射的走兜底",
+                   ModelCatalog.Resolve(fb, "whatever").UpstreamModel, "backup-model");
         Harness.Eq("默认不开兜底：静默换模型比报错更难查",
                    new ProxyConfig().FallbackModelEnabled, false);
-        up2.Dispose();
 
-        Harness.Section("上游密钥（DPAPI）");
+        Harness.Section("站点密钥（DPAPI）");
 
         var roundTrip = Secrets.RoundTripWorks(Secrets.UpstreamEntropy);
         if (roundTrip)
         {
-            var c = new ProxyConfig();
-            Harness.Eq("没设密钥时明文为空", c.UpstreamApiKey, "");
-            Harness.Eq("没设时 HasUpstreamKey 为假", c.HasUpstreamKey, false);
+            var p = new ProviderProfile();
+            Harness.Eq("没设密钥时明文为空", p.ApiKey, "");
+            Harness.Eq("没设时密文为空", p.ApiKeyProtected, "");
 
-            c.UpstreamApiKey = "sk-secret-value-12345";
-            Harness.Eq("设进去之后能读回来", c.UpstreamApiKey, "sk-secret-value-12345");
-            Harness.Eq("HasUpstreamKey 为真", c.HasUpstreamKey, true);
+            p.ApiKey = "sk-secret-value-12345";
+            Harness.Eq("设进去之后能读回来", p.ApiKey, "sk-secret-value-12345");
             Harness.True("落盘的是密文而不是明文",
-                         !c.UpstreamKeyProtected.Contains("sk-secret-value-12345", StringComparison.Ordinal));
+                         !p.ApiKeyProtected.Contains("sk-secret-value-12345", StringComparison.Ordinal));
 
+            var c = new ProxyConfig();
+            c.Providers.Add(p);
             var json = System.Text.Json.JsonSerializer.Serialize(c);
             Harness.True("序列化结果里不含明文密钥（JsonIgnore 生效）",
                          !json.Contains("sk-secret-value-12345", StringComparison.Ordinal));
-            Harness.True("但密文在里面", json.Contains("UpstreamKeyProtected", StringComparison.Ordinal));
+            Harness.True("但密文在里面", json.Contains("apiKeyProtected", StringComparison.OrdinalIgnoreCase));
 
-            c.UpstreamApiKey = "";
-            Harness.Eq("能清空", c.UpstreamApiKey, "");
-            Harness.Eq("清空后 HasUpstreamKey 为假", c.HasUpstreamKey, false);
+            p.ApiKey = "";
+            Harness.Eq("能清空", p.ApiKey, "");
+            Harness.Eq("清空后密文也为空", p.ApiKeyProtected, "");
         }
         else
         {

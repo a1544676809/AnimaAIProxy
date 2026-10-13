@@ -46,6 +46,13 @@ public static class E2E
 
         public List<JsonObject> Received { get; } = new();
 
+        /// <summary>
+        /// 与 <see cref="Received"/> 一一对应的请求头快照。
+        /// 用来验"站点自带的请求头真的发出去了"——这一条只有真收到请求才测得出来，
+        /// 而它失效时的症状是"某个网关回 401"，与请求头毫无字面关联。
+        /// </summary>
+        public List<Dictionary<string, string>> ReceivedHeaders { get; } = new();
+
         private readonly Queue<JsonObject> _replies = new();
 
         /// <summary>流式模式：不按剧本回 JSON，而是分块吐 SSE 并每块 flush。</summary>
@@ -80,7 +87,13 @@ public static class E2E
             {
                 var raw = await new StreamReader(ctx.Request.Body, Encoding.UTF8).ReadToEndAsync();
                 var body = ChatWire.TryParseObject(raw);
-                lock (Received) Received.Add(body ?? new JsonObject());
+                lock (Received)
+                {
+                    Received.Add(body ?? new JsonObject());
+                    var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var h in ctx.Request.Headers) headers[h.Key] = h.Value.ToString();
+                    ReceivedHeaders.Add(headers);
+                }
 
                 if (StreamMode)
                 {
@@ -209,9 +222,9 @@ public static class E2E
         };
     }
 
-    private static JsonObject ClientBody(bool stream = false) => new()
+    private static JsonObject ClientBody(bool stream = false, string model = "client-model") => new()
     {
-        ["model"] = "client-model",
+        ["model"] = model,
         ["messages"] = new JsonArray
         {
             new JsonObject { ["role"] = "system", ["content"] = "You are a helpful agent." },
@@ -253,6 +266,13 @@ public static class E2E
         var oldTokenPath = TokenStore.FilePathOverride;
         TokenStore.FilePathOverride = Path.Combine(tmpDir, "proxy.tokens.json");
 
+        // 配置也必须重定向。**这一条是被一次真实事故逼出来的**：
+        // 第 4 节的 /v1/models 会触发"按需拉取模型表"，那一步会 Save()，
+        // 而 Save 写的是 ProxyConfig.ConfigPath——没重定向时它把用户的真配置
+        // 整个盖成了这份临时配置（站点、密钥全没了，且没有任何提示）。
+        var oldCfgPath = ProxyConfig.FilePathOverride;
+        ProxyConfig.FilePathOverride = Path.Combine(tmpDir, "proxy.config.json");
+
         var stub = new StubUpstream();
         stub.StartAsync().GetAwaiter().GetResult();
 
@@ -260,7 +280,6 @@ public static class E2E
         {
             Port = FreePort(),
             BindScope = "local",
-            UpstreamBaseUrl = stub.BaseUrl,
             RequireToken = true,
             ToolsEnabled = true,
             AnnounceTools = true,
@@ -269,6 +288,11 @@ public static class E2E
             VocabDbPath = hasDb ? dbPath! : Path.Combine(tmpDir, "no-vocab.sqlite"),
             SeedPath = hasDb ? (Vocab.ResolveSeedPath() ?? "") : Path.Combine(tmpDir, "no-seed.json")
         };
+
+        // 桩上游当默认站点。**刻意不预置模型、也不设 ModelsFetchedAt**：
+        // 这样第 4 节的 /v1/models 会走"按需拉取"那条路——那是新功能的入口，
+        // 只有真发一次请求才验得到。
+        Fixture.AddProvider(cfg, stub.BaseUrl, name: "桩上游");
 
         var tokens = new TokenStore();
         tokens.Tokens.Add(TokenStore.Create("e2e", "", out var token));
@@ -517,7 +541,7 @@ public static class E2E
                 stub.StreamScript.Clear();
             }
 
-            // ================= 4. /v1/models 走真实上游 =================
+            // ================= 4. /v1/models：按需拉取 + 勾选结果 =================
             {
                 var req = new HttpRequestMessage(HttpMethod.Get, $"http://127.0.0.1:{cfg.Port}/v1/models");
                 req.Headers.TryAddWithoutValidation("Authorization", "Bearer " + token);
@@ -527,7 +551,69 @@ public static class E2E
                 Harness.Eq("/v1/models 200", (int)r.StatusCode, 200);
                 var ids = (json?["data"] as JsonArray)?.Select(n =>
                     ChatWire.GetString(n as JsonObject, "id")).ToList() ?? new List<string>();
-                Harness.True("上游的模型出现在列表里", ids.Contains("stub-model"));
+                Harness.True("从未拉过的站点被按需拉了一次，模型出现在表里", ids.Contains("stub-model"));
+                Harness.True("站点自己拉完就记下了时间（不会每次 GET 都重拉）",
+                             cfg.Providers[0].ModelsFetchedAt is not null);
+                Harness.Eq("响应是 OpenAI 的 list 形状", ChatWire.GetString(json, "object"), "list");
+
+                // 关掉这个模型 → 它必须从对外公布的模型表里消失。
+                // 这正是"维护一个模型列表来开关引入的模型"这条需求的核心行为。
+                cfg.Providers[0].FindModel("stub-model")!.Enabled = false;
+                using var r2 = http.SendAsync(new HttpRequestMessage(HttpMethod.Get,
+                    $"http://127.0.0.1:{cfg.Port}/v1/models")
+                {
+                    Headers = { { "Authorization", "Bearer " + token } }
+                }).GetAwaiter().GetResult();
+                var ids2 = (ChatWire.TryParseObject(r2.Content.ReadAsStringAsync().GetAwaiter().GetResult())?["data"]
+                    as JsonArray)?.Select(n => ChatWire.GetString(n as JsonObject, "id")).ToList() ?? new List<string>();
+                Harness.True("关掉的模型从对外模型表里消失", !ids2.Contains("stub-model"));
+                cfg.Providers[0].FindModel("stub-model")!.Enabled = true;
+            }
+
+            // ================= 5. 两个站点：按模型名路由 + 站点自带请求头 =================
+            {
+                var stub2 = new StubUpstream();
+                stub2.StartAsync().GetAwaiter().GetResult();
+                try
+                {
+                    // 站点2 声明一个只有它有的模型，并带一组自己的请求头。
+                    // 预置模型 + 标记已拉取：这一节要测的是路由与请求头，不是拉取。
+                    var p2 = Fixture.AddProvider(cfg, stub2.BaseUrl, name: "站点2",
+                        headers: "x-opencode-session: sess-123\nX-Title: AnimaAIProxy",
+                        models: new[] { "only-on-2" });
+                    p2.ModelsFetchedAt = "已预置";
+
+                    stub2.Enqueue(Answer("我是站点2。", 5, 5));
+                    var beforeDefault = stub.Received.Count;
+
+                    var r = Post(http, url, ChatWire.ToJson(ClientBody(model: "only-on-2")), token);
+                    Harness.Eq("按模型名路由：整条链路走通", r.Status, 200);
+
+                    Harness.Eq("请求真的发到了站点2", stub2.Received.Count, 1);
+                    Harness.Eq("默认站点一个字节都没收到（没有广播式重发）",
+                               stub.Received.Count, beforeDefault);
+                    Harness.Eq("站点2 收到的模型名就是它自己的那个",
+                               ChatWire.GetString(stub2.Received[0], "model"), "only-on-2");
+
+                    var h = stub2.ReceivedHeaders[0];
+                    Harness.True("站点自带的路由头发出去了",
+                                 h.TryGetValue("x-opencode-session", out var sess) && sess == "sess-123");
+                    Harness.True("第二个自定义头也发出去了",
+                                 h.TryGetValue("X-Title", out var title) && title == "AnimaAIProxy");
+
+                    // 反向断言：站点1 从没收到过站点2 的请求头。
+                    // 少了这一条，"把请求头加在所有站点上"这种实现也能全绿。
+                    Harness.True("站点1 的历史请求里没有站点2 的专属头",
+                                 !stub.ReceivedHeaders.Any(x => x.ContainsKey("x-opencode-session")));
+
+                    var resp = ChatWire.TryParseObject(r.Text);
+                    Harness.Eq("响应里的模型名回写成客户端报的那个",
+                               ChatWire.GetString(resp, "model"), "only-on-2");
+                }
+                finally
+                {
+                    stub2.StopAsync().GetAwaiter().GetResult();
+                }
             }
         }
         finally
@@ -535,6 +621,7 @@ public static class E2E
             server.StopAsync().GetAwaiter().GetResult();
             stub.StopAsync().GetAwaiter().GetResult();
             TokenStore.FilePathOverride = oldTokenPath;
+            ProxyConfig.FilePathOverride = oldCfgPath;
             try { Directory.Delete(tmpDir, recursive: true); } catch { }
         }
     }

@@ -31,7 +31,13 @@ public static class Live
         return port;
     }
 
-    /// <summary>从 proxy.config.json 里取上游配置（密钥走 DPAPI 解密，和程序本体同一条路）。</summary>
+    /// <summary>
+    /// 从 proxy.config.json 里取默认站点的配置（密钥走 DPAPI 解密，和程序本体同一条路）。
+    ///
+    /// 用 <see cref="ProxyConfig.LoadReal"/> 而不是 <c>Load()</c>：回归进程已把配置路径
+    /// 全局重定向到临时目录（那是防止测试写掉用户配置的防线），而这里要的正是
+    /// 用户那份真配置。LoadReal 只读、绝不落盘。
+    /// </summary>
     private static (string BaseUrl, string Key) ResolveUpstream(string[] args)
     {
         string? baseUrl = args.Length > 1 ? args[1] : null;
@@ -39,9 +45,10 @@ public static class Live
 
         try
         {
-            var cfg = ProxyConfig.Load();
-            baseUrl ??= cfg.UpstreamBaseUrl;
-            key = cfg.UpstreamApiKey;
+            var cfg = ProxyConfig.LoadReal();
+            var p = cfg.DefaultProvider;
+            baseUrl ??= p?.BaseUrl;
+            key = p?.ApiKey;
         }
         catch (Exception ex)
         {
@@ -78,12 +85,15 @@ public static class Live
         var oldTokenPath = TokenStore.FilePathOverride;
         TokenStore.FilePathOverride = Path.Combine(tmpDir, "proxy.tokens.json");
 
+        // 重定向配置文件：上面 ResolveUpstream 已经读过**真**配置（那是它的职责），
+        // 从这里往后的一切 Save() 都必须落在临时目录里。
+        var oldCfgPath = ProxyConfig.FilePathOverride;
+        ProxyConfig.FilePathOverride = Path.Combine(tmpDir, "proxy.config.json");
+
         var cfg = new ProxyConfig
         {
             Port = FreePort(),
             BindScope = "local",
-            UpstreamBaseUrl = baseUrl,
-            UpstreamApiKey = key,
             RequireToken = true,
             ToolsEnabled = true,
             AnnounceTools = true,
@@ -92,6 +102,7 @@ public static class Live
             VocabDbPath = hasDb ? dbPath! : Path.Combine(tmpDir, "no-vocab.sqlite"),
             SeedPath = Vocab.ResolveSeedPath() ?? ""
         };
+        Fixture.AddProvider(cfg, baseUrl, apiKey: key, name: "真实上游");
 
         var tokens = new TokenStore();
         tokens.Tokens.Add(TokenStore.Create("live", "", out var token));
@@ -548,6 +559,7 @@ public static class Live
         {
             server.StopAsync().GetAwaiter().GetResult();
             TokenStore.FilePathOverride = oldTokenPath;
+            ProxyConfig.FilePathOverride = oldCfgPath;
             try { Directory.Delete(tmpDir, recursive: true); } catch { }
         }
     }

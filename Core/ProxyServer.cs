@@ -17,8 +17,8 @@ namespace AnimaAIProxy.Core;
 /// 端点清单（与 OpenAI 的形状对齐，多余的一个都没有）：
 ///
 ///   GET  /health                 存活探测（**不鉴权**，见下）
-///   POST /v1/chat/completions    主端点：非流式注入工具，流式纯透传
-///   GET  /v1/models              上游的模型表（+ 配置里映射出来的名字）
+///   POST /v1/chat/completions    主端点：注入工具（流式与非流式都注入）
+///   GET  /v1/models              模型表：**用户勾选过的结果**，见 HandleModels
 ///   *    /v1/**                  其它端点原样透传（embeddings、completions……）
 ///
 /// **三条贯穿全文的原则：**
@@ -511,6 +511,29 @@ public sealed class ProxyServer : IAsyncDisposable
 
     // ---------------- GET /v1/models ----------------
 
+    /// <summary>
+    /// 按需拉取模型表的超时。比 <see cref="ProxyConfig.TimeoutSeconds"/> 短得多：
+    /// 这是在一次 GET 里顺手做的事，接入方常常在启动时调它，
+    /// 不该因为某个站点不通就让平台启动干等半分钟。
+    /// </summary>
+    private const int AutoFetchTimeoutSeconds = 6;
+
+    /// <summary>本进程里已经尝试过自动拉取的站点。失败的站点不再每次 GET 都重试。</summary>
+    private readonly HashSet<string> _autoFetchTried = new(StringComparer.Ordinal);
+    private readonly object _autoFetchLock = new();
+
+    /// <summary>
+    /// 对外公布的模型表 = **用户勾选过的结果**，不是上游的原样透传。
+    ///
+    /// 只有已启用站点的已启用模型会出现在这里。这一点是本功能的核心：
+    /// 用户关掉一个模型，它就该从平台的模型选择里消失；关掉一个站点，
+    /// 它下面的模型全部消失。
+    ///
+    /// **按需拉取**：勾选启用、允许自动拉取、且从未拉过的站点，趁这次 GET 拉一次。
+    /// 没有这一步的话，"配好站点就能用"会退化成"配好站点还得记得先去点一下刷新"——
+    /// 而平台的失败表现是"你配的模型不存在"，与真正的原因毫无关系。
+    /// 拉取失败**不影响响应**：把已有的表报出去，用户至少还能看到自己配的东西。
+    /// </summary>
     private async Task HandleModels(HttpContext ctx)
     {
         if (!Authorize(ctx, out _, out var reject))
@@ -519,91 +542,56 @@ public sealed class ProxyServer : IAsyncDisposable
             return;
         }
 
-        var (ok, status, rawText, error) = await _upstream.ModelsAsync(ctx.RequestAborted)
-                                                        .ConfigureAwait(false);
+        await EnsureModelsFetchedAsync(ctx.RequestAborted).ConfigureAwait(false);
 
-        if (!ok)
+        var payload = new JsonObject
         {
-            // 上游挂了也要把**配置里映射出来的名字**报出去：平台可能在启动时
-            // 先拉一次模型表来决定用哪个模型，上游临时不通不该让整个平台起不来。
-            var fallback = BuildModelsFromMap(null);
-            if (fallback.Count > 0)
-            {
-                ProxyLog.Write($"上游 /models 失败（{error}），回退到配置里的模型映射表");
-                ctx.Response.StatusCode = StatusCodes.Status200OK;
-                ctx.Response.ContentType = "application/json; charset=utf-8";
-                await ctx.Response.WriteAsync(ChatWire.ToJson(new JsonObject { ["data"] = fallback }),
-                                              ctx.RequestAborted).ConfigureAwait(false);
-                return;
-            }
+            ["object"] = "list",
+            ["data"] = ModelCatalog.ToOpenAiModels(_cfg)
+        };
 
-            ctx.Response.StatusCode = status > 0 ? status : StatusCodes.Status502BadGateway;
-            ctx.Response.ContentType = "application/json; charset=utf-8";
-            await ctx.Response.WriteAsync(ChatWire.ToJson(new JsonObject
-            {
-                ["error"] = new JsonObject
-                {
-                    ["message"] = error.Length > 0 ? error : "上游 /models 失败",
-                    ["type"] = "upstream_error"
-                }
-            }), ctx.RequestAborted).ConfigureAwait(false);
-            return;
-        }
-
-        // 上游成功：原样透传，但**把配置里映射出来的名字补进去**。
-        // 理由：映射表的键是代理真正接受的名字（客户端报 gpt-4o，我们换成上游的
-        // 模型名）。平台在启动时按 /models 校验"我配的模型名存在吗"，不补进去
-        // 它就会判定配置非法——而那个名字我们其实完全支持。
-        var merged = MergeModelMap(rawText);
         ctx.Response.StatusCode = StatusCodes.Status200OK;
         ctx.Response.ContentType = "application/json; charset=utf-8";
-        await ctx.Response.WriteAsync(merged, ctx.RequestAborted).ConfigureAwait(false);
+        await ctx.Response.WriteAsync(ChatWire.ToJson(payload), ctx.RequestAborted).ConfigureAwait(false);
     }
 
-    /// <summary>上游 /models 的原样 JSON + 配置里映射出来的名字（去重）。</summary>
-    private string MergeModelMap(string upstreamJson)
+    private async Task EnsureModelsFetchedAsync(CancellationToken ct)
     {
-        var node = ChatWire.TryParseObject(upstreamJson);
-        if (node is null) return upstreamJson;
-
-        if (node["data"] is not JsonArray data)
+        List<ProviderProfile> pending;
+        lock (_autoFetchLock)
         {
-            // 少数实现把模型表放在别的键下。**不猜形状**，原样透传，
-            // 宁可少补几个名字，也不要把别人的响应改坏。
-            return upstreamJson;
+            pending = _cfg.Providers
+                .Where(p => p.Enabled && p.AutoFetchModels && p.ModelsFetchedAt is null &&
+                            !string.IsNullOrWhiteSpace(p.BaseUrl) &&
+                            _autoFetchTried.Add(p.Id))
+                .ToList();
         }
+        if (pending.Count == 0) return;
 
-        var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var item in data)
-            if (item is JsonObject o)
+        // 并行拉：站点之间互不相关，串行的话"三个站点里有一个不通"会让这次 GET
+        // 多等好几倍。失败的站点已记进 _autoFetchTried，不会每次 GET 重来一遍；
+        // 重启进程或在界面上点刷新会清掉这个标记。
+        var results = await Task.WhenAll(pending.Select(async p =>
+        {
+            var (ok, _, ids, _, error) = await _upstream
+                .FetchModelsAsync(p, ct, AutoFetchTimeoutSeconds).ConfigureAwait(false);
+            return (Provider: p, Ok: ok, Ids: ids, Error: error);
+        })).ConfigureAwait(false);
+
+        var changed = false;
+        foreach (var r in results)
+        {
+            if (!r.Ok)
             {
-                var id = ChatWire.GetString(o, "id");
-                if (id.Length > 0) existing.Add(id);
+                ProxyLog.Write($"自动拉取 {r.Provider.DisplayName} 的模型表失败：{r.Error}");
+                continue;
             }
-
-        var added = BuildModelsFromMap(existing);
-        foreach (var m in added) data.Add(m);
-
-        return ChatWire.ToJson(node);
-    }
-
-    /// <summary>把 <see cref="ProxyConfig.ModelMap"/> 的键做成 OpenAI 形状的模型条目。</summary>
-    private JsonArray BuildModelsFromMap(HashSet<string>? exclude)
-    {
-        var arr = new JsonArray();
-        foreach (var key in _cfg.ModelMap.Keys)
-        {
-            if (string.IsNullOrWhiteSpace(key)) continue;
-            if (exclude is not null && exclude.Contains(key)) continue;
-            arr.Add(new JsonObject
-            {
-                ["id"] = key,
-                ["object"] = "model",
-                ["created"] = 0,
-                ["owned_by"] = "animaiproxy"
-            });
+            r.Provider.ApplyFetchedModels(r.Ids);
+            changed = true;
+            ProxyLog.Write($"{r.Provider.DisplayName}：拉到 {r.Ids.Count} 个模型");
         }
-        return arr;
+
+        if (changed) _cfg.Save();
     }
 
     // ---------------- /v1/** 通用透传 ----------------
