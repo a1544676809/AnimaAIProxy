@@ -49,6 +49,11 @@ public sealed partial class MainWindow : Window
         LoadIntoUi();
         RefreshStatus();
 
+        // 关窗口 = 收进托盘，**不是退出**。
+        // 这个程序的正事是在后台持续提供 HTTP 服务；关掉窗口就把服务一起停掉，
+        // 等于"我瞄一眼状态"这个动作会把接入方的 agent 打断。
+        // 真正退出走托盘菜单里的"退出"。
+        AppWindow.Closing += OnAppWindowClosing;
         Closed += OnClosed;
 
         // 词库载入要几秒（113 MB），放到界面出来之后再做，
@@ -59,6 +64,9 @@ public sealed partial class MainWindow : Window
         if (_cfg.AutoStart)
             _ = StartServerAsync();
     }
+
+    /// <summary>用户明确点了托盘里的"退出"才会置位。</summary>
+    private bool _exiting;
 
     // ---------------- 配置 ↔ 界面 ----------------
 
@@ -282,6 +290,11 @@ public sealed partial class MainWindow : Window
 
         ToggleButton.Content = running ? "停止代理" : "启动代理";
         PortBox.IsEnabled = true;
+
+        // 托盘提示：用户把窗口收起来之后，唯一能看到状态的地方就是这里。
+        Tray.ToolTipText = running
+            ? $"AnimaAIProxy 运行中 — {_server!.BaseUrl}"
+            : "AnimaAIProxy 已停止（右键启动）";
     }
 
     private void CopyBaseUrl_Click(object sender, RoutedEventArgs e)
@@ -508,6 +521,61 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    // ---------------- 托盘 ----------------
+
+    private void OnAppWindowClosing(Microsoft.UI.Windowing.AppWindow sender,
+                                    Microsoft.UI.Windowing.AppWindowClosingEventArgs args)
+    {
+        if (_exiting) return;   // 真的退出，放行
+
+        // 取消关闭，改成隐藏。**必须取消**：WinUI 关掉窗口之后那个 Window
+        // 对象就废了，再想 Show 出来只能重建整个界面（配置、日志订阅、
+        // 托盘图标全部要重做）。
+        args.Cancel = true;
+        sender.Hide();
+
+        Tray.ShowNotification("AnimaAIProxy 还在后台运行",
+            $"代理{(IsRunning ? "仍在" : "未")}运行。要彻底退出，右键托盘图标选「退出」。");
+    }
+
+    private bool IsRunning => _server?.IsRunning == true;
+
+    private void ShowWindow()
+    {
+        AppWindow.Show();
+        Activate();
+    }
+
+    private void TrayShow_Click(object sender, RoutedEventArgs e) => ShowWindow();
+
+    private async void TrayStart_Click(object sender, RoutedEventArgs e)
+    {
+        if (!IsRunning) await StartServerAsync();
+    }
+
+    private async void TrayStop_Click(object sender, RoutedEventArgs e)
+    {
+        if (IsRunning) await StopServerAsync();
+    }
+
+    private async void TrayExit_Click(object sender, RoutedEventArgs e)
+    {
+        _exiting = true;
+        ProxyLog.Written -= OnLogWritten;
+
+        // 顺序要紧：先把 Kestrel 停干净（释放端口、把在途请求处理完），
+        // 再退进程。直接 Exit 的话端口会处于 TIME_WAIT / 未释放状态，
+        // 下次启动就报"地址已占用"。
+        try
+        {
+            if (_server is not null) await _server.DisposeAsync();
+        }
+        catch { /* 退出路径上不抛 */ }
+
+        try { Tray.Dispose(); } catch { }
+        Application.Current.Exit();
+    }
+
     // ---------------- 收尾 ----------------
 
     private async Task ShowAsync(string title, string message)
@@ -527,8 +595,9 @@ public sealed partial class MainWindow : Window
 
     private async void OnClosed(object sender, WindowEventArgs args)
     {
-        // 进程要退了，Kestrel 必须真的停掉并释放端口。不停的话端口会一直被占，
-        // 下次启动报"地址已占用"——而用户完全不知道为什么，因为他已经关过程序了。
+        // 这条路只在 _exiting 时才会走到（平时 Closing 已经被取消、改成隐藏）。
+        // 兜底再停一次：万一哪天有人把 Closing 的处理去掉了，
+        // 端口也不至于一直被占着。
         ProxyLog.Written -= OnLogWritten;
         try
         {

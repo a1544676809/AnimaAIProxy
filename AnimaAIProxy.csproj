@@ -99,6 +99,12 @@
       8.0/10.0 两条线都能装，但版本对齐比"能装上"重要）。
     -->
     <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.10" />
+    <!--
+      托盘图标。版本**必须是 2.3.0**，不能顺手升到 2.4.1：
+      2.4.1 的 lib 只有 net10.0-windows，装到 net8.0-windows 的工程上会
+      NU1202（不兼容）。2.3.0 有 net8.0-windows10.0.17763。
+    -->
+    <PackageReference Include="H.NotifyIcon.WinUI" Version="2.3.0" />
   </ItemGroup>
 
   <!--

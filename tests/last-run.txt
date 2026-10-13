@@ -10,7 +10,7 @@ AnimaAIProxy 回归：all
 === 1. 词库内核（vendored：VocabDb / TagSearch / TagSections） ===
        词库：vocab.sqlite（113.0 MB）
        seed：E:\ComfyUI\anima-vocab\seed.json
-       载入耗时 1336 ms
+       载入耗时 1471 ms
   ok   标签数 > 30 万                                           True
   ok   Anima 索引非空
 
@@ -286,7 +286,7 @@ AnimaAIProxy 回归：all
   ok   上游连不上 → 502                                          502
   ok   错误体里有 error.message
   ok   错误信息说清了是连不上上游，而不是含糊的「请求失败」
-       上游不可达时的响应：{"error":{"message":"连不上上游：由于目标计算机积极拒绝，无法连接。 (127.0.0.1:61664)","type":"upstream_error"}}
+       上游不可达时的响应：{"error":{"message":"连不上上游：由于目标计算机积极拒绝，无法连接。 (127.0.0.1:52264)","type":"upstream_error"}}
   ok   坏 JSON → 400                                         400
   ok   上游 /models 挂了，但回退到配置里的映射表 → 200                      200
   ok   映射表里的名字出现在模型列表里（平台启动时会拿它校验配置）
@@ -327,8 +327,8 @@ AnimaAIProxy 回归：all
   ok   上游收到的 stream 是 true                                  True
   ok   上游请求里没有我们的工具（流式不做注入）
   ok   数据是分多次到达的（收到 5 次读，不是一次）
-  ok   首块远早于最后一块（首块 0ms / 总 614ms）
-       流式时序：读次数=5，首块=0ms，总耗时=614ms
+  ok   首块远早于最后一块（首块 0ms / 总 613ms）
+       流式时序：读次数=5，首块=0ms，总耗时=613ms
   ok   /v1/models 200                                       200
   ok   上游的模型出现在列表里
 
