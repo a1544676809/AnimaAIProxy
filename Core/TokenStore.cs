@@ -50,7 +50,18 @@ public sealed class TokenStore
 {
     private static readonly object Gate = new();
 
-    public static string FilePath => Path.Combine(ProxyConfig.Dir, "proxy.tokens.json");
+    /// <summary>
+    /// 令牌库位置。默认 <c>%LocalAppData%\AnimaAIProxy\proxy.tokens.json</c>。
+    ///
+    /// **可覆盖**：离线回归要真的起一次 HTTP 服务、真的发一枚令牌、真的走一遍
+    /// 鉴权，而那会调 <see cref="Save"/>。不把它指到临时目录的话，跑一次回归
+    /// 就会把用户**已经发给各个平台的真令牌**全部作废——这是那种"跑测试把
+    /// 生产配置弄坏了"的事故。
+    /// </summary>
+    public static string? FilePathOverride { get; set; }
+
+    public static string FilePath =>
+        FilePathOverride ?? Path.Combine(ProxyConfig.Dir, "proxy.tokens.json");
 
     private static readonly JsonSerializerOptions Options = new()
     {
@@ -178,7 +189,11 @@ public sealed class TokenStore
     {
         try
         {
-            Directory.CreateDirectory(ProxyConfig.Dir);
+            // 目录从**实际要写的那个路径**推出来，而不是固定用 ProxyConfig.Dir：
+            // FilePath 可以被覆盖（见 FilePathOverride），写 temp 的路径却去建
+            // 真实配置目录是两件不相干的事。
+            var dir = Path.GetDirectoryName(FilePath);
+            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
             lock (Gate)
                 File.WriteAllText(FilePath, JsonSerializer.Serialize(this, Options));
         }

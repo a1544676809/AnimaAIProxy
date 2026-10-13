@@ -43,8 +43,19 @@ public sealed class ToolLoop
         _cfg = cfg;
     }
 
-    /// <summary>一次循环的结果，含给客户端的最终响应与给人看的日志。</summary>
-    public sealed record Outcome(JsonObject Response, IReadOnlyList<string> Log, bool Injected, int UpstreamCalls);
+    /// <summary>
+    /// 一次循环的结果，含给客户端的最终响应与给人看的日志。
+    ///
+    /// <see cref="Status"/> 是**必须**的：上游失败时如果照旧回 200 + 一个
+    /// <c>{"error":...}</c> 体，接入方会认为这次请求成功了，然后去读
+    /// <c>choices</c>，读不到就报一个和真正原因毫无关系的错（"模型没有返回内容"）。
+    /// OpenAI 兼容接口的错误是**带状态码**的，代理必须照抄上游的状态码。
+    /// </summary>
+    public sealed record Outcome(
+        JsonObject Response, IReadOnlyList<string> Log, bool Injected, int UpstreamCalls, int Status);
+
+    /// <summary>上游给了状态码就用它的，没给（连不上/超时）就是 502。</summary>
+    private static int StatusOf(UpstreamResult res) => res.Status > 0 ? res.Status : 502;
 
     /// <summary>
     /// 跑一次带注入的对话。<paramref name="body"/> 是客户端原始请求体，
@@ -68,6 +79,7 @@ public sealed class ToolLoop
         var collected = new List<string>();
         var usageResponses = new List<JsonObject>();
         var upstreamCalls = 0;
+        var executed = 0;   // 本次请求已本地执行的工具次数（见下方"执行我们的工具"）
 
         // 最后一轮必须把客户端的工具原样带上：我们要的是"模型在知道有这些工具
         // 的前提下决定该干什么"，只带我们自己的工具会让它以为这个环境里
@@ -83,14 +95,14 @@ public sealed class ToolLoop
                 // 上游失败：如实回报。**不重试**——上游的错误信息（429、余额不足、
                 // 模型名写错）重试一遍只会把同样的错再犯一次，还多花一次配额。
                 log.Add($"上游失败：{res.Error}");
-                return new Outcome(ErrorResponse(res), log, true, upstreamCalls);
+                return new Outcome(ErrorResponse(res), log, true, upstreamCalls, StatusOf(res));
             }
 
             var parsed = res.Body is null ? null : ChatWire.Parse(res.Body);
             if (parsed is null)
             {
                 log.Add("上游响应结构不对（没有 choices/message）");
-                return new Outcome(res.Body ?? ErrorResponse(res), log, true, upstreamCalls);
+                return new Outcome(res.Body ?? ErrorResponse(res), log, true, upstreamCalls, 502);
             }
 
             usageResponses.Add(res.Body!);
@@ -101,7 +113,7 @@ public sealed class ToolLoop
                 log.Add($"第 {upstreamCalls} 轮：无工具调用，收尾");
                 var final = res.Body!;
                 Finish(final, body, usageResponses, parsed, collected, log);
-                return new Outcome(final, log, true, upstreamCalls);
+                return new Outcome(final, log, true, upstreamCalls, 200);
             }
 
             // 分成"我们的"和"客户端的"两堆。
@@ -118,14 +130,19 @@ public sealed class ToolLoop
                 log.Add("没有我们的工具调用，原样交还客户端");
                 var asIs = res.Body!;
                 Finish(asIs, body, usageResponses, parsed, collected, log);
-                return new Outcome(asIs, log, true, upstreamCalls);
+                return new Outcome(asIs, log, true, upstreamCalls, 200);
             }
 
             // 执行我们的工具。
+            //
+            // 计数在**本方法内**：ToolLoop 是一次请求一个实例，而 ToolHost 是
+            // 跨请求共享的。把计数挂在 ToolHost 上会让"每次请求最多 N 次"
+            // 变成"全局最多 N 次"——跑一阵子之后所有人都查不了库，
+            // 而日志上没有任何异常。
             var toolMsgs = new JsonArray();
             foreach (var call in mine)
             {
-                if (_tools.ExecutedCount >= _cfg.MaxToolCallsPerRequest)
+                if (executed >= _cfg.MaxToolCallsPerRequest)
                 {
                     toolMsgs.Add(ToolMessage(call.Id,
                         "Too many tool calls in one request. Answer with what you already have."));
@@ -144,6 +161,7 @@ public sealed class ToolLoop
                 }
                 else
                 {
+                    executed++;
                     text = _tools.Execute(_cfg, kind.Value, call.Arguments, out var summary);
                     collected.Add(summary);
                     log.Add(summary);
@@ -199,17 +217,17 @@ public sealed class ToolLoop
                 if (!lastRes.Ok)
                 {
                     log.Add($"收尾失败：{lastRes.Error}");
-                    return new Outcome(ErrorResponse(lastRes), log, true, upstreamCalls);
+                    return new Outcome(ErrorResponse(lastRes), log, true, upstreamCalls, StatusOf(lastRes));
                 }
 
                 var lastParsed = lastRes.Body is null ? null : ChatWire.Parse(lastRes.Body);
                 if (lastParsed is null)
-                    return new Outcome(lastRes.Body ?? ErrorResponse(lastRes), log, true, upstreamCalls);
+                    return new Outcome(lastRes.Body ?? ErrorResponse(lastRes), log, true, upstreamCalls, 502);
 
                 if (lastRes.Body is not null) usageResponses.Add(lastRes.Body);
                 var wrap = lastRes.Body!;
                 Finish(wrap, body, usageResponses, lastParsed, collected, log);
-                return new Outcome(wrap, log, true, upstreamCalls);
+                return new Outcome(wrap, log, true, upstreamCalls, 200);
             }
         }
     }

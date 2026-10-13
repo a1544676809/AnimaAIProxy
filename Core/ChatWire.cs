@@ -307,4 +307,33 @@ public static class ChatWire
         }
         catch (JsonException) { return null; }
     }
+
+    /// <summary>
+    /// 序列化成要发给客户端的 JSON 文本。
+    ///
+    /// **必须指定编码器**：<c>ToJsonString()</c> 的默认编码器会把所有非 ASCII
+    /// 字符转成 <c>\uXXXX</c>，于是一句中文错误信息在日志、在平台上、
+    /// 在用户眼里都是一串码点。语义没错，但"代理报的错看不懂"会直接让用户
+    /// 放弃排查——而错误信息存在的全部意义就是让人看懂。
+    ///
+    /// 用 UnsafeRelaxedJsonEscaping 是安全的：响应头是 application/json，
+    /// 浏览器不会把它当 HTML 渲染，所以没有注入面。项目里的配置序列化
+    /// （<see cref="ProxyConfig"/>）用的也是同一个编码器，两处口径一致。
+    ///
+    /// **TypeInfoResolver 也必须显式给**（这不是洁癖，是被回归抓出来的）：
+    /// <c>JsonNode.ToJsonString(options)</c> 会先把 options 实例标成只读，
+    /// 而"首次使用时自动补上默认反射解析器"那一步就来不及了，抛
+    /// <c>JsonSerializerOptions instance must specify a TypeInfoResolver setting
+    /// before being marked as read-only</c>。症状是**每一个**走这条路的响应都
+    /// 500，堆栈指向序列化，看起来像我们的 JSON 有问题。
+    /// （<c>JsonSerializer.Serialize(obj, options)</c> 不会踩到，所以配置那边没事。）
+    /// </summary>
+    private static readonly JsonSerializerOptions WireOptions = new()
+    {
+        Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        TypeInfoResolver = new System.Text.Json.Serialization.Metadata.DefaultJsonTypeInfoResolver()
+    };
+
+    public static string ToJson(JsonNode? node) =>
+        node is null ? "null" : node.ToJsonString(WireOptions);
 }

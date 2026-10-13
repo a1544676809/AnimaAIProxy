@@ -12,6 +12,16 @@
     <WinUISDKReferences>false</WinUISDKReferences>
     <EnableMsixTooling>true</EnableMsixTooling>
     <Nullable>enable</Nullable>
+    <!--
+      ImplicitUsings / LangVersion 是**必须的**，不是顺手加的：
+      Core/ 与 Vendor/ 下的源码是按"隐式 using 已开"写的（`Task`、
+      `HttpClient`、`HashSet<>`、`StringComparer` 这些一律没写 using，
+      与 AnimaCaptioner 原仓库的约定一致，见 tests/proxycheck.csproj）。
+      模板默认不开，于是本工程会把整片 Core/ 编译成一堆
+      "未能找到类型或命名空间名 Task" —— 症状看起来像缺包，其实是缺开关。
+    -->
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
   </PropertyGroup>
 
   <ItemGroup>
@@ -22,6 +32,20 @@
     <Content Include="Assets\Square44x44Logo.targetsize-24_altform-unplated.png" />
     <Content Include="Assets\StoreLogo.png" />
     <Content Include="Assets\Wide310x150Logo.scale-200.png" />
+  </ItemGroup>
+
+  <!--
+    tests/ 是**另一个工程**（tests/proxycheck.csproj），它自己用相对路径把
+    Core/ 与 Vendor/ 的真实源文件 Compile Include 进去。默认的通配会把
+    tests/ 下的源文件——尤其是 tests/obj/ 里那些自动生成的 AssemblyInfo——
+    一起吸进本工程，症状是一堆"特性重复"（CS0579）加一个莫名其妙的
+    XamlCompiler WMC9999，而根因和 XAML 毫无关系。这里明确切掉整棵子树。
+  -->
+  <ItemGroup>
+    <Compile Remove="tests\**" />
+    <None Remove="tests\**" />
+    <Content Remove="tests\**" />
+    <EmbeddedResource Remove="tests\**" />
   </ItemGroup>
 
   <ItemGroup>
@@ -39,6 +63,27 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.2705" />
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.5.1" />
+    <!--
+      vendored 的 VocabDb 直接读 SQLite，所以应用本体也需要它。
+      版本与 tests/proxycheck.csproj **必须一致**：两处不同的话，
+      "回归里跑过的代码路径"和"应用实际跑的那套托管依赖"就不是同一套了，
+      而这类差异的表现是"测试全过、应用一查库就炸"。
+      本 TFM 是 net8.0，所以取 8.0.x 线（该包只有 netstandard2.0 资产，
+      8.0/10.0 两条线都能装，但版本对齐比"能装上"重要）。
+    -->
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.10" />
+  </ItemGroup>
+
+  <!--
+    代理的 HTTP 服务层用 Kestrel。**刻意不用 ASP.NET Core 的 Web SDK**：
+    那会把 OutputType 变成 Exe、接管 Program.Main，与 WinUI 的入口打架。
+    这里只借共享框架（Microsoft.AspNetCore.App），入口仍然是 WinUI 的，
+    由我们自己 new 一个 WebApplication 出来。
+    已在 WinUI 的 TFM（net8.0-windows10.0.19041.0）下实测过：进程内起
+    Kestrel 能被子进程/外部客户端访问，SSE 也正常回流。
+  -->
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>
 
   <!--

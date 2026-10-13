@@ -22,18 +22,18 @@ public sealed class ToolHost
 
     public ToolHost(VocabService vocab) => _vocab = vocab;
 
-    /// <summary>本次请求里我们已经执行过的工具调用数，用来卡上限。</summary>
-    public int ExecutedCount { get; private set; }
-
-    public void ResetCounter() => ExecutedCount = 0;
-
     /// <summary>
     /// 执行一次调用。返回回灌给模型的文本；<paramref name="summary"/> 是一句
     /// 给人看的一行摘要，供日志与界面显示。
+    ///
+    /// **这个类是无状态的**（只持一个 <see cref="VocabService"/> 引用），
+    /// 所以可以跨请求共享。这里刻意**不**记"本请求已执行几次"：那个计数
+    /// 放在共享实例上会跨请求累加，把"每次请求最多 N 次"悄悄变成"全局最多 N 次"——
+    /// 跑一阵子之后所有人都查不了库，而日志上什么异常都没有。
+    /// 计数归 <see cref="ToolLoop"/> 自己持有（它本来就是一次请求一个实例）。
     /// </summary>
     public string Execute(ProxyConfig cfg, ToolKind kind, string arguments, out string summary)
     {
-        ExecutedCount++;
         try
         {
             return kind switch

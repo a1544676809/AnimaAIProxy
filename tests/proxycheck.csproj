@@ -1,11 +1,14 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <!-- 与应用同一个 TFM 代际（应用是 net10.0-windows10.0.19041.0），
-         刻意不带 -windows 后缀：这里编译的是纯 .NET 逻辑层。
-         它同时是一道**守卫**：哪天 Core/ 或 Vendor/ 里混进了 WinUI 类型，
-         这个工程会当场编译不过，而不是等到搬去别的宿主时才发现。 -->
-    <TargetFramework>net10.0</TargetFramework>
+    <!-- 与应用同一个 TFM 代际：应用是 net8.0-windows10.0.19041.0，这里刻意
+         只写 net8.0（不带 -windows）。**这个后缀不能省**：它同时是一道守卫——
+         哪天 Core/ 或 Vendor/ 里混进了 WinUI/WinRT 类型，或者用了 net10 才有的
+         API，这个工程会当场编译不过，而不是等到搬去别的宿主、或者等应用
+         自己构建失败时才发现。
+         （这一行以前写的是 net10.0，比应用高了两代，守卫实际上是失效的：
+         Core 里用 net9/net10 的 API 测试照样全过，应用却编译不过。） -->
+    <TargetFramework>net8.0</TargetFramework>
     <Platforms>x64</Platforms>
     <AppendPlatformToOutputPath>false</AppendPlatformToOutputPath>
     <Nullable>enable</Nullable>
@@ -17,8 +20,19 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- 与应用同版本，避免"测试跑过的代码路径和应用实际跑的不是同一套托管依赖"。 -->
-    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
+    <!-- 与应用**同版本**，避免"测试跑过的代码路径和应用实际跑的不是同一套托管依赖"。 -->
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.10" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      Core/ 里有 ProxyServer.cs（Kestrel），所以这里也要这个共享框架。
+      **这不削弱本工程的守卫作用**：它要拦的是 WinUI / WinRT / Windows.*
+      这些"换个宿主就没有"的依赖，而 ASP.NET Core 是跨平台的、net8.0 上就有。
+      好处是 ProxyServer.cs 也会被这条快速构建通道做类型检查，
+      并且能在离线回归里真的起一次 HTTP 服务（见 Server.cs）。
+    -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>
 
   <ItemGroup>
@@ -33,5 +47,6 @@
     <Compile Include="Loop.cs" />
     <Compile Include="Tokens.cs" />
     <Compile Include="Merge.cs" />
+    <Compile Include="Server.cs" />
   </ItemGroup>
 </Project>

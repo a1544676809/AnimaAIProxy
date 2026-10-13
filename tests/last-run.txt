@@ -3,12 +3,14 @@
 # 用途：给手上没有 113 MB 真实词库的人看一遍带真库的输出长什么样。
 # 真库路径：E:\ComfyUI\anima-vocab\vocab.sqlite（从 AnimaCaptioner 的 settings.json 借）
 # 没有词库时第 1/2/6 节会跳过并以退出码 2 结束（= 没能验证，不等于通过）。
+# 第 7 节（server）会真的起一次 Kestrel，但令牌库指向临时目录、
+# 上游指向死端口，不碰用户真实数据、也不需要网络。
 AnimaAIProxy 回归：all
 
 === 1. 词库内核（vendored：VocabDb / TagSearch / TagSections） ===
        词库：vocab.sqlite（113.0 MB）
        seed：E:\ComfyUI\anima-vocab\seed.json
-       载入耗时 1219 ms
+       载入耗时 1228 ms
   ok   标签数 > 30 万                                           True
   ok   Anima 索引非空
 
@@ -267,6 +269,30 @@ AnimaAIProxy 回归：all
   ok   但密文在里面
   ok   能清空                                                  ""
   ok   清空后 HasUpstreamKey 为假                                False
+
+=== 代理 HTTP 端点（真的起一次 Kestrel） ===
+  ok   服务起来了
+  ok   GET /health 不带令牌也能通（监控系统没有令牌）                        200
+  ok   health 报 ok                                          "ok"
+  ok   health 里不含上游地址（它是给局域网上任何人看的）
+  ok   GET / 返回 200                                         200
+  ok   根路径告诉用户 Base URL 该填什么
+  ok   没带令牌 → 401                                           401
+  ok   401 体里有 error 对象（OpenAI 形状）
+  ok   错令牌 → 401                                            401
+  ok   已停用的令牌 → 401                                         401
+  ok   GET /v1/models 无令牌 → 401                             401
+  ok   上游连不上时不回 200（否则平台会去读一个不存在的 choices）
+  ok   上游连不上 → 502                                          502
+  ok   错误体里有 error.message
+  ok   错误信息说清了是连不上上游，而不是含糊的「请求失败」
+       上游不可达时的响应：{"error":{"message":"连不上上游：由于目标计算机积极拒绝，无法连接。 (127.0.0.1:61869)","type":"upstream_error"}}
+  ok   坏 JSON → 400                                         400
+  ok   上游 /models 挂了，但回退到配置里的映射表 → 200                      200
+  ok   映射表里的名字出现在模型列表里（平台启动时会拿它校验配置）
+  ok   关掉工具注入后仍然只是转发，状态码照样如实
+  ok   服务停了
+  ok   停止后端口已释放
 
 全部通过。
 
