@@ -24,29 +24,46 @@
     <LangVersion>latest</LangVersion>
 
     <!--
-      以**非打包（unpackaged）**方式运行，并自带 Windows App SDK 运行时。
-      为什么必须这样：直接跑 MSIX 打包工程产出的那个 exe 会在启动瞬间抛
+      以**非打包（unpackaged）**方式运行。WindowsPackageType=None 是必须的：
+      直接跑 MSIX 打包工程产出的那个 exe 会在启动瞬间抛
       REGDB_E_CLASSNOTREG (0x80040154)，堆栈落在
       WindowsAppRuntime.DeploymentInitializeOptions —— 因为打包应用的 exe
-      没有包标识（package identity），而机器上装的 WindowsAppRuntime 版本
-      又和本工程解析出来的 Foundation 包（2.3.12）对不上。
+      没有包标识（package identity）。
 
-      对一个"本机自用的小工具"来说，MSIX 打包本来就是多余的负担：
-      它换来的是商店分发与自动更新，而这里既不上架也不自动更新，
-      却要用户先装一个匹配的运行时才能跑起来。
-      SelfContained 把运行时随程序一起带走，双击就能用，代价是输出目录大一些。
-      Package.appxmanifest 仍留在仓库里 —— 哪天要出 MSIX 包，
-      把这两个属性去掉即可，代码一行都不用改。
+      **Windows App SDK 走框架依赖，不自带。** 实测（进程模块表，非推断）：
+      应用从
+        C:\Program Files\WindowsApps\Microsoft.WindowsAppRuntime.2_2.5.1.0_x64__8wekyb3d8bbwe\
+      加载 Microsoft.UI.Xaml.dll / Microsoft.UI.Xaml.Controls.dll /
+      CoreMessagingXP.dll，窗口渲染、托盘、/health 全部正常。
+      输出目录 **156 MB → 42 MB**，与 AnimaCaptioner（41 MB / 70 文件）持平。
+
+      为什么以前是 true：那时框架依赖会在启动瞬间抛 REGDB_E_CLASSNOTREG，
+      于是改成自带运行时绕开。现在本机已装匹配的
+      Microsoft.WindowsAppRuntime.2（2.5.1.0），那条理由不再成立。
+
+      自带究竟贵在哪（156 MB 的构成）：WinAppSDK 2.x 是**组件化元包**，
+      Microsoft.WindowsAppSDK 2.5.1 把 Base/Foundation/WinUI/DWrite/
+      InteractiveExperiences **以及 AI + ML + Search + Widgets** 一起拉进来。
+      自带时这后四个会整体落进输出目录，共 47 个文件 / **55.7 MB**
+      （onnxruntime.dll 20.7 + DirectML.dll 17.8 + SemanticIndex.AiFabric 3.8
+      + Windows.Search 3.3 + …），而本代理一个 API 都不调它们。
+
+      代价是刻意的，与 AnimaCaptioner 同一取舍：目标机需要
+      **Windows App Runtime 2.x（2.5.1）+ .NET 8 Desktop Runtime**。
+      要发到没装运行时的机器上，把下面这行改回 true 即可 ——
+      代码一行都不用改，代价是输出目录回到约 156 MB。
+      Package.appxmanifest 仍留在仓库里：哪天要出 MSIX 包，
+      把这两个属性去掉即可。
     -->
     <WindowsPackageType>None</WindowsPackageType>
-    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <WindowsAppSDKSelfContained>false</WindowsAppSDKSelfContained>
     <!--
-      **只自带 Windows App SDK，不自带 .NET。** 本机装了 .NET 运行时，
-      把 coreclr / System.Private.CoreLib 一起塞进输出目录没有任何收益，
-      只会让目录从几十 MB 涨到 250 MB、每次构建都慢一截。
-      WindowsAppSDKSelfContained 会**隐式**打开 SelfContained，所以这里
-      必须显式关掉它——不写这一行的症状是"输出目录里莫名其妙多出一整套
-      .NET 运行时"，而没有任何提示。
+      **不自带 .NET。** 本机装了 .NET 运行时，把 coreclr /
+      System.Private.CoreLib 一起塞进输出目录没有任何收益，只会让目录从
+      几十 MB 涨到 250 MB、每次构建都慢一截。
+      WindowsAppSDKSelfContained 一旦打开，会**隐式**把 SelfContained 也
+      打开——所以上面那行无论取值如何，这一行都必须显式写 false。
+      不写的症状是"输出目录里莫名其妙多出一整套 .NET 运行时"，没有任何提示。
     -->
     <SelfContained>false</SelfContained>
   </PropertyGroup>
@@ -128,11 +145,92 @@
     <HasPackageAndPublishMenu>true</HasPackageAndPublishMenu>
   </PropertyGroup>
 
-  <!-- Publish Properties -->
+  <!--
+    发布属性。这两项都**不能**沿用模板默认值 —— 模板是按"独立 + 可裁剪"的
+    普通应用写的，而这里是一个**框架依赖的 WinUI 3** 应用。
+
+    ① PublishTrimmed 必须是 false。模板在非 Debug 下写的是 true，
+       而裁剪要求发布的是独立应用，与 <SelfContained>false</SelfContained>
+       撞在一起会让 `dotnet publish -c Release` **直接失败、一个文件都不产出**：
+         error NETSDK1102: 所选发布配置不支持优化程序集的大小。请确保你发布的是独立应用。
+       （实测于本仓库；这条一直藏着，因为平时只用 dotnet build。）
+       即使去掉框架依赖改成独立，裁剪对 WinUI 3 也是**不受支持**的：XAML 类型靠
+       反射解析，被裁掉的表现是运行期 "Cannot find a resource with the given key"。
+       本项目还有 System.Text.Json 反射序列化（构建时那批 IL2026 就是它在报警）。
+       **体积不靠裁剪来省** —— 省体积靠 WindowsAppSDKSelfContained=false，
+       那是 156 MB → 42 MB 的那一刀。
+
+    ② PublishReadyToRun 保持 false。R2R 是拿体积换启动时间的：把 IL 预编译成原生码
+       塞进每个程序集。本代理的启动开销几乎全在加载 113 MB 词库（约 1.5 s），
+       R2R 对那一段毫无帮助，却会让发布目录明显变大。AnimaCaptioner 也没开。
+  -->
   <PropertyGroup>
-    <PublishReadyToRun Condition="'$(Configuration)' == 'Debug'">False</PublishReadyToRun>
-    <PublishReadyToRun Condition="'$(Configuration)' != 'Debug'">True</PublishReadyToRun>
-    <PublishTrimmed Condition="'$(Configuration)' == 'Debug'">False</PublishTrimmed>
-    <PublishTrimmed Condition="'$(Configuration)' != 'Debug'">True</PublishTrimmed>
+    <PublishTrimmed>false</PublishTrimmed>
+    <PublishReadyToRun>false</PublishReadyToRun>
   </PropertyGroup>
+
+  <!--
+    **这里刻意没有 CopyAppPriToPublish。**
+
+    AnimaCaptioner / DshBroker 都带一个同名 target，用来补 WinUI 3 + unpackaged
+    + dotnet publish 的已知缺陷（应用自己的 .pri 只生成在 bin\，不进发布目录，
+    症状是发布版一碰 XAML 资源就报 "Cannot find a resource with the given key"）。
+    本工程**实测不需要它**，所以没有照抄 —— 加了就是一段永不生效、还会误导
+    后来人的死代码（"有 target 兜着"会让人以为这里也有那个缺陷）。
+
+    实测（不是推断）：把该 target 去掉后发布，两种发布模式各测一次 ——
+      框架依赖  dotnet publish -c Release -r win-x64 -p:Platform=x64
+      自带运行时 再加 -p:WindowsAppSDKSelfContained=true
+    两次的发布目录里都有 AnimaAIProxy.pri，**11224 字节，与 bin\ 下的同名文件
+    字节数一致**，且文件内确实含 .xbf 与 MainWindow 条目（是真资源不是空壳）。
+    -v n 日志里那行拷贝来自 SDK 自己的发布路径，不是我们的 target：
+      正在将文件从"...\bin\x64\Release\...\win-x64\AnimaAIProxy.pri"
+              复制到"...\AnimaAIProxy.pri"。
+
+    更关键的是**跑起来验证过**：用去掉 target 后的发布产物启动，
+    MainWindowHandle 非 0（XAML 真的加载并建出窗口），/health 返回
+    {"status":"ok","vocabReady":true}，没有 "Cannot find a resource" 之类报错。
+
+    也就是说：那个缺陷要么不适用于本工程，要么已被当前 SDK 修掉。哪一天真在
+    发布版上撞到 "Cannot find a resource with the given key"，再把那个 target
+    加回来即可 —— 它是无害的（SkipUnchangedFiles，内容一致时什么都不做）。
+  -->
+
+  <!--
+    **发布目录里剔除 Windows ML 的原生负载（onnxruntime + DirectML，共 39.4 MB）。**
+    本代理一个 Windows ML / Windows AI API 都不调用，这些 DLL 纯属搭车。
+
+    为什么非写这一段不可：WindowsAppSDKSelfContained=false 已经让 **build** 不带它们了，
+    但 **publish 照样会带** —— 这是 Microsoft 自己 targets 的漏洞：
+    Microsoft.WindowsAppSDK.ML 里的 _SuppressWindowsMLNativeCopyLocalNative 只在
+    ResolveNuGetPackageAssets → _CopyFilesMarkedCopyLocal 这条 **build** 路径上
+    摘掉了这些原生资产，而 publish 走的是 ComputeResolvedFilesToPublishList →
+    ResolvePublishAssemblies 那条路，没人管。症状就是"build 42 MB、publish 81 MB"，
+    多出来的正好是 onnxruntime.dll 20.7 + DirectML.dll 17.8 +
+    Microsoft.Windows.AI.MachineLearning.dll 0.9。
+
+    试过但**实测无效**的两个官方开关（不是推断）：
+      WindowsAppSDKMLPassthroughOnnxRuntime=true   → 仍是 81.5 MB
+      DisableWindowsAppSDKMLAutoInitialize=true     → 仍是 81.5 MB
+    它们只改 C++ 侧的 auto-initializer 选择，管不到 C# 项目的 NuGet 资产拷贝。
+
+    **这个 target 确实在干活，不是死代码** —— 与上面刻意删掉的 CopyAppPriToPublish
+    同一套标准验证过（把 AfterTargets/BeforeTargets 同时改成不存在的名字使其失效，
+    再发布一次；两个钩子必须都改，只改一个 target 仍会因 BeforeTargets 触发）：
+      失效时  62 文件 / **81.5 MB**，onnxruntime.dll 20.66 + DirectML.dll 17.83 回来了
+      生效时  59 文件 / **42.1 MB**，两者都不在
+    差的 39.4 MB 就是这三行 Remove 省下来的。验证后已按原始字节还原（无残留）。
+
+    按**元数据**筛，不按文件名筛：AssetType=native + NuGetPackageId=...。
+    托管的 Microsoft.ML.OnnxRuntime.dll / *.Projection.dll（合计约 0.3 MB）**留着** ——
+    build 输出里本来就有，删掉会让 publish 与 build 不一致，得不偿失。
+  -->
+  <Target Name="DropUnusedWindowsMLPayloadFromPublish"
+          AfterTargets="ComputeResolvedFilesToPublishList"
+          BeforeTargets="CopyFilesToPublishDirectory">
+    <ItemGroup>
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)"
+                             Condition="'%(ResolvedFileToPublish.AssetType)' == 'native' and '%(ResolvedFileToPublish.NuGetPackageId)' == 'Microsoft.Windows.AI.MachineLearning'" />
+    </ItemGroup>
+  </Target>
 </Project>

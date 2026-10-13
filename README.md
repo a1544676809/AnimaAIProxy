@@ -98,24 +98,49 @@ dotnet build tests\proxycheck.csproj
 dotnet run --project tests\proxycheck.csproj all
 ```
 
-### 两个刻意的构建取舍
+### 构建取舍：非打包 + 全框架依赖（输出 42 MB）
 
-**以非打包（unpackaged）方式运行，自带 Windows App SDK，但不自带 .NET。**
+**以非打包（unpackaged）方式运行；`.NET` 与 `Windows App SDK` 都走框架依赖。**
 
-- `WindowsPackageType=None` + `WindowsAppSDKSelfContained=true`：直接跑打包工程产出的
-  那个 exe 会在启动瞬间抛 `REGDB_E_CLASSNOTREG (0x80040154)`（堆栈落在
-  `WindowsAppRuntime.DeploymentInitializeOptions`）—— 打包应用的 exe 没有包标识，
-  而机器上装的运行时版本又和工程解析出的 Foundation 包对不上。对一个本机自用的小工具
-  来说，MSIX 换来的是商店分发与自动更新，而这里既不上架也不自动更新。
+- `WindowsPackageType=None`：直接跑打包工程产出的那个 exe 会在启动瞬间抛
+  `REGDB_E_CLASSNOTREG (0x80040154)`（堆栈落在
+  `WindowsAppRuntime.DeploymentInitializeOptions`）—— 打包应用的 exe 没有包标识。
+  对一个本机自用的小工具来说，MSIX 换来的是商店分发与自动更新，而这里既不上架也不自动更新。
   `Package.appxmanifest` 仍留在仓库里：哪天要出 MSIX 包，把这两个属性去掉即可，代码一行不用改。
-- `.NET` 走**框架依赖**（`SelfContained=false`）：本机装了运行时，把 `coreclr` /
-  `System.Private.CoreLib` 塞进输出目录没有收益，只会让目录从 154 MB 涨到 251 MB。
+- `SelfContained=false` ——本机装了 .NET 运行时，把 `coreclr` /
+  `System.Private.CoreLib` 塞进输出目录没有收益，只会让目录从 42 MB 涨到 251 MB。
 
   注意这一条有个坑：csproj 里写了 `<PublishProfile>win-$(Platform).pubxml</PublishProfile>`，
   所以只要构建时传了 `-p:Platform=x64`，`Properties/PublishProfiles/*.pubxml` 就会被导入 ——
   **连普通 `build` 也逃不掉**。那三个模板文件里写着 `<SelfContained>true</SelfContained>`，
   会把 csproj 里显式的 `false` 盖掉，症状是"输出目录里莫名其妙多出一整套 .NET 运行时"，
   且没有任何提示。三个 pubxml 都已改成 `false` 并写明了原因。
+- `WindowsAppSDKSelfContained=false` ——这一刀是体积的大头，**156 MB → 42 MB**，
+  与 AnimaCaptioner（41 MB / 70 文件）持平。WinAppSDK 2.x 是**组件化元包**，
+  `Microsoft.WindowsAppSDK` 2.5.1 除了 Base/Foundation/WinUI/DWrite/InteractiveExperiences，
+  还会把 **AI + ML + Search + Widgets** 一起拉进来；自带时这些原生负载整体落进输出目录，
+  共 47 个文件 / **55.7 MB**（`onnxruntime.dll` 20.7 + `DirectML.dll` 17.8 +
+  `SemanticIndex.AiFabric` 3.8 + `Windows.Search` 3.3 + …），而本代理一个 API 都不调它们。
+
+  代价与 AnimaCaptioner 同一取舍：目标机需要
+  **Windows App Runtime 2.x（2.5.1）+ .NET 8 Desktop Runtime**。
+  要发到没装运行时的机器上，把 `WindowsAppSDKSelfContained` 改回 `true` 即可，
+  代码一行都不用改，代价是输出目录回到约 156 MB。
+
+  **实测证据（进程模块表，非推断）**：框架依赖版启动后，
+  `Microsoft.UI.Xaml.dll` / `CoreMessagingXP.dll` 从
+  `C:\Program Files\WindowsApps\Microsoft.WindowsAppRuntime.2_2.5.1.0_x64__8wekyb3d8bbwe\`
+  加载，输出目录里没有它们；`MainWindowHandle` 非 0（XAML 真建出了窗口），
+  `/health` 返回 `vocabReady:true`。
+
+- 发布路径还有一处 Microsoft 自己 targets 的漏洞要补：`WindowsAppSDKSelfContained=false`
+  已经让 **build** 不带 Windows ML 原生负载了，但 **publish 照样会带**
+  （`_SuppressWindowsMLNativeCopyLocalNative` 只堵了 build 那条资产拷贝路径）。
+  症状是"build 42 MB、publish 81 MB"。csproj 里的
+  `DropUnusedWindowsMLPayloadFromPublish` 按**元数据**（`AssetType=native` +
+  `NuGetPackageId`）而非文件名剔除，发布目录因此稳定在 **59 文件 / 42.1 MB**。
+  这个 target 也按同一套标准验证过**确实在干活**：把它的两个钩子同时改名使其失效后发布为
+  62 文件 / 81.5 MB（`onnxruntime.dll` 20.66 + `DirectML.dll` 17.83 回来了）。
 
 ## 当前状态
 
@@ -130,6 +155,11 @@ Kestrel 端点与鉴权、WinUI 外壳（启停 / 上游 / 工具注入 / 监听
 （词库路径自动从 AnimaCaptioner 的 `settings.json` 借到，331,808 条标签 1.5 秒载入），
 无令牌请求得到 401，**关窗口后进程仍在、窗口已隐藏、代理继续服务**（发真实
 `WM_CLOSE` 验证过），退出时端口正常释放。
+
+**发布产物同样实测可运行**（不只是 `build` 能跑）：`dotnet publish -c Release -r win-x64
+-p:Platform=x64` 产出 59 文件 / **42.1 MB**，直接启动该产物得 `MainWindowHandle` 非 0、
+`/health` 正常、未鉴权 `/v1/models` 得 401；`Microsoft.UI.Xaml.dll` 等确认从已安装的
+WindowsAppRuntime 2.5.1 加载。
 
 **尚未验证**：接一个**真实上游**（DeepSeek 等）跑一遍真实对话。这需要密钥，
 所以不在回归里；代理到上游那一段的行为由 `e2e` 那一段的桩上游覆盖。
