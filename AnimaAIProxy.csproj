@@ -22,6 +22,33 @@
     -->
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
+
+    <!--
+      以**非打包（unpackaged）**方式运行，并自带 Windows App SDK 运行时。
+      为什么必须这样：直接跑 MSIX 打包工程产出的那个 exe 会在启动瞬间抛
+      REGDB_E_CLASSNOTREG (0x80040154)，堆栈落在
+      WindowsAppRuntime.DeploymentInitializeOptions —— 因为打包应用的 exe
+      没有包标识（package identity），而机器上装的 WindowsAppRuntime 版本
+      又和本工程解析出来的 Foundation 包（2.3.12）对不上。
+
+      对一个"本机自用的小工具"来说，MSIX 打包本来就是多余的负担：
+      它换来的是商店分发与自动更新，而这里既不上架也不自动更新，
+      却要用户先装一个匹配的运行时才能跑起来。
+      SelfContained 把运行时随程序一起带走，双击就能用，代价是输出目录大一些。
+      Package.appxmanifest 仍留在仓库里 —— 哪天要出 MSIX 包，
+      把这两个属性去掉即可，代码一行都不用改。
+    -->
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <!--
+      **只自带 Windows App SDK，不自带 .NET。** 本机装了 .NET 运行时，
+      把 coreclr / System.Private.CoreLib 一起塞进输出目录没有任何收益，
+      只会让目录从几十 MB 涨到 250 MB、每次构建都慢一截。
+      WindowsAppSDKSelfContained 会**隐式**打开 SelfContained，所以这里
+      必须显式关掉它——不写这一行的症状是"输出目录里莫名其妙多出一整套
+      .NET 运行时"，而没有任何提示。
+    -->
+    <SelfContained>false</SelfContained>
   </PropertyGroup>
 
   <ItemGroup>

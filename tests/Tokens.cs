@@ -13,6 +13,30 @@ public static class Tokens
 {
     public static void Run()
     {
+        // **先把令牌库指到临时目录。** 这一节里 store.Authenticate(plaintext)
+        // 命中之后会调 Save()（它要把 LastUsedAt / UseCount 落盘，这是生产行为），
+        // 而 TokenStore.FilePath 默认指向用户真实的 %LocalAppData%\AnimaAIProxy\
+        // proxy.tokens.json —— 不隔离的话，跑一次回归就把用户**已经发给各个平台
+        // 的真令牌全部作废**，而且完全没有提示。（这不是假想：这个文件里曾经
+        // 就躺着一条 "Claude Desktop / 本机测试"，正是这一节写进去的。）
+        var oldPath = TokenStore.FilePathOverride;
+        var tmpDir = Path.Combine(Path.GetTempPath(), "aip-tokencheck-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(tmpDir);
+        TokenStore.FilePathOverride = Path.Combine(tmpDir, "proxy.tokens.json");
+
+        try
+        {
+            RunCore();
+        }
+        finally
+        {
+            TokenStore.FilePathOverride = oldPath;
+            try { Directory.Delete(tmpDir, recursive: true); } catch { }
+        }
+    }
+
+    private static void RunCore()
+    {
         Harness.Section("令牌：生成与校验");
 
         var store = new TokenStore();

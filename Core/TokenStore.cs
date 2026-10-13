@@ -139,9 +139,18 @@ public sealed class TokenStore
         return hit;
     }
 
-    /// <summary>有没有一枚启用中的令牌。用来区分"没带令牌"和"根本没配令牌"两种拒绝。</summary>
+    /// <summary>
+    /// 有没有一枚启用中的令牌。用来区分"没带令牌"和"根本没配令牌"两种拒绝。
+    ///
+    /// <c>JsonIgnore</c>：这是从 <see cref="Tokens"/> 算出来的视图，不是配置项。
+    /// 不标的话它会被写进 proxy.tokens.json，于是文件里出现一个"看起来能改、
+    /// 改了却没有任何效果"的字段——用户手改它、重启、发现没用，
+    /// 而真正的数据在 tokens 数组里。
+    /// </summary>
+    [JsonIgnore]
     public bool HasEnabled => Tokens.Any(t => t.Enabled && t.Hash.Length > 0);
 
+    [JsonIgnore]
     public int EnabledCount => Tokens.Count(t => t.Enabled && t.Hash.Length > 0);
 
     private static string Hash(string plaintext) =>

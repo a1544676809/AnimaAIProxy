@@ -71,27 +71,52 @@ dotnet run --project tests\proxycheck.csproj all
 
 `tests/last-run.txt` 是**手工留存**的快照（没有任何代码会写它），给手上没有 113 MB 真实词库的人看。
 
-## 构建
+## 构建与运行
 
 ```powershell
-# 应用（WinUI，必须显式给平台，否则 MSIX 打包会拒绝 AnyCPU）
+# 应用（WinUI）。必须显式给平台，否则 MSIX 打包会拒绝 AnyCPU
 dotnet build AnimaAIProxy.csproj -p:Platform=x64
+bin\x64\Debug\net8.0-windows10.0.19041.0\win-x64\AnimaAIProxy.exe
 
 # 回归（快得多，且不需要 Windows SDK）
 dotnet build tests\proxycheck.csproj
+dotnet run --project tests\proxycheck.csproj all
 ```
+
+### 两个刻意的构建取舍
+
+**以非打包（unpackaged）方式运行，自带 Windows App SDK，但不自带 .NET。**
+
+- `WindowsPackageType=None` + `WindowsAppSDKSelfContained=true`：直接跑打包工程产出的
+  那个 exe 会在启动瞬间抛 `REGDB_E_CLASSNOTREG (0x80040154)`（堆栈落在
+  `WindowsAppRuntime.DeploymentInitializeOptions`）—— 打包应用的 exe 没有包标识，
+  而机器上装的运行时版本又和工程解析出的 Foundation 包对不上。对一个本机自用的小工具
+  来说，MSIX 换来的是商店分发与自动更新，而这里既不上架也不自动更新。
+  `Package.appxmanifest` 仍留在仓库里：哪天要出 MSIX 包，把这两个属性去掉即可，代码一行不用改。
+- `.NET` 走**框架依赖**（`SelfContained=false`）：本机装了运行时，把 `coreclr` /
+  `System.Private.CoreLib` 塞进输出目录没有收益，只会让目录从 154 MB 涨到 251 MB。
+
+  注意这一条有个坑：csproj 里写了 `<PublishProfile>win-$(Platform).pubxml</PublishProfile>`，
+  所以只要构建时传了 `-p:Platform=x64`，`Properties/PublishProfiles/*.pubxml` 就会被导入 ——
+  **连普通 `build` 也逃不掉**。那三个模板文件里写着 `<SelfContained>true</SelfContained>`，
+  会把 csproj 里显式的 `false` 盖掉，症状是"输出目录里莫名其妙多出一整套 .NET 运行时"，
+  且没有任何提示。三个 pubxml 都已改成 `false` 并写明了原因。
 
 ## 当前状态
 
 **已完成**：词库内核 vendored、配置/密钥/日志/令牌、工具层、透明工具循环、上游客户端、
-Kestrel 端点与鉴权、离线回归、**端到端联调**。
+Kestrel 端点与鉴权、WinUI 外壳（启停 / 上游 / 工具注入 / 监听 / 令牌 / 词库 / 实时日志）、
+离线回归、端到端联调。
 
 回归现状：**255 项断言全过 / 0 失败**（含 113 MB 真实词库、一次真实 Kestrel 起停、
 以及一次完整的「客户端 → 代理 → 桩上游」链路，非流式注入与流式分块透传都在内）。
 
-**未完成**：WinUI 托盘外壳（启停开关、上游配置、令牌管理、实时日志、词库状态）。
-`ProxyServer` 已经可以被界面直接驱动（`StartAsync` / `StopAsync` / `BaseUrl` / `IsRunning`），
-`ProxyLog.Written` 事件也已经给实时日志面板留好了。
+应用已实测可运行：启动后 `/health` 返回 `ok` 且 `vocabReady: true`
+（词库路径自动从 AnimaCaptioner 的 `settings.json` 借到，331,808 条标签 1.5 秒载入），
+无令牌请求得到 401，退出时端口正常释放。
+
+**尚未验证**：接一个**真实上游**（DeepSeek 等）跑一遍真实对话。这需要密钥，
+所以不在回归里；代理到上游那一段的行为由 `e2e` 那一段的桩上游覆盖。
 
 **已验证的关键风险**：
 

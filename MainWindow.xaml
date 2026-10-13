@@ -7,13 +7,244 @@
     xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
     mc:Ignorable="d"
-    Title="AnimaAIProxy">
+    Title="AnimaAIProxy — OpenAI 兼容代理">
 
     <Window.SystemBackdrop>
         <MicaBackdrop />
     </Window.SystemBackdrop>
 
-    <Grid>
+    <Grid Padding="16" RowSpacing="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
 
+        <!-- ================= 顶部状态条 ================= -->
+        <Border Grid.Row="0"
+                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                BorderThickness="1" CornerRadius="8" Padding="16">
+            <Grid ColumnSpacing="12">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Grid.Column="0" Spacing="4">
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <Ellipse x:Name="StatusDot" Width="10" Height="10"
+                                 Fill="{ThemeResource SystemFillColorCriticalBrush}"
+                                 VerticalAlignment="Center" />
+                        <TextBlock x:Name="StatusText" Text="已停止" FontSize="16"
+                                   FontWeight="SemiBold" VerticalAlignment="Center" />
+                        <TextBlock x:Name="UptimeText" Text="" Opacity="0.6"
+                                   VerticalAlignment="Center" />
+                    </StackPanel>
+
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <TextBlock Text="Base URL" Opacity="0.6" VerticalAlignment="Center" />
+                        <TextBlock x:Name="BaseUrlText" Text="—" IsTextSelectionEnabled="True"
+                                   FontFamily="Consolas" VerticalAlignment="Center" />
+                        <Button x:Name="CopyBaseUrlButton" Content="复制"
+                                Click="CopyBaseUrl_Click" Padding="8,2" />
+                    </StackPanel>
+
+                    <TextBlock x:Name="HintText" Opacity="0.6" TextWrapping="Wrap"
+                               Text="把 agent 平台的 OpenAI Base URL 指到上面这个地址，API Key 填下面签发的令牌（aip- 开头）。" />
+                </StackPanel>
+
+                <Button Grid.Column="1" x:Name="ToggleButton" Content="启动代理"
+                        Style="{StaticResource AccentButtonStyle}"
+                        Click="Toggle_Click" MinWidth="120" />
+
+                <Button Grid.Column="2" x:Name="SaveButton" Content="保存设置"
+                        Click="Save_Click" MinWidth="100" />
+            </Grid>
+        </Border>
+
+        <!-- ================= 下面几块 ================= -->
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+            <StackPanel Spacing="10">
+
+                <!-- ===== 上游 ===== -->
+                <Expander Header="上游（代理替你持有密钥，接入方永远拿不到）" IsExpanded="True"
+                          HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                    <StackPanel Spacing="10" Padding="4,10,4,4">
+                        <TextBox x:Name="UpstreamUrlBox" Header="上游 Base URL（必须自带 /v1）"
+                                 PlaceholderText="https://api.deepseek.com/v1" />
+                        <PasswordBox x:Name="UpstreamKeyBox" Header="上游 API Key"
+                                     PlaceholderText="留空表示上游不需要密钥" />
+                        <TextBlock x:Name="UpstreamKeyState" Opacity="0.6" Text="未设置密钥。" />
+
+                        <Grid ColumnSpacing="10">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Button Grid.Column="0" x:Name="TestUpstreamButton" Content="测试连接"
+                                    Click="TestUpstream_Click" />
+                            <Button Grid.Column="1" x:Name="ClearKeyButton" Content="清除密钥"
+                                    Click="ClearKey_Click" />
+                            <TextBlock Grid.Column="2" x:Name="UpstreamTestResult" Opacity="0.7"
+                                       TextWrapping="Wrap" VerticalAlignment="Center" />
+                        </Grid>
+
+                        <NumberBox x:Name="TimeoutBox" Header="单次上游请求超时（秒）"
+                                   Minimum="5" Maximum="3600" SpinButtonPlacementMode="Compact" />
+
+                        <TextBlock Text="模型名映射：接入方写死的名字 → 上游真正的名字（每行一条，格式 客户端名=上游名）。映射里没有的原样透传。"
+                                   TextWrapping="Wrap" Opacity="0.7" />
+                        <TextBox x:Name="ModelMapBox" AcceptsReturn="True" Height="80"
+                                 FontFamily="Consolas" PlaceholderText="gpt-4o=deepseek-chat" />
+                    </StackPanel>
+                </Expander>
+
+                <!-- ===== 工具注入 ===== -->
+                <Expander Header="工具注入（代理自有工具的开关）" IsExpanded="True"
+                          HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                    <StackPanel Spacing="10" Padding="4,10,4,4">
+                        <ToggleSwitch x:Name="ToolsEnabledSwitch"
+                                      Header="启用工具注入"
+                                      OnContent="接入方的请求会被注入查词库的工具（非流式）"
+                                      OffContent="代理退化成纯反向代理，一个字节都不改请求" />
+                        <ToggleSwitch x:Name="AnnounceToolsSwitch"
+                                      Header="在系统提示里介绍这些工具"
+                                      OnContent="推荐。平台只会介绍它自己的工具，不说明的话模型不会想到去调我们的"
+                                      OffContent="只挂工具声明，不写进系统提示" />
+                        <ToggleSwitch x:Name="CarryFindingsSwitch"
+                                      Header="把已查到的结果回写进 content"
+                                      OnContent="只在接入方还有自己的工具要调时回写（那时它一定会带着历史再回来）"
+                                      OffContent="不回写" />
+                        <Grid ColumnSpacing="10">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <NumberBox Grid.Column="0" x:Name="MaxRoundsBox"
+                                       Header="工具循环轮数上限（1-12）"
+                                       Minimum="1" Maximum="12" SpinButtonPlacementMode="Compact" />
+                            <NumberBox Grid.Column="1" x:Name="MaxCallsBox"
+                                       Header="单次请求最多执行工具次数（1-64）"
+                                       Minimum="1" Maximum="64" SpinButtonPlacementMode="Compact" />
+                        </Grid>
+                    </StackPanel>
+                </Expander>
+
+                <!-- ===== 监听 ===== -->
+                <Expander Header="监听" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                    <StackPanel Spacing="10" Padding="4,10,4,4">
+                        <NumberBox x:Name="PortBox" Header="端口（1024-65535）"
+                                   Minimum="1024" Maximum="65535" SpinButtonPlacementMode="Compact" />
+                        <ComboBox x:Name="ScopeBox" Header="允许连接的范围" HorizontalAlignment="Stretch">
+                            <ComboBoxItem Content="仅本机（推荐）" Tag="local" />
+                            <ComboBoxItem Content="仅局域网（只放行私有网段）" Tag="lan" />
+                            <ComboBoxItem Content="任意来源（不安全）" Tag="wan" />
+                        </ComboBox>
+                        <TextBlock Text="代理手里握着上游密钥。暴露到网络上等于把密钥的使用权一起交出去；要跨机请用 SSH 本地转发。"
+                                   TextWrapping="Wrap" Opacity="0.7" />
+                        <ToggleSwitch x:Name="RequireTokenSwitch"
+                                      Header="要求接入方携带代理令牌"
+                                      OnContent="推荐。一枚令牌都没有时会拒绝一切请求，不是「没配就放行」"
+                                      OffContent="不鉴权（本机任何程序都能白用你的额度）" />
+                        <ToggleSwitch x:Name="LogBodiesSwitch"
+                                      Header="把完整请求/响应体写进日志"
+                                      OnContent="排查问题时临时打开，对话内容会落盘"
+                                      OffContent="只记摘要" />
+                    </StackPanel>
+                </Expander>
+
+                <!-- ===== 令牌 ===== -->
+                <Expander Header="代理令牌（发给 agent 平台当 API Key）" IsExpanded="True"
+                          HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                    <StackPanel Spacing="10" Padding="4,10,4,4">
+                        <Grid ColumnSpacing="10">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBox Grid.Column="0" x:Name="NewTokenNameBox"
+                                     Header="给哪个平台用" PlaceholderText="Claude Desktop" />
+                            <TextBox Grid.Column="1" x:Name="NewTokenNoteBox"
+                                     Header="备注（可选）" PlaceholderText="家里那台机器" />
+                            <Button Grid.Column="2" x:Name="CreateTokenButton" Content="签发新令牌"
+                                    Style="{StaticResource AccentButtonStyle}"
+                                    Click="CreateToken_Click" VerticalAlignment="Bottom" />
+                        </Grid>
+
+                        <TextBlock x:Name="TokenSummaryText" Opacity="0.7" Text="" />
+
+                        <ListView x:Name="TokenList" SelectionMode="None" MaxHeight="240">
+                            <ListView.ItemTemplate>
+                                <DataTemplate x:DataType="local:TokenRow">
+                                    <Grid ColumnSpacing="10" Padding="0,6">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel Grid.Column="0" Spacing="2">
+                                            <TextBlock Text="{x:Bind Title}" FontWeight="SemiBold" />
+                                            <TextBlock Text="{x:Bind Subtitle}" Opacity="0.6"
+                                                       FontSize="12" TextWrapping="Wrap" />
+                                        </StackPanel>
+                                        <ToggleSwitch Grid.Column="1" IsOn="{x:Bind Enabled, Mode=TwoWay}"
+                                                      OnContent="启用" OffContent="停用"
+                                                      Toggled="TokenToggled" />
+                                        <Button Grid.Column="2" Content="删除" Click="DeleteToken_Click"
+                                                Tag="{x:Bind Id}" VerticalAlignment="Center" />
+                                    </Grid>
+                                </DataTemplate>
+                            </ListView.ItemTemplate>
+                        </ListView>
+                    </StackPanel>
+                </Expander>
+
+                <!-- ===== 词库 ===== -->
+                <Expander Header="词库（Danbooru / Anima 标签库）" IsExpanded="True"
+                          HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                    <StackPanel Spacing="10" Padding="4,10,4,4">
+                        <TextBlock x:Name="VocabStatusText" TextWrapping="Wrap" />
+                        <TextBox x:Name="VocabPathBox" Header="vocab.sqlite 路径" />
+                        <TextBox x:Name="SeedPathBox" Header="seed.json 路径（可选的人工映射表）" />
+                        <Grid ColumnSpacing="10">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Button Grid.Column="0" x:Name="ReloadVocabButton" Content="重新载入"
+                                    Click="ReloadVocab_Click" />
+                            <TextBlock Grid.Column="1" Text="默认从 AnimaCaptioner 的 settings.json 借同一份词库——两个程序各填一遍路径，迟早会填成两份不同的。"
+                                       TextWrapping="Wrap" Opacity="0.7" VerticalAlignment="Center" />
+                        </Grid>
+                    </StackPanel>
+                </Expander>
+
+                <!-- ===== 日志 ===== -->
+                <Expander Header="实时日志" IsExpanded="True"
+                          HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                    <StackPanel Spacing="10" Padding="4,10,4,4">
+                        <Grid ColumnSpacing="10">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Button Grid.Column="0" Content="清空面板" Click="ClearLog_Click" />
+                            <Button Grid.Column="1" Content="打开日志文件" Click="OpenLogFile_Click" />
+                            <Button Grid.Column="2" Content="打开配置目录" Click="OpenConfigDir_Click" />
+                            <TextBlock Grid.Column="3" x:Name="LogPathText" Opacity="0.6"
+                                       VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                        </Grid>
+                        <ListView x:Name="LogList" SelectionMode="None" MaxHeight="320"
+                                  FontFamily="Consolas" FontSize="12" />
+                    </StackPanel>
+                </Expander>
+
+            </StackPanel>
+        </ScrollViewer>
     </Grid>
 </Window>
