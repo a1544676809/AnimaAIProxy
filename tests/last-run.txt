@@ -3,14 +3,14 @@
 # 用途：给手上没有 113 MB 真实词库的人看一遍带真库的输出长什么样。
 # 真库路径：E:\ComfyUI\anima-vocab\vocab.sqlite（从 AnimaCaptioner 的 settings.json 借）
 # 没有词库时第 1/2/6 节会跳过并以退出码 2 结束（= 没能验证，不等于通过）。
-# 第 7 节（server）会真的起一次 Kestrel，但令牌库指向临时目录、
-# 上游指向死端口，不碰用户真实数据、也不需要网络。
+# server / e2e 两节会真的起 Kestrel，但令牌库指向临时目录、上游是死端口或本进程内的
+# 桩上游，既不碰用户真实数据、也不需要网络。
 AnimaAIProxy 回归：all
 
 === 1. 词库内核（vendored：VocabDb / TagSearch / TagSections） ===
        词库：vocab.sqlite（113.0 MB）
        seed：E:\ComfyUI\anima-vocab\seed.json
-       载入耗时 1228 ms
+       载入耗时 1154 ms
   ok   标签数 > 30 万                                           True
   ok   Anima 索引非空
 
@@ -286,13 +286,51 @@ AnimaAIProxy 回归：all
   ok   上游连不上 → 502                                          502
   ok   错误体里有 error.message
   ok   错误信息说清了是连不上上游，而不是含糊的「请求失败」
-       上游不可达时的响应：{"error":{"message":"连不上上游：由于目标计算机积极拒绝，无法连接。 (127.0.0.1:61869)","type":"upstream_error"}}
+       上游不可达时的响应：{"error":{"message":"连不上上游：由于目标计算机积极拒绝，无法连接。 (127.0.0.1:57858)","type":"upstream_error"}}
   ok   坏 JSON → 400                                         400
   ok   上游 /models 挂了，但回退到配置里的映射表 → 200                      200
   ok   映射表里的名字出现在模型列表里（平台启动时会拿它校验配置）
   ok   关掉工具注入后仍然只是转发，状态码照样如实
   ok   服务停了
   ok   停止后端口已释放
+
+=== 端到端：客户端 → 代理 → 桩上游（全部真实 HTTP） ===
+  ok   整条链路走通，200                                           200
+  ok   上游被问了两次（第一轮工具调用 + 第二轮收尾）                             2
+  ok   发往上游的请求里有接入方的工具（它必须知道环境里有什么）
+  ok   发往上游的请求里有我们的三个工具
+  ok   reasoning_effort 原样透传到了上游（代理不劫持）                     "high"
+  ok   模型名换成了上游要的（映射表没配 → 原样）                               "client-model"
+  ok   注入路径强制按非流式问上游                                        False
+  ok   系统提示里追加了工具说明，且接入方原有的还在
+  ok   第二轮请求里带上了 role:tool 的工具结果
+  ok   工具结果里是真实词库查出来的标签（弓 → bow (weapon)）
+       工具回灌给模型的内容：query: 弓 …（共 28 行）
+  ok   客户端拿到的是模型的最终回答                                       "弓 对应的标签是 bow (weapon)。"
+  ok   客户端看不到我们的任何 tool_call（摘干净了）                          0
+  ok   finish_reason 改回 stop（否则客户端会等一个不存在的工具）               "stop"
+  ok   模型名回写成客户端请求时用的那个                                     "client-model"
+  ok   usage 跨轮累加（20+30）                                    50
+  ok   usage 跨轮累加（7+9）                                      16
+  ok   usage 跨轮累加（27+39）                                    66
+  ok   返回给客户端的 message 里没有 tool_calls 字段
+  ok   返回给客户端的 message 只有 role/content                      2
+  ok   只调接入方工具时上游只被问一次                                      1
+  ok   接入方的 tool_call 原样交还                                  1
+  ok   交还的是它那个                                              "read_file"
+  ok   id 一字不差（它要靠这个回填结果）                                   "call_theirs"
+  ok   finish_reason 保持 tool_calls                          "tool_calls"
+  ok   流式请求 200                                             200
+  ok   content-type 是 event-stream
+  ok   SSE 内容完整（4 块 + [DONE]）
+  ok   流式路径不注入工具（这一阶段如实纯透传）                                 1
+  ok   上游收到的 stream 是 true                                  True
+  ok   上游请求里没有我们的工具（流式不做注入）
+  ok   数据是分多次到达的（收到 5 次读，不是一次）
+  ok   首块远早于最后一块（首块 0ms / 总 623ms）
+       流式时序：读次数=5，首块=0ms，总耗时=623ms
+  ok   /v1/models 200                                       200
+  ok   上游的模型出现在列表里
 
 全部通过。
 

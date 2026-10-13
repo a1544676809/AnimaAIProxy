@@ -48,5 +48,6 @@
     <Compile Include="Tokens.cs" />
     <Compile Include="Merge.cs" />
     <Compile Include="Server.cs" />
+    <Compile Include="E2E.cs" />
   </ItemGroup>
 </Project>
