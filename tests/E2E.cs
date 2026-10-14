@@ -168,6 +168,69 @@ public static class E2E
         }
     }
 
+    // ---------------- 桩搜索后端 ----------------
+
+    /// <summary>
+    /// 桩搜索后端：只实现 SearXNG 的 JSON 形状（<c>GET /search?q=..&amp;format=json</c>）。
+    ///
+    /// 有它才验得完整那条链：代理把 web_search 下发给模型 → 模型调它 →
+    /// 代理**真的发出了这次搜索请求** → 结果回到上游第二轮请求里 →
+    /// 客户端看不到任何 tool_call。少了它，这条链只能在内存里拼，
+    /// 而"请求到底有没有发出去"恰恰是这里最容易静默失效的一环。
+    /// </summary>
+    private sealed class StubSearch
+    {
+        private WebApplication? _app;
+        public int Port { get; private set; }
+        public string BaseUrl => $"http://127.0.0.1:{Port}";
+
+        public List<string> Queries { get; } = new();
+
+        /// <summary>演"引擎全挂"：SearXNG 会回 200 + 空 results + unresponsive_engines。</summary>
+        public bool EnginesDown { get; set; }
+
+        public async Task StartAsync()
+        {
+            Port = FreePort();
+            var b = WebApplication.CreateSlimBuilder(new WebApplicationOptions
+            {
+                ContentRootPath = AppContext.BaseDirectory,
+                EnvironmentName = Environments.Production
+            });
+            b.Logging.ClearProviders();
+            b.Logging.SetMinimumLevel(LogLevel.None);
+            b.WebHost.ConfigureKestrel(o => o.Listen(IPAddress.Loopback, Port));
+
+            var app = b.Build();
+            app.MapGet("/search", async ctx =>
+            {
+                var q = ctx.Request.Query["q"].ToString();
+                lock (Queries) Queries.Add(q);
+
+                ctx.Response.ContentType = "application/json; charset=utf-8";
+                await ctx.Response.WriteAsync(EnginesDown
+                    ? "{\"number_of_results\":0,\"results\":[]," +
+                      "\"unresponsive_engines\":[[\"google\",\"timeout\"]]}"
+                    : "{\"results\":[" +
+                      "{\"title\":\"Qt 6.8 released\",\"url\":\"https://example.com/qt68\"," +
+                      "\"content\":\"Qt 6.8 was released in October 2024.\"}," +
+                      "{\"title\":\"Qt blog\",\"url\":\"https://example.com/blog\"," +
+                      "\"content\":\"Release notes and downloads.\"}]}");
+            });
+
+            await app.StartAsync();
+            _app = app;
+        }
+
+        public async Task StopAsync()
+        {
+            if (_app is null) return;
+            await _app.StopAsync(TimeSpan.FromSeconds(3));
+            await _app.DisposeAsync();
+            _app = null;
+        }
+    }
+
     // ---------------- 报文构造 ----------------
 
     private static JsonObject Answer(string content, int pt, int ct) => new()
@@ -634,6 +697,95 @@ public static class E2E
                              !string.IsNullOrWhiteSpace(pb.ModelsFetchedAt));
                 Harness.True("拉到的模型进了它自己的表", pb.FindModel("stub-model") is not null);
             }
+
+            // ===== 5. web_search：注入 → 真的发搜索 → 结果回灌 → 不外泄 =====
+            {
+                var search = new StubSearch();
+                search.StartAsync().GetAwaiter().GetResult();
+                try
+                {
+                    // 5a. 默认（没配搜索）不下发这个工具。
+                    // 下发一个必然失败的工具，模型会白烧一轮预算、然后可能凭记忆编答案。
+                    stub.Enqueue(Answer("不搜。", 1, 1));
+                    stub.Received.Clear();
+                    Post(http, url, ChatWire.ToJson(ClientBody()), token);
+                    Harness.True("默认不下发 web_search",
+                                 !SentToolNames(stub.Received[0]).Contains(ToolCatalog.WebSearchName));
+
+                    // 5b. 打开了但缺地址 → 仍然不下发（判据是"配到能用"，不是"勾了开关"）
+                    cfg.SearchEnabled = true;
+                    cfg.SearchProvider = "searxng";
+                    cfg.SearchBaseUrl = "";
+                    stub.Enqueue(Answer("还是不搜。", 1, 1));
+                    stub.Received.Clear();
+                    Post(http, url, ChatWire.ToJson(ClientBody()), token);
+                    Harness.True("只勾开关、没填地址时也不下发（缺配置是必然失败）",
+                                 !SentToolNames(stub.Received[0]).Contains(ToolCatalog.WebSearchName));
+
+                    // 5c. 配好了 → 下发、真的搜、结果回到上游
+                    cfg.SearchBaseUrl = search.BaseUrl;
+                    stub.Enqueue(ToolCall("call_web", ToolCatalog.WebSearchName,
+                                          "{\"query\":\"Qt 6.8 release date\"}", 12, 4));
+                    stub.Enqueue(Answer("Qt 6.8 于 2024 年 10 月发布。", 20, 8));
+                    stub.Received.Clear();
+                    lock (search.Queries) search.Queries.Clear();
+
+                    var r = Post(http, url, ChatWire.ToJson(ClientBody()), token);
+                    Harness.Eq("web_search 链路走通，200", r.Status, 200);
+
+                    Harness.True("配好后 web_search 出现在发往上游的工具里",
+                                 SentToolNames(stub.Received[0]).Contains(ToolCatalog.WebSearchName));
+                    var sys = ChatWire.GetString(((JsonArray)stub.Received[0]["messages"]!)[0] as JsonObject, "content");
+                    Harness.True("系统提示里也介绍了它（否则模型不会想到用）",
+                                 sys.Contains(ToolCatalog.WebSearchName, StringComparison.Ordinal) &&
+                                 sys.Contains("You are a helpful agent.", StringComparison.Ordinal));
+
+                    lock (search.Queries)
+                    {
+                        Harness.Eq("代理真的发出了搜索请求", search.Queries.Count, 1);
+                        Harness.Eq("搜索词原样送达", search.Queries.Count > 0 ? search.Queries[0] : "",
+                                   "Qt 6.8 release date");
+                    }
+
+                    var toolMsgs = ((JsonArray)stub.Received[1]["messages"]!).Where(m =>
+                        ChatWire.GetString(m as JsonObject, "role") == "tool").ToList();
+                    Harness.Eq("第二轮请求里带上了搜索结果", toolMsgs.Count, 1);
+                    var toolText = ChatWire.GetString(toolMsgs[0] as JsonObject, "content");
+                    Harness.True("结果里有真实网址（模型要能引用它）",
+                                 toolText.Contains("https://example.com/qt68", StringComparison.Ordinal));
+                    Harness.True("结果里有摘要正文",
+                                 toolText.Contains("October 2024", StringComparison.Ordinal));
+
+                    var parsed = ChatWire.Parse(ChatWire.TryParseObject(r.Text)!)!;
+                    Harness.Eq("客户端拿到的是最终回答", parsed.Content, "Qt 6.8 于 2024 年 10 月发布。");
+                    Harness.Eq("客户端看不到 web_search 的 tool_call", parsed.ToolCalls.Count, 0);
+                    Harness.Eq("finish_reason 改回 stop", parsed.FinishReason, "stop");
+                    Harness.True("交还给客户端的报文里连 web_search 这个名字都搜不到",
+                                 !r.Text.Contains(ToolCatalog.WebSearchName, StringComparison.Ordinal));
+
+                    // 5d. 引擎全挂：必须如实报故障，不能回一个空结果。
+                    // 后者会让模型把"搜索坏了"当成"这东西不存在"，然后凭记忆编答案。
+                    search.EnginesDown = true;
+                    stub.Enqueue(ToolCall("call_web2", ToolCatalog.WebSearchName, "{\"query\":\"again\"}", 5, 2));
+                    stub.Enqueue(Answer("搜不了。", 6, 3));
+                    stub.Received.Clear();
+                    Post(http, url, ChatWire.ToJson(ClientBody()), token);
+
+                    var toolMsgs2 = ((JsonArray)stub.Received[1]["messages"]!).Where(m =>
+                        ChatWire.GetString(m as JsonObject, "role") == "tool").ToList();
+                    var toolText2 = ChatWire.GetString(toolMsgs2[0] as JsonObject, "content");
+                    Harness.True("引擎全挂时如实报错（不把故障说成「没这东西」）",
+                                 toolText2.Contains("没有可用引擎", StringComparison.Ordinal));
+                    Harness.True("故障时明确告诉模型这不代表那东西不存在",
+                                 toolText2.Contains("does NOT mean", StringComparison.Ordinal));
+                }
+                finally
+                {
+                    cfg.SearchEnabled = false;
+                    cfg.SearchBaseUrl = "";
+                    search.StopAsync().GetAwaiter().GetResult();
+                }
+            }
         }
         finally
         {
@@ -646,6 +798,12 @@ public static class E2E
     }
 
     private sealed record HttpResult(int Status, string Text);
+
+    /// <summary>上游这一轮收到的工具名清单。用来断言"我们的工具真的出现在报文里了"。</summary>
+    private static List<string> SentToolNames(JsonObject request) =>
+        (request["tools"] as JsonArray ?? new JsonArray())
+            .Select(t => ChatWire.GetString(t?["function"] as JsonObject, "name"))
+            .ToList();
 
     private static HttpResult Post(HttpClient http, string url, string body, string token)
     {

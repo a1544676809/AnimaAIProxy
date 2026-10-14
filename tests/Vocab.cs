@@ -170,31 +170,38 @@ public static class Vocab
         var host = new ToolHost(new VocabService());
         var toolCfg = new ProxyConfig { VocabDbPath = db };
 
+        // 工具执行体已经改成异步的（web_search 要发 HTTP），测试是同步的口径，
+        // 所以在这里统一收口成一次阻塞等待。**只在这一个辅助函数里阻塞**，
+        // 免得每个断言各写一遍 GetAwaiter，将来改签名会漏掉一处。
+        ToolHost.ToolResult Resolve(string tag) =>
+            host.ExecuteAsync(toolCfg, ToolKind.Resolve, "{\"tag\":\"" + tag + "\"}")
+                .GetAwaiter().GetResult();
+
         // 裸形式不是精确键、类别又不是 junk 的那 11,138 条：代理要能直接解析出来。
         // 挑的都是**没被 Anima 索引或别名表接住**的（否则走的是别的路，测不到回落）。
-        var bow = host.Execute(toolCfg, ToolKind.Resolve, "{\"tag\":\"弓\"}", out var s1);
+        var bow = Resolve("弓");
         Harness.True("danbooru_resolve_tag 能解析裸形式「弓」（内核落空 → 回落 Search）",
-                     bow.Contains("result: FOUND", StringComparison.Ordinal) &&
-                     bow.Contains("tag=bow (weapon)", StringComparison.Ordinal));
-        Harness.Info("resolve_tag(弓) → " + s1);
+                     bow.Text.Contains("result: FOUND", StringComparison.Ordinal) &&
+                     bow.Text.Contains("tag=bow (weapon)", StringComparison.Ordinal));
+        Harness.Info("resolve_tag(弓) → " + bow.Summary);
 
-        var arrow = host.Execute(toolCfg, ToolKind.Resolve, "{\"tag\":\"箭头\"}", out var s2);
+        var arrow = Resolve("箭头");
         Harness.True("「箭头」→ arrow (symbol)",
-                     arrow.Contains("tag=arrow (symbol)", StringComparison.Ordinal));
-        Harness.Info("resolve_tag(箭头) → " + s2);
+                     arrow.Text.Contains("tag=arrow (symbol)", StringComparison.Ordinal));
+        Harness.Info("resolve_tag(箭头) → " + arrow.Summary);
 
         // 回落必须收窄，而且类别要由**内核**来裁：
         // `少女（mokufuu）` 的形状和 `弓（武器）` 一模一样，差别只在类别
         // （character vs general）。实测不审类别的话 `少女` 会解析到
         // `girl (mokufuu)` —— 正是内核注释里点名的那个坑。
-        var shojo = host.Execute(toolCfg, ToolKind.Resolve, "{\"tag\":\"少女\"}", out _);
+        var shojo = Resolve("少女");
         Harness.True("`少女` 仍是 NOT FOUND（回落让内核裁类别，不吃角色标签）",
-                     shojo.Contains("result: NOT FOUND", StringComparison.Ordinal));
+                     shojo.Text.Contains("result: NOT FOUND", StringComparison.Ordinal));
 
         // 形状不对（多出来的是普通字而不是括号限定）也不算命中
-        var partial = host.Execute(toolCfg, ToolKind.Resolve, "{\"tag\":\"初音未\"}", out _);
+        var partial = Resolve("初音未");
         Harness.True("前缀相似不算命中（`初音未` 仍是 NOT FOUND）",
-                     partial.Contains("result: NOT FOUND", StringComparison.Ordinal));
+                     partial.Text.Contains("result: NOT FOUND", StringComparison.Ordinal));
 
         // 人物名与内核保持一致（不绕过 JunkCategories），但必须把模型引到
         // search 那条好路上——否则模型会以为"这个词库连初音未来都没有"。
@@ -204,17 +211,17 @@ public static class Vocab
         // `初音未来（Cosplay）`（2,728 帖）是 general **能过审**。若回落写成
         // "往后继续挑"，就会把 `初音未来` 解析成 `hatsune miku (cosplay)`——
         // 一个自信的错答案，比查不到更糟。所以下面同时断言它**没有**变成那个。
-        var miku = host.Execute(toolCfg, ToolKind.Resolve, "{\"tag\":\"初音未来\"}", out _);
+        var miku = Resolve("初音未来");
         Harness.True("人物名与内核保持一致（NOT FOUND），并把模型引向 search",
-                     miku.Contains("result: NOT FOUND", StringComparison.Ordinal) &&
-                     miku.Contains(ToolCatalog.SearchName, StringComparison.Ordinal));
+                     miku.Text.Contains("result: NOT FOUND", StringComparison.Ordinal) &&
+                     miku.Text.Contains(ToolCatalog.SearchName, StringComparison.Ordinal));
         Harness.True("没有退而求其次挑一个冷门同名变体（不许变成 hatsune miku (cosplay)）",
-                     !miku.Contains("tag=hatsune miku (cosplay)", StringComparison.Ordinal));
+                     !miku.Text.Contains("tag=hatsune miku (cosplay)", StringComparison.Ordinal));
 
         // 英文那条路没有被回落影响
-        var en = host.Execute(toolCfg, ToolKind.Resolve, "{\"tag\":\"hatsune miku\"}", out _);
+        var en = Resolve("hatsune miku");
         Harness.True("英文标签仍然照常解析",
-                     en.Contains("tag=hatsune miku", StringComparison.Ordinal));
+                     en.Text.Contains("tag=hatsune miku", StringComparison.Ordinal));
     }
 }
 

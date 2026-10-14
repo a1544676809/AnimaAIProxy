@@ -19,45 +19,57 @@ namespace AnimaAIProxy.Core;
 public sealed class ToolHost
 {
     private readonly VocabService _vocab;
+    private readonly SearchClient _search;
 
-    public ToolHost(VocabService vocab) => _vocab = vocab;
+    public ToolHost(VocabService vocab, SearchClient? search = null)
+    {
+        _vocab = vocab;
+        _search = search ?? new SearchClient();
+    }
 
     /// <summary>
-    /// 执行一次调用。返回回灌给模型的文本；<paramref name="summary"/> 是一句
-    /// 给人看的一行摘要，供日志与界面显示。
+    /// 一次工具执行的结果。
     ///
-    /// **这个类是无状态的**（只持一个 <see cref="VocabService"/> 引用），
-    /// 所以可以跨请求共享。这里刻意**不**记"本请求已执行几次"：那个计数
+    /// 做成 record 而不是 <c>out</c> 参数，是因为执行体已经是异步的了
+    /// （<c>web_search</c> 要发 HTTP），而 C# 不允许 async 方法带 out 参数。
+    /// <paramref name="Text"/> 是回灌给模型的文本，<paramref name="Summary"/>
+    /// 是给人看的一行摘要（日志与界面）。
+    /// </summary>
+    public sealed record ToolResult(string Text, string Summary);
+
+    /// <summary>
+    /// 执行一次调用，返回回灌给模型的文本。
+    ///
+    /// **这个类是无状态的**（只持 <see cref="VocabService"/> 与 <see cref="SearchClient"/>
+    /// 两个引用），所以可以跨请求共享。这里刻意**不**记"本请求已执行几次"：那个计数
     /// 放在共享实例上会跨请求累加，把"每次请求最多 N 次"悄悄变成"全局最多 N 次"——
     /// 跑一阵子之后所有人都查不了库，而日志上什么异常都没有。
     /// 计数归 <see cref="ToolLoop"/> 自己持有（它本来就是一次请求一个实例）。
     /// </summary>
-    public string Execute(ProxyConfig cfg, ToolKind kind, string arguments, out string summary)
+    public async Task<ToolResult> ExecuteAsync(ProxyConfig cfg, ToolKind kind, string arguments,
+                                               CancellationToken ct = default)
     {
         try
         {
-            return kind switch
+            switch (kind)
             {
-                ToolKind.Search => Search(cfg, arguments, out summary),
-                ToolKind.Resolve => Resolve(cfg, arguments, out summary),
-                ToolKind.Scan => Scan(cfg, arguments, out summary),
-                _ => Fail("未知工具。", out summary)
-            };
+                case ToolKind.Search: return Search(cfg, arguments);
+                case ToolKind.Resolve: return Resolve(cfg, arguments);
+                case ToolKind.Scan: return Scan(cfg, arguments);
+                case ToolKind.WebSearch: return await WebSearchAsync(cfg, arguments, ct).ConfigureAwait(false);
+                default: return new ToolResult("Unknown tool.", "未知工具。");
+            }
         }
         catch (Exception ex)
         {
-            // 词库那边理论上不抛，但 113 MB 的数据 + 任意用户输入，
+            // 词库那边理论上不抛，但 113 MB 的数据 + 任意用户输入 + 一次外部 HTTP，
             // 兜底一层比让上游收到 500 强。
             ProxyLog.Write($"工具执行异常（{kind}）：{ex}");
-            return Fail("工具执行失败：" + ex.Message, out summary);
+            return new ToolResult("工具执行失败：" + ex.Message, "工具执行失败：" + ex.Message);
         }
     }
 
-    private static string Fail(string text, out string summary)
-    {
-        summary = text;
-        return text;
-    }
+    private static ToolResult Fail(string text) => new(text, text);
 
     /// <summary>
     /// 取出并解析词库。不可用时返回 null，并且**把原因交给调用方**——
@@ -80,18 +92,19 @@ public sealed class ToolHost
 
     // ---------------- danbooru_search_tags ----------------
 
-    private string Search(ProxyConfig cfg, string arguments, out string summary)
+    private ToolResult Search(ProxyConfig cfg, string arguments)
     {
         var (query, limit) = ReadQueryAndLimit(arguments);
         if (query.Length == 0)
         {
-            summary = "查（空查询）";
-            return "The query was empty. Call this tool again with one or two words, " +
-                   "for example \"white dress\" or \"蕾丝\".";
+            return new ToolResult(
+                "The query was empty. Call this tool again with one or two words, " +
+                "for example \"white dress\" or \"蕾丝\".",
+                "查（空查询）");
         }
 
         var db = TryVocab(cfg, out var err);
-        if (db is null) return Fail(err, out summary);
+        if (db is null) return Fail(err);
 
         var res = TagSearch.QueryDetailed(db, query, Math.Clamp(limit, 1, TagSearch.ToolLimit));
 
@@ -100,26 +113,27 @@ public sealed class ToolHost
         // "还剩几次"是编的，不如统一说 0（"这是本轮的最后信息"），
         // 系统提示里另外交代它"需要更多就再调一次"。
         var text = TagSearch.ToToolContent(res.Hits, query, 0, res.SplitMatch);
-        summary = res.Hits.Count > 0
+        var summary = res.Hits.Count > 0
             ? $"查「{query}」→ {res.Hits.Count} 条"
             : $"查「{query}」→ 无结果";
-        return text;
+        return new ToolResult(text, summary);
     }
 
     // ---------------- danbooru_resolve_tag ----------------
 
-    private string Resolve(ProxyConfig cfg, string arguments, out string summary)
+    private ToolResult Resolve(ProxyConfig cfg, string arguments)
     {
         var tag = ReadString(arguments, "tag");
         if (tag.Length == 0)
         {
-            summary = "核对（空输入）";
-            return "The tag was empty. Call this tool again with one tag name or one " +
-                   "Chinese meaning.";
+            return new ToolResult(
+                "The tag was empty. Call this tool again with one tag name or one " +
+                "Chinese meaning.",
+                "核对（空输入）");
         }
 
         var db = TryVocab(cfg, out var err);
-        if (db is null) return Fail(err, out summary);
+        if (db is null) return Fail(err);
 
         // 先当英文标签解析，不成立再当中文释义解析。这条顺序与
         // AnimaCaptioner 的 SuspiciousMentions 判据一致——两处不一致的话，
@@ -196,8 +210,7 @@ public sealed class ToolHost
               Append("it as a tag; say it in prose instead, or call ").
               Append(ToolCatalog.SearchName).Append(" with shorter words to look for a ").
               Append("real one.\n");
-            summary = $"核对「{tag}」→ 查不到";
-            return sb.ToString();
+            return new ToolResult(sb.ToString(), $"核对「{tag}」→ 查不到");
         }
 
         var status = db.Status(resolved);
@@ -222,8 +235,7 @@ public sealed class ToolHost
             sb.Append("warning: this tag exists in the database but has no usage; treat it " +
                       "as unverified.\n");
 
-        summary = $"核对「{tag}」→ {resolved}（{StatusText(status)}）";
-        return sb.ToString();
+        return new ToolResult(sb.ToString(), $"核对「{tag}」→ {resolved}（{StatusText(status)}）");
     }
 
     /// <summary>
@@ -269,17 +281,18 @@ public sealed class ToolHost
 
     // ---------------- danbooru_scan_text ----------------
 
-    private string Scan(ProxyConfig cfg, string arguments, out string summary)
+    private ToolResult Scan(ProxyConfig cfg, string arguments)
     {
         var text = ReadString(arguments, "text");
         if (text.Length == 0)
         {
-            summary = "切分（空输入）";
-            return "The text was empty. Call this tool again with a Chinese description.";
+            return new ToolResult(
+                "The text was empty. Call this tool again with a Chinese description.",
+                "切分（空输入）");
         }
 
         var db = TryVocab(cfg, out var err);
-        if (db is null) return Fail(err, out summary);
+        if (db is null) return Fail(err);
 
         var hits = db.Scan(text);
         var sb = new StringBuilder();
@@ -290,8 +303,7 @@ public sealed class ToolHost
             sb.Append("result: no tag matched. None of the words in this description ").
               Append("correspond to a tag in the database. This is a normal outcome, not an ").
               Append("error - say the leftover meaning in prose.\n");
-            summary = "切分 → 无命中";
-            return sb.ToString();
+            return new ToolResult(sb.ToString(), "切分 → 无命中");
         }
 
         sb.Append("matched ").Append(hits.Count).Append(" tag(s):\n");
@@ -303,8 +315,44 @@ public sealed class ToolHost
             if (!string.IsNullOrEmpty(h.Key)) sb.Append(" (from \"").Append(h.Key).Append("\")");
             sb.Append('\n');
         }
-        summary = $"切分 → {hits.Count} 个标签";
-        return sb.ToString();
+        return new ToolResult(sb.ToString(), $"切分 → {hits.Count} 个标签");
+    }
+
+    // ---------------- web_search ----------------
+
+    /// <summary>
+    /// 联网搜索。**这里刻意不做"搜索能不能用"的判断以外的任何补救**：
+    /// 搜索失败时如实把失败原因交给模型（见 <see cref="SearchClient.ToToolContent"/>），
+    /// 而不是回一句空结果——后者会让模型把"网断了"当成"这个概念不存在"，
+    /// 然后凭记忆编一个答案出来，而它自己并不知道自己在编。
+    /// </summary>
+    private async Task<ToolResult> WebSearchAsync(ProxyConfig cfg, string arguments, CancellationToken ct)
+    {
+        var query = ReadString(arguments, "query");
+        if (query.Length == 0)
+        {
+            return new ToolResult(
+                "The query was empty. Call this tool again with a few keywords, " +
+                "for example \"Qt 6.8 release date\".",
+                "搜索（空查询）");
+        }
+
+        if (!cfg.SearchReady)
+        {
+            // 正常情况下走不到这里：没配好后端时这个工具根本不会被下发。
+            // 但模型可能凭上文记忆去调一个这次没下发的工具名，所以如实回一句。
+            return new ToolResult(
+                "Web search is not available on this proxy right now, so this could not be " +
+                "performed. Do not pretend that you searched, and do not invent sources or " +
+                "urls. Tell the user that web search is unavailable.",
+                "搜索 → 未配置");
+        }
+
+        var r = await _search.SearchAsync(cfg, query, ct).ConfigureAwait(false);
+        var text = SearchClient.ToToolContent(r, query);
+        return new ToolResult(text, r.Ok
+            ? $"搜索「{query}」→ {r.Hits.Count} 条"
+            : $"搜索「{query}」→ 失败：{r.Error}");
     }
 
     // ---------------- 参数读取 ----------------

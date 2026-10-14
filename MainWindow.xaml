@@ -20,7 +20,14 @@
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
 
-        <!-- 托盘图标：只是个载体，不渲染。图标由 GeneratedIconSource 现画，不依赖 .ico。 -->
+        <!--
+            托盘图标：只是个载体，不渲染。图标由 GeneratedIconSource 现画，不依赖 .ico。
+
+            菜单项**只给 x:Name、不给 Click**：默认的 ContextMenuMode=PopupMenu 会把
+            这个 MenuFlyout 交给 Win32 菜单模拟，而它只认每项上的 Command（由
+            MainWindow 构造函数里的 WireTrayCommands 接上）。绑 Click 的话菜单照常
+            弹出、每项都能点，但没有任何代码会执行。
+        -->
         <tb:TaskbarIcon x:Name="Tray" Grid.Row="0" ToolTipText="AnimaAIProxy"
                         MenuActivation="RightClick" NoLeftClickDelay="True">
             <tb:TaskbarIcon.IconSource>
@@ -29,12 +36,12 @@
             </tb:TaskbarIcon.IconSource>
             <tb:TaskbarIcon.ContextFlyout>
                 <MenuFlyout>
-                    <MenuFlyoutItem Text="显示窗口" Click="TrayShow_Click" />
+                    <MenuFlyoutItem x:Name="TrayShowItem" Text="显示窗口" />
                     <MenuFlyoutSeparator />
-                    <MenuFlyoutItem Text="启动代理" Click="TrayStart_Click" />
-                    <MenuFlyoutItem Text="停止代理" Click="TrayStop_Click" />
+                    <MenuFlyoutItem x:Name="TrayStartItem" Text="启动代理" />
+                    <MenuFlyoutItem x:Name="TrayStopItem" Text="停止代理" />
                     <MenuFlyoutSeparator />
-                    <MenuFlyoutItem Text="退出" Click="TrayExit_Click" />
+                    <MenuFlyoutItem x:Name="TrayExitItem" Text="退出" />
                 </MenuFlyout>
             </tb:TaskbarIcon.ContextFlyout>
         </tb:TaskbarIcon>
@@ -247,6 +254,64 @@
                             <NumberBox Grid.Column="1" x:Name="MaxCallsBox"
                                        Header="单次请求工具调用上限（1-64）"
                                        Minimum="1" Maximum="64" SpinButtonPlacementMode="Compact" />
+                        </Grid>
+                    </StackPanel>
+                </Expander>
+
+                <!-- ===== 联网搜索 ===== -->
+                <Expander Header="联网搜索" HorizontalAlignment="Stretch"
+                          HorizontalContentAlignment="Stretch">
+                    <StackPanel Spacing="10" Padding="4,10,4,4">
+                        <ToggleSwitch x:Name="SearchEnabledSwitch"
+                                      Header="给模型 web_search 工具"
+                                      OnContent="模型可以自己决定上网查"
+                                      OffContent="不下发这个工具"
+                                      Toggled="SearchSetting_Changed" />
+                        <TextBlock x:Name="SearchStatusText" TextWrapping="Wrap" Opacity="0.8" />
+
+                        <ComboBox x:Name="SearchProviderBox" Header="后端"
+                                  HorizontalAlignment="Stretch"
+                                  SelectionChanged="SearchProvider_Changed">
+                            <ComboBoxItem Content="（未选择）" Tag="" />
+                            <ComboBoxItem Content="SearXNG（自建实例，不需要密钥）" Tag="searxng" />
+                            <ComboBoxItem Content="Tavily" Tag="tavily" />
+                            <ComboBoxItem Content="Brave Search" Tag="brave" />
+                            <ComboBoxItem Content="Serper（返回 Google 结果）" Tag="serper" />
+                            <ComboBoxItem Content="shim（Anthropic 兼容搜索网关）" Tag="shim" />
+                        </ComboBox>
+
+                        <TextBox x:Name="SearchBaseUrlBox" Header="地址"
+                                 PlaceholderText="http://127.0.0.1:8888"
+                                 TextChanged="SearchSetting_TextChanged" />
+
+                        <Grid ColumnSpacing="10">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <PasswordBox Grid.Column="0" x:Name="SearchKeyBox" Header="API Key" />
+                            <Button Grid.Column="1" x:Name="ClearSearchKeyButton" Content="清除密钥"
+                                    Click="ClearSearchKey_Click" VerticalAlignment="Bottom"
+                                    Visibility="Collapsed" />
+                        </Grid>
+
+                        <TextBox x:Name="SearchSniBox" Header="TLS SNI / Host（shim 需要时填）"
+                                 PlaceholderText="留空则用地址里的主机名" />
+
+                        <Grid ColumnSpacing="10">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <NumberBox Grid.Column="0" x:Name="SearchMaxResultsBox"
+                                       Header="结果条数（1-10）" Minimum="1" Maximum="10"
+                                       SpinButtonPlacementMode="Compact" />
+                            <NumberBox Grid.Column="1" x:Name="SearchTimeoutBox"
+                                       Header="超时（秒）" Minimum="5" Maximum="120"
+                                       SpinButtonPlacementMode="Compact" />
+                            <Button Grid.Column="2" x:Name="TestSearchButton" Content="测试搜索"
+                                    Click="TestSearch_Click" VerticalAlignment="Bottom" />
                         </Grid>
                     </StackPanel>
                 </Expander>

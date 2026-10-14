@@ -66,7 +66,7 @@ public sealed class ToolLoop
         var log = new List<string>();
 
         var clientTools = ChatWire.ClientToolNames(body);
-        var plan = ToolCatalog.Plan(clientTools);
+        var plan = ToolCatalog.Plan(clientTools, _cfg.SearchReady);
 
         // 我们自己那一轮的消息历史。它是**影子**历史：从客户端发来的 messages
         // 开始，加上我们执行过的工具调用与结果。这条历史只用于我们和上游之间的
@@ -161,9 +161,11 @@ public sealed class ToolLoop
                 else
                 {
                     executed++;
-                    text = _tools.Execute(_cfg, kind.Value, call.Arguments, out var summary);
-                    collected.Add(summary);
-                    log.Add(summary);
+                    var r = await _tools.ExecuteAsync(_cfg, kind.Value, call.Arguments, ct)
+                                        .ConfigureAwait(false);
+                    text = r.Text;
+                    collected.Add(r.Summary);
+                    log.Add(r.Summary);
                 }
 
                 toolMsgs.Add(RequestShaper.ToolMessage(call.Id, text));

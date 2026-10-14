@@ -234,6 +234,147 @@ public sealed class ProxyConfig
     /// <summary>启动时预载词库。113 MB 的库载入要几秒，但第一次查询就不必现等。</summary>
     public bool PreloadVocab { get; set; } = true;
 
+    // ---------------- 联网搜索 ----------------
+
+    /// <summary>
+    /// 是否允许给模型下发 <c>web_search</c> 工具。
+    ///
+    /// **默认关，而且光打开还不够**：后端没配到能用的程度时工具不下发，
+    /// 见 <see cref="SearchReady"/>。给模型一个必然失败的工具，结果是它白烧
+    /// 一轮预算、拿到一句"搜索不可用"，然后可能改去凭记忆编答案——
+    /// 这比一开始就没有这个工具更糟。AnimaCaptioner 那边同样是这个取舍。
+    /// </summary>
+    public bool SearchEnabled { get; set; }
+
+    /// <summary>
+    /// 搜索后端，见 <see cref="SearchProviders"/>。空串 = 没选，等同于没配。
+    /// 与 <see cref="ProviderProfile"/> 不同，**搜索只有一个后端**——
+    /// 它是给模型查"这个词是什么意思"用的，不需要按名字路由到多家里。
+    /// </summary>
+    public string SearchProvider { get; set; } = "";
+
+    /// <summary>searxng / shim 的后端地址；tavily、brave、serper 用各自固定的官方地址，这里留空。</summary>
+    public string SearchBaseUrl { get; set; } = "";
+
+    /// <summary>DPAPI 密文，加密后 Base64。不要直接改这个字段。</summary>
+    public string SearchApiKeyProtected { get; set; } = "";
+
+    /// <summary>明文搜索密钥。只在内存里，赋值时立刻加密写入 <see cref="SearchApiKeyProtected"/>。</summary>
+    [JsonIgnore]
+    public string SearchApiKey
+    {
+        get => _searchKey ??= Secrets.TryUnprotect(SearchApiKeyProtected, Secrets.UpstreamEntropy) ?? "";
+        set
+        {
+            _searchKey = value ?? "";
+            SearchApiKeyProtected = string.IsNullOrEmpty(_searchKey)
+                ? ""
+                : Secrets.Protect(_searchKey, Secrets.UpstreamEntropy);
+        }
+    }
+
+    [JsonIgnore] private string? _searchKey;
+
+    /// <summary>密文存在但解不开（换过机器）。界面据此提示重填，而不是静默当成没填。</summary>
+    [JsonIgnore]
+    public bool SearchApiKeyUnreadable =>
+        !string.IsNullOrEmpty(SearchApiKeyProtected) &&
+        Secrets.TryUnprotect(SearchApiKeyProtected, Secrets.UpstreamEntropy) is null;
+
+    /// <summary>
+    /// shim 后端的 TLS SNI / Host 名。留空时取 <see cref="SearchBaseUrl"/> 的主机名。
+    /// 见 <see cref="SearchClient"/> 里对 shim 那条路的说明（SNI 与 Host 必须一致）。
+    /// </summary>
+    public string SearchSniHost { get; set; } = "";
+
+    /// <summary>回灌给模型的结果条数上限。摘要很占上下文，给太多会把真正的问题挤出视野。</summary>
+    public int SearchMaxResults { get; set; } = 5;
+
+    /// <summary>单次搜索的超时（秒）。它比上游对话快得多，不需要几分钟。</summary>
+    public int SearchTimeoutSeconds { get; set; } = 30;
+
+    /// <summary>可选后端，顺序即界面下拉框的顺序。</summary>
+    public static readonly string[] SearchProviders = { "searxng", "tavily", "brave", "serper", "shim" };
+
+    /// <summary>把后端名归一化成小写白名单里的值；认不出就返回空串（= 未配置）。</summary>
+    public static string NormalizeProvider(string? value) => value?.Trim().ToLowerInvariant() switch
+    {
+        "searxng" => "searxng",
+        "tavily" => "tavily",
+        "brave" => "brave",
+        "serper" => "serper",
+        "shim" => "shim",
+        _ => ""
+    };
+
+    [JsonIgnore]
+    public string SearchProviderKey => NormalizeProvider(SearchProvider);
+
+    /// <summary>这个后端是否必须要密钥（商业 API，以及实测需要密钥的 shim）。</summary>
+    [JsonIgnore]
+    public bool SearchNeedsKey => NeedsKeyFor(SearchProviderKey);
+
+    /// <summary>这个后端是否必须要地址（自建实例）；商业 API 用固定域名。</summary>
+    [JsonIgnore]
+    public bool SearchNeedsEndpoint => NeedsEndpointFor(SearchProviderKey);
+
+    /// <summary>
+    /// 这个后端是否必须要密钥。
+    ///
+    /// **shim 也算必须**，这一条与 AnimaCaptioner 不同（那边密钥可选），依据是实测：
+    /// 对着真实的搜索网关（nas.ddger.top:49977）不带密钥请求，它回
+    /// <c>401 authentication_error: invalid api key</c>。而 AnimaCaptioner 自己那份
+    /// 配置里也是带密钥的——"可选"只是代码允许，不是它真的能用。
+    ///
+    /// 把它算成必须，效果是"没填密钥就不下发 web_search"。反过来（可选）会下发一个
+    /// **每次必然 401** 的工具：模型白烧一轮预算、拿到一句失败，还可能改去凭记忆编答案。
+    /// 没有密钥时那个网关本来就不可用，所以这里不损失任何真实能力，只是不再假装可用。
+    /// </summary>
+    public static bool NeedsKeyFor(string providerKey) =>
+        providerKey is "tavily" or "brave" or "serper" or "shim";
+
+    public static bool NeedsEndpointFor(string providerKey) => providerKey is "searxng" or "shim";
+
+    /// <summary>
+    /// 后端配到"能用"的程度了吗——**这是 web_search 工具要不要下发的唯一判据**。
+    ///
+    /// 刻意不检查网络可达性：可达与否只有发请求才知道，而那是每次搜索的事。
+    /// 这里只判"配置齐不齐"，因为缺配置是**必然失败**，而网络问题只是**这次失败**，
+    /// 后者应该由工具如实告诉模型重试或放弃，而不是让它连工具都看不到。
+    /// </summary>
+    [JsonIgnore]
+    public bool SearchReady =>
+        SearchEnabled &&
+        SearchProviderKey.Length > 0 &&
+        (!SearchNeedsKey || SearchApiKey.Trim().Length > 0) &&
+        (!SearchNeedsEndpoint || SearchBaseUrl.Trim().Length > 0);
+
+    /// <summary>界面上那行状态说明。空串 = 没问题。</summary>
+    [JsonIgnore]
+    public string SearchProblem =>
+        ProblemFor(SearchEnabled, SearchProviderKey, SearchApiKey.Trim().Length > 0,
+                   SearchApiKeyUnreadable, SearchBaseUrl);
+
+    /// <summary>
+    /// 判据的**唯一**实现，界面上的实时提示也用它。
+    ///
+    /// 界面必须在用户**还没点保存**的时候就能说出"还差哪一项"，否则用户会先点
+    /// 测试、看到一句失败、再回头猜是哪个框没填。而界面上那些值此刻还在控件里、
+    /// 不在配置对象里，所以判据必须能从显式参数算——照抄一份到界面里是错的，
+    /// 两份判据一定会走偏（"界面说已就绪、实际没下发工具"这类问题没有任何症状）。
+    /// </summary>
+    public static string ProblemFor(bool enabled, string providerKey, bool hasKey,
+                                    bool keyUnreadable, string baseUrl)
+    {
+        if (!enabled) return "";
+        if (providerKey.Length == 0) return "还没选后端";
+        if (NeedsKeyFor(providerKey) && keyUnreadable) return "密钥解不开，请重新填写";
+        if (NeedsKeyFor(providerKey) && !hasKey) return "这个后端需要 API Key";
+        if (NeedsEndpointFor(providerKey) && (baseUrl ?? "").Trim().Length == 0)
+            return "这个后端需要填地址";
+        return "";
+    }
+
     // ---------------- 鉴权 ----------------
 
     /// <summary>
@@ -346,6 +487,15 @@ public sealed class ProxyConfig
         if (MaxToolRounds is < 1 or > 12) MaxToolRounds = 4;
         if (MaxToolCallsPerRequest is < 1 or > 64) MaxToolCallsPerRequest = 12;
         ModelMap ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        // 搜索：后端名收敛到白名单，条数与超时拉到合法区间。
+        // 后端填了一个认不出的值（比如手写 "google"）时**不当成错，只是没有后端**——
+        // 界面会显示"还没选后端"，用户看得见，而不是一个静默变成默认后端的值。
+        SearchProvider = NormalizeProvider(SearchProvider);
+        SearchBaseUrl = (SearchBaseUrl ?? "").Trim();
+        SearchSniHost = (SearchSniHost ?? "").Trim();
+        if (SearchMaxResults is < 1 or > 10) SearchMaxResults = 5;
+        if (SearchTimeoutSeconds is < 5 or > 120) SearchTimeoutSeconds = 30;
 
         Providers ??= new List<ProviderProfile>();
         MigrateLegacyUpstream();

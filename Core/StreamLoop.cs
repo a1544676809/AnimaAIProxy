@@ -119,7 +119,7 @@ public sealed class StreamLoop
             _token = clientToken;
             _ct = ct;
             _clientModel = ChatWire.GetString(body, "model");
-            _plan = ToolCatalog.Plan(ChatWire.ClientToolNames(body));
+            _plan = ToolCatalog.Plan(ChatWire.ClientToolNames(body), _cfg.SearchReady);
 
             // 影子历史：从客户端发来的 messages 开始，后面每一轮追加我们执行过的
             // 工具调用与结果。它只用于我们和上游之间的后续轮次，绝不会整体回给
@@ -210,7 +210,8 @@ public sealed class StreamLoop
                     return Completed();
                 }
 
-                await ExecuteOursAsync(mine, theirs, calls, round).ConfigureAwait(false);            }
+                await ExecuteOursAsync(mine, theirs, calls, round).ConfigureAwait(false);
+            }
         }
 
         /// <summary>
@@ -223,8 +224,8 @@ public sealed class StreamLoop
         /// 模型在后续轮次里重新提出（客户端的历史里本来就没有我们的工具结果，
         /// 它会带着自己的历史再来一次）。
         /// </summary>
-        private Task ExecuteOursAsync(List<BufferedCall> mine, List<BufferedCall> theirs,
-                                      IReadOnlyList<BufferedCall> all, Round round)
+        private async Task ExecuteOursAsync(List<BufferedCall> mine, List<BufferedCall> theirs,
+                                            IReadOnlyList<BufferedCall> all, Round round)
         {
             var toolMsgs = new JsonArray();
 
@@ -250,9 +251,11 @@ public sealed class StreamLoop
                 else
                 {
                     _executed++;
-                    text = _tools.Execute(_cfg, kind.Value, call.Arguments, out var summary);
-                    _collected.Add(summary);
-                    _log.Add(summary);
+                    var r = await _tools.ExecuteAsync(_cfg, kind.Value, call.Arguments, _ct)
+                                        .ConfigureAwait(false);
+                    text = r.Text;
+                    _collected.Add(r.Summary);
+                    _log.Add(r.Summary);
                 }
 
                 toolMsgs.Add(RequestShaper.ToolMessage(call.Id, text));
@@ -266,7 +269,7 @@ public sealed class StreamLoop
                 _shadow.Add(RequestShaper.ToolMessage(call.Id, RequestShaper.PendingClientNote));
 
             if (_upstreamCalls < _cfg.MaxToolRounds)
-                return Task.CompletedTask;   // 继续下一轮
+                return;   // 继续下一轮
 
             // 轮数用完：追加一条收尾指令，并**只关我们自己的工具**。
             // 客户端的工具原样留着——那是接入方的能力，我们没有资格因为自己的
@@ -281,7 +284,7 @@ public sealed class StreamLoop
             _plan = new InjectionPlan(Array.Empty<ToolDecl>(),
                                       new Dictionary<string, ToolKind>(StringComparer.Ordinal));
             _wrappingUp = true;
-            return Task.CompletedTask;
+            return;
         }
 
         // ---------------- 一轮上游请求 ----------------

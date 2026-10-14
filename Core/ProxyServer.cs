@@ -40,6 +40,12 @@ public sealed class ProxyServer : IAsyncDisposable
     private readonly VocabService _vocab;
     private readonly UpstreamClient _upstream;
 
+    /// <summary>
+    /// 搜索客户端。**在服务端持有一个而不是每次请求新建**：它内部有 HttpClient，
+    /// 每请求一个的话会不断开新连接、把 TIME_WAIT 攒起来。dispose 归这里。
+    /// </summary>
+    private readonly SearchClient _search = new();
+
     private WebApplication? _app;
     private DateTimeOffset _startedAt;
 
@@ -145,6 +151,7 @@ public sealed class ProxyServer : IAsyncDisposable
     {
         await StopAsync().ConfigureAwait(false);
         _upstream.Dispose();
+        _search.Dispose();
     }
 
     // ---------------- 鉴权 ----------------
@@ -264,7 +271,8 @@ public sealed class ProxyServer : IAsyncDisposable
             ["service"] = "AnimaAIProxy",
             ["uptimeSeconds"] = (int)(DateTimeOffset.Now - _startedAt).TotalSeconds,
             ["tools"] = _cfg.ToolsEnabled,
-            ["vocabReady"] = _vocab.IsLoaded
+            ["vocabReady"] = _vocab.IsLoaded,
+            ["webSearch"] = _cfg.SearchReady
         };
         return ctx.Response.WriteAsync(ChatWire.ToJson(payload), ctx.RequestAborted);
     }
@@ -348,7 +356,7 @@ public sealed class ProxyServer : IAsyncDisposable
     {
         // ToolLoop / ToolHost 都是**一次请求一个实例**：ToolLoop 里持有
         // 本请求的轮数与工具调用计数，复用会把"每次请求"变成"全局"。
-        var loop = new ToolLoop(_upstream, new ToolHost(_vocab), _cfg);
+        var loop = new ToolLoop(_upstream, new ToolHost(_vocab, _search), _cfg);
 
         ToolLoop.Outcome outcome;
         try
@@ -432,7 +440,7 @@ public sealed class ProxyServer : IAsyncDisposable
     private async Task RunStreamLoop(HttpContext ctx, JsonObject body, string token)
     {
         // 与非流式同样的理由：一次请求一个实例，计数才不会跨请求累加。
-        var loop = new StreamLoop(_upstream, new ToolHost(_vocab), _cfg);
+        var loop = new StreamLoop(_upstream, new ToolHost(_vocab, _search), _cfg);
         var sink = new SseSink(ctx);
 
         // **在日志里标明这是流式路径。** 两条路产生的轮次/执行日志措辞一模一样，

@@ -59,6 +59,9 @@ public sealed partial class MainWindow : Window
 
         LogPathText.Text = ProxyLog.FilePath;
 
+        // 托盘菜单项的接线必须在这里做：菜单项只认 Command（见 WireTrayCommands）。
+        WireTrayCommands();
+
         LoadIntoUi();
         RefreshStatus();
 
@@ -105,6 +108,16 @@ public sealed partial class MainWindow : Window
 
             VocabPathBox.Text = _cfg.VocabDbPath;
             SeedPathBox.Text = _cfg.SeedPath;
+
+            SearchEnabledSwitch.IsOn = _cfg.SearchEnabled;
+            SelectProvider(_cfg.SearchProviderKey);
+            SearchBaseUrlBox.Text = _cfg.SearchBaseUrl;
+            SearchSniBox.Text = _cfg.SearchSniHost;
+            SearchMaxResultsBox.Value = _cfg.SearchMaxResults;
+            SearchTimeoutBox.Value = _cfg.SearchTimeoutSeconds;
+            // 密钥框永远不回填明文（界面上没有明文可回填），"空"一律理解成"不改动"。
+            SearchKeyBox.Password = "";
+            RefreshSearchStatus();
 
             RefreshProviderList();
             RefreshModelList();
@@ -153,6 +166,22 @@ public sealed partial class MainWindow : Window
 
         _cfg.VocabDbPath = (VocabPathBox.Text ?? "").Trim();
         _cfg.SeedPath = (SeedPathBox.Text ?? "").Trim();
+
+        _cfg.SearchEnabled = SearchEnabledSwitch.IsOn;
+        _cfg.SearchProvider = (SearchProviderBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "";
+        _cfg.SearchBaseUrl = (SearchBaseUrlBox.Text ?? "").Trim();
+        _cfg.SearchSniHost = (SearchSniBox.Text ?? "").Trim();
+        _cfg.SearchMaxResults = ToInt(SearchMaxResultsBox.Value, _cfg.SearchMaxResults);
+        _cfg.SearchTimeoutSeconds = ToInt(SearchTimeoutBox.Value, _cfg.SearchTimeoutSeconds);
+        // 与站点编辑对话框同一条约定：框里有内容才覆盖密钥，空 = 不改动。
+        // 否则每次点"保存设置"都会把密钥清掉——而用户无从察觉，只会在下次搜索时
+        // 收到一句"需要 API Key"。
+        var typedSearchKey = SearchKeyBox.Password;
+        if (typedSearchKey.Length > 0)
+        {
+            _cfg.SearchApiKey = typedSearchKey;
+            SearchKeyBox.Password = "";
+        }
 
         _cfg.Normalize();
         _cfg.Save();
@@ -904,8 +933,147 @@ public sealed partial class MainWindow : Window
     /// </summary>
     private void OnModelsChanged() => DeferRefreshLists();
 
-    private void ClearLog_Click(object sender, RoutedEventArgs e) => _logLines.Clear();
+    // ---------------- 联网搜索 ----------------
 
+    private void SelectProvider(string key)
+    {
+        for (var i = 0; i < SearchProviderBox.Items.Count; i++)
+        {
+            if (SearchProviderBox.Items[i] is ComboBoxItem item &&
+                string.Equals(item.Tag as string, key, StringComparison.Ordinal))
+            {
+                SearchProviderBox.SelectedIndex = i;
+                return;
+            }
+        }
+        SearchProviderBox.SelectedIndex = 0;   // （未选择）
+    }
+
+    private string SelectedProvider =>
+        (SearchProviderBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "";
+
+    private void SearchProvider_Changed(object sender, SelectionChangedEventArgs e) => RefreshSearchStatus();
+
+    private void SearchSetting_Changed(object sender, RoutedEventArgs e) => RefreshSearchStatus();
+
+    private void SearchSetting_TextChanged(object sender, TextChangedEventArgs e) => RefreshSearchStatus();
+
+    /// <summary>
+    /// 搜索面板的实时状态。**用 <see cref="ProxyConfig.ProblemFor"/> 而不是自己判**：
+    /// 界面说"已就绪"而实际没下发工具（或反过来）都不会有任何症状，
+    /// 两份判据一旦走偏就只能靠人读代码发现。
+    /// </summary>
+    private void RefreshSearchStatus()
+    {
+        var provider = SelectedProvider;
+        var needsKey = ProxyConfig.NeedsKeyFor(provider);
+        var needsUrl = ProxyConfig.NeedsEndpointFor(provider);
+        var typed = SearchKeyBox.Password;
+        var hasKey = typed.Length > 0 || _cfg.SearchApiKey.Trim().Length > 0;
+        var unreadable = typed.Length == 0 && _cfg.SearchApiKeyUnreadable;
+
+        // 只让当前后端用得上的那两项可编辑：留着别的框能打字，用户会以为填了有用。
+        SearchBaseUrlBox.IsEnabled = needsUrl;
+        SearchKeyBox.IsEnabled = needsKey;
+        ClearSearchKeyButton.Visibility = string.IsNullOrEmpty(_cfg.SearchApiKeyProtected)
+            ? Visibility.Collapsed
+            : Visibility.Visible;
+
+        SearchKeyBox.PlaceholderText = !needsKey
+            ? "这个后端不需要密钥"
+            : string.IsNullOrEmpty(_cfg.SearchApiKeyProtected)
+                ? "留空表示不设密钥"
+                : unreadable ? "已存的密钥解不开，请重新填写" : "留空表示不改动";
+
+        var hint = provider switch
+        {
+            "searxng" => "填实例地址。实例要在 settings.yml 的 search.formats 里开启 json，否则接口返回 403。",
+            "shim" => "填网关地址与密钥。TLS SNI / Host 留空时用地址里的主机名。",
+            "tavily" or "brave" or "serper" => "只需填 API Key，地址用官方域名。",
+            _ => "选一个后端，再填它需要的那几项。"
+        };
+
+        var problem = ProxyConfig.ProblemFor(SearchEnabledSwitch.IsOn, provider, hasKey,
+                                             unreadable, SearchBaseUrlBox.Text);
+        var state = !SearchEnabledSwitch.IsOn
+            ? "未启用：模型看不到这个工具。"
+            : problem.Length > 0
+                ? "⚠ " + problem
+                : "已就绪：模型可以调用 " + ToolCatalog.WebSearchName + "。";
+
+        SearchStatusText.Text = hint + "\n" + state;
+    }
+
+    private async void ClearSearchKey_Click(object sender, RoutedEventArgs e)
+    {
+        if (!await ConfirmAsync("清除搜索密钥",
+                "已存的搜索密钥会被删除，之后需要重新填写才能使用联网搜索。", "清除"))
+            return;
+
+        _cfg.SearchApiKey = "";
+        _cfg.Save();
+        SearchKeyBox.Password = "";
+        RefreshSearchStatus();
+        ProxyLog.Write("搜索密钥已清除");
+    }
+
+    /// <summary>
+    /// 用**界面上当前的值**试一次搜索，而不是用已保存的配置。
+    ///
+    /// 用户点"测试"的时机就是他刚填完还没保存的时候；拿盘上的旧配置去测，
+    /// 测的是上一次的设置，而结果会被当成"我这次填的对不对"——那比不测更误导。
+    /// </summary>
+    private async void TestSearch_Click(object sender, RoutedEventArgs e)
+    {
+        var probe = BuildSearchProbe();
+        if (!probe.SearchReady)
+        {
+            SearchStatusText.Text = "还没配好：" + probe.SearchProblem;
+            return;
+        }
+
+        TestSearchButton.IsEnabled = false;
+        SearchStatusText.Text = "正在测试…";
+        try
+        {
+            using var client = new SearchClient();
+            var (ok, message) = await client.TestAsync(probe);
+            SearchStatusText.Text = (ok ? "✓ " : "✗ ") + message;
+            ProxyLog.Write($"搜索自测（{probe.SearchProviderKey}）：" + message);
+        }
+        catch (Exception ex)
+        {
+            SearchStatusText.Text = "✗ 测试失败：" + ex.Message;
+            ProxyLog.WriteException("搜索自测失败", ex);
+        }
+        finally
+        {
+            TestSearchButton.IsEnabled = true;
+        }
+    }
+
+    /// <summary>把界面上当前填的搜索设置做成一份配置（不落盘、不动真配置）。</summary>
+    private ProxyConfig BuildSearchProbe()
+    {
+        var probe = new ProxyConfig
+        {
+            SearchEnabled = SearchEnabledSwitch.IsOn,
+            SearchProvider = SelectedProvider,
+            SearchBaseUrl = (SearchBaseUrlBox.Text ?? "").Trim(),
+            SearchSniHost = (SearchSniBox.Text ?? "").Trim(),
+            SearchMaxResults = ToInt(SearchMaxResultsBox.Value, _cfg.SearchMaxResults),
+            SearchTimeoutSeconds = ToInt(SearchTimeoutBox.Value, _cfg.SearchTimeoutSeconds)
+        };
+
+        var typed = SearchKeyBox.Password;
+        if (typed.Length > 0) probe.SearchApiKey = typed;
+        else probe.SearchApiKeyProtected = _cfg.SearchApiKeyProtected;   // 用已存的那把
+
+        probe.Normalize();
+        return probe;
+    }
+
+    private void ClearLog_Click(object sender, RoutedEventArgs e) => _logLines.Clear();
     private void OpenLogFile_Click(object sender, RoutedEventArgs e) => Open(ProxyLog.FilePath);
 
     private void OpenConfigDir_Click(object sender, RoutedEventArgs e) => Open(ProxyConfig.Dir);
@@ -924,6 +1092,89 @@ public sealed partial class MainWindow : Window
 
     // ---------------- 托盘 ----------------
 
+    /// <summary>
+    /// 托盘菜单与左键的接线。**必须在构造函数里做，而且只能用 Command**——原因见
+    /// <see cref="RelayCommand"/> 的类注释（默认 PopupMenu 模式只看 Command，
+    /// 绑 Click 会让每个菜单项都变成"点得动但什么也不发生"）。
+    ///
+    /// 不用 XAML 的 <c>x:Bind</c>：<c>MenuFlyout</c> 不在可视树里，而
+    /// <c>Window</c> 又不是 <c>FrameworkElement</c>（没有 DataContext），
+    /// 两种声明式写法在这里都靠不住。写在代码里既直白又不会随模板改动失效。
+    /// </summary>
+    private void WireTrayCommands()
+    {
+        TrayShowItem.Command = new RelayCommand(() => RunTray("显示窗口", ShowWindow));
+        TrayStartItem.Command = new RelayCommand(() => RunTray("启动代理", TrayStart));
+        TrayStopItem.Command = new RelayCommand(() => RunTray("停止代理", TrayStop));
+        TrayExitItem.Command = new RelayCommand(() => RunTray("退出", () => _ = ExitAsync()));
+
+        // 左键点图标 = 把窗口叫回来。
+        // **不设的话左键什么都不做**：用户点一下毫无反应，就会判定"托盘是坏的"——
+        // 而左键恰恰是托盘图标最常被点的那个键（右键菜单是第二順位）。
+        Tray.LeftClickCommand = new RelayCommand(() => RunTray("左键显示窗口", ShowWindow));
+    }
+
+    /// <summary>
+    /// 托盘动作的统一入口：**先回 UI 线程，再执行，而且一定留一条日志**。
+    ///
+    /// 两件事都是必需的：
+    /// * **回 UI 线程**：这些命令来自 H.NotifyIcon 的 Win32 消息窗口，
+    ///   碰 <c>AppWindow</c>、控件、列表都不是从 XAML 线程发的。
+    /// * **兜住异常**：Win32 菜单回调里抛出的异常传不回我们的代码，
+    ///   症状就是"点了没反应"——而"点了没反应"正是这一整套修复要消灭的东西。
+    ///   所以失败必须变成日志里的一行，而不是一片沉默。
+    /// </summary>
+    private void RunTray(string what, Action action)
+    {
+        if (!DispatcherQueue.TryEnqueue(() =>
+            {
+                try
+                {
+                    ProxyLog.Write($"托盘：{what}");
+                    action();
+                }
+                catch (Exception ex)
+                {
+                    ProxyLog.WriteException($"托盘「{what}」失败", ex);
+                }
+            }))
+        {
+            ProxyLog.Write($"托盘：{what} 未能派发到界面线程（窗口可能已销毁）");
+        }
+    }
+
+    private void TrayStart()
+    {
+        if (!IsRunning) _ = StartServerAsync();   // 已有的判断放在动作里，不用 CanExecute（见 RelayCommand）
+    }
+
+    private void TrayStop()
+    {
+        if (IsRunning) _ = StopServerAsync();
+    }
+
+    /// <summary>
+    /// 真正退出（只有托盘菜单里的「退出」会走到这里）。
+    ///
+    /// 顺序要紧：先把 Kestrel 停干净（释放端口、把在途请求处理完），再退进程。
+    /// 直接 Exit 的话端口会处于 TIME_WAIT / 未释放状态，下次启动就报"地址已占用"。
+    /// </summary>
+    private async Task ExitAsync()
+    {
+        _exiting = true;   // 让 OnAppWindowClosing 放行
+        ProxyLog.Written -= OnLogWritten;
+        ProxyServer.ModelsChanged -= OnModelsChanged;
+
+        try
+        {
+            if (_server is not null) await _server.DisposeAsync();
+        }
+        catch { /* 退出路径上不抛 */ }
+
+        try { Tray.Dispose(); } catch { }
+        Application.Current.Exit();
+    }
+
     private void OnAppWindowClosing(Microsoft.UI.Windowing.AppWindow sender,
                                     Microsoft.UI.Windowing.AppWindowClosingEventArgs args)
     {
@@ -941,41 +1192,25 @@ public sealed partial class MainWindow : Window
 
     private bool IsRunning => _server?.IsRunning == true;
 
+    /// <summary>
+    /// 把窗口叫回来。
+    ///
+    /// 三件事都要做，少一件就会出现"点了没反应"：
+    /// 1. 隐藏过的窗口要 <c>Show</c>；
+    /// 2. **最小化过的窗口 <c>Show</c> 不会还原**，得让 presenter <c>Restore</c>
+    ///    （最小化之后点托盘"显示窗口"，窗口会一闪之后仍然缩在任务栏上）；
+    /// 3. <c>Activate</c> 才到前台——否则窗口可能出现在别的窗口后面，
+    ///    用户看不到，照样认为没反应。
+    /// </summary>
     private void ShowWindow()
     {
-        AppWindow.Show();
-        Activate();
-    }
-
-    private void TrayShow_Click(object sender, RoutedEventArgs e) => ShowWindow();
-
-    private async void TrayStart_Click(object sender, RoutedEventArgs e)
-    {
-        if (!IsRunning) await StartServerAsync();
-    }
-
-    private async void TrayStop_Click(object sender, RoutedEventArgs e)
-    {
-        if (IsRunning) await StopServerAsync();
-    }
-
-    private async void TrayExit_Click(object sender, RoutedEventArgs e)
-    {
-        _exiting = true;
-        ProxyLog.Written -= OnLogWritten;
-        ProxyServer.ModelsChanged -= OnModelsChanged;
-
-        // 顺序要紧：先把 Kestrel 停干净（释放端口、把在途请求处理完），
-        // 再退进程。直接 Exit 的话端口会处于 TIME_WAIT / 未释放状态，
-        // 下次启动就报"地址已占用"。
-        try
+        if (!AppWindow.IsVisible) AppWindow.Show();
+        if (AppWindow.Presenter is Microsoft.UI.Windowing.OverlappedPresenter p &&
+            p.State == Microsoft.UI.Windowing.OverlappedPresenterState.Minimized)
         {
-            if (_server is not null) await _server.DisposeAsync();
+            p.Restore();
         }
-        catch { /* 退出路径上不抛 */ }
-
-        try { Tray.Dispose(); } catch { }
-        Application.Current.Exit();
+        Activate();
     }
 
     // ---------------- 收尾 ----------------

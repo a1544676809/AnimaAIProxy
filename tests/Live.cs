@@ -58,9 +58,69 @@ public static class Live
         return (baseUrl?.TrimEnd('/') ?? "", key ?? "");
     }
 
+    /// <summary>
+    /// 用**用户真配置里**的搜索后端跑一次真实搜索。
+    ///
+    /// 这是 web_search 唯一一条只有真后端才验得到的路径：代理自己发的那个请求
+    /// （TLS SNI、Host 头、认证头、各家的响应形状）在离线回归里是桩，
+    /// 而桩永远不会告诉你"真实网关认不认我们的请求"。
+    ///
+    /// **刻意不做硬断言**：真实后端可能今天不可用（网关没开、额度用完、上游引擎挂），
+    /// 把那种失败报成"回归失败"会让这条检查变成噪声。所以它只如实打印结果，
+    /// 由人判断——这与本节其余部分"要联网、要密钥"的定位一致。
+    /// </summary>
+    private static void SearchProbe()
+    {
+        Harness.Section("0. 联网搜索后端（用真配置里的搜索设置，直连一次）");
+
+        ProxyConfig cfg;
+        try
+        {
+            cfg = ProxyConfig.LoadReal();
+        }
+        catch (Exception ex)
+        {
+            Harness.Note("读真配置失败：" + ex.Message);
+            return;
+        }
+
+        if (!cfg.SearchEnabled)
+        {
+            Harness.Note("搜索没启用。在界面的「联网搜索」面板里选后端、填好，再点保存。");
+            return;
+        }
+
+        Harness.Info($"后端：{cfg.SearchProviderKey}　地址：{(cfg.SearchBaseUrl.Length > 0 ? cfg.SearchBaseUrl : "（官方域名）")}");
+
+        if (!cfg.SearchReady)
+        {
+            Harness.Note("配置还不完整：" + cfg.SearchProblem + "（填好后这一节才会真的发请求）");
+            return;
+        }
+
+        using var client = new SearchClient();
+        var (ok, message) = client.TestAsync(cfg).GetAwaiter().GetResult();
+        if (ok)
+        {
+            Harness.True("真实搜索后端可用", true);
+            Harness.Info(message);
+        }
+        else
+        {
+            // 不是断言失败：真实后端今天不通，不代表代码有问题。
+            Harness.Note("这次没通：" + message);
+            Harness.Note("提示：密钥错误会回 401；SearXNG 没开 json 会回 403；" +
+                         "shim 的 Host 与 TLS SNI 不一致会回 200 + 空体。");
+        }
+    }
+
     public static void Run(string[] args)
     {
         Harness.Section("真实上游联调：客户端 → 代理 → 真实模型（要联网、要密钥、花真 token）");
+
+        // 搜索自检放在最前面，而且**在"上游没配好就跳过"之前**：
+        // 这两件事互不依赖，用户可能只配好了搜索（或只配好了上游）。
+        SearchProbe();
 
         var (baseUrl, key) = ResolveUpstream(args);
         if (string.IsNullOrWhiteSpace(baseUrl) || string.IsNullOrWhiteSpace(key))
