@@ -62,6 +62,8 @@ public sealed partial class MainWindow : Window
         // 托盘菜单项的接线必须在这里做：菜单项只认 Command（见 WireTrayCommands）。
         WireTrayCommands();
 
+        // 下拉框的选项从 Core 的档位表填进来（**单一来源**：界面不自己列一遍秒数）。
+        InitCleanupOptions();
         LoadIntoUi();
         RefreshStatus();
 
@@ -125,7 +127,7 @@ public sealed partial class MainWindow : Window
             FetchBrowserPathBox.Text = _cfg.FetchBrowserPath;
             FetchMaxCharsBox.Value = _cfg.FetchMaxChars;
             FetchTimeoutBox.Value = _cfg.FetchTimeoutSeconds;
-            FetchIdleBox.Value = _cfg.FetchBrowserIdleSeconds;
+            SelectCleanup(_cfg.FetchCleanupSeconds);
             FetchPrivateSwitch.IsOn = _cfg.FetchAllowPrivateHosts;
             if ((FetchTestUrlBox.Text ?? "").Trim().Length == 0)
                 FetchTestUrlBox.Text = "https://example.com/";
@@ -201,7 +203,7 @@ public sealed partial class MainWindow : Window
         _cfg.FetchBrowserPath = (FetchBrowserPathBox.Text ?? "").Trim();
         _cfg.FetchMaxChars = ToInt(FetchMaxCharsBox.Value, _cfg.FetchMaxChars);
         _cfg.FetchTimeoutSeconds = ToInt(FetchTimeoutBox.Value, _cfg.FetchTimeoutSeconds);
-        _cfg.FetchBrowserIdleSeconds = ToInt(FetchIdleBox.Value, _cfg.FetchBrowserIdleSeconds);
+        _cfg.FetchCleanupSeconds = SelectedCleanupSeconds;
         _cfg.FetchAllowPrivateHosts = FetchPrivateSwitch.IsOn;
 
         _cfg.Normalize();
@@ -1160,8 +1162,129 @@ public sealed partial class MainWindow : Window
             ? "浏览器引擎：" + Path.GetFileName(path)
             : "浏览器引擎：本机没找到 Edge / Chrome（自动降级会退化成只用 HTTP）";
 
-        FetchStatusText.Text = hint + "\n" + browser + "\n" + state;
+        // 清理设置也要说出来：这一项直接决定浏览器（几百 MB 内存）和临时目录活多久，
+        // 而"永不清理"这个档位会一直占着内存 —— 不说明的话用户不会知道代价。
+        var cleanup = CleanupSchedule.Describe(SelectedCleanupSeconds);
+
+        FetchStatusText.Text = hint + "\n" + browser + "\n" + cleanup + "\n" + state;
     }
+
+    // ---------------- 临时目录清理时间 ----------------
+
+    /// <summary>把 Core 的档位表填进两个下拉框。只在窗口构造时做一次。</summary>
+    private void InitCleanupOptions()
+    {
+        FetchCleanupBox.Items.Clear();
+        foreach (var seconds in CleanupSchedule.Presets)
+            FetchCleanupBox.Items.Add(new ComboBoxItem
+            {
+                Content = CleanupSchedule.LabelFor(seconds),
+                Tag = seconds.ToString()
+            });
+        FetchCleanupBox.Items.Add(new ComboBoxItem { Content = "自定义…", Tag = "custom" });
+
+        FetchCleanupUnitBox.Items.Clear();
+        foreach (var unit in CleanupSchedule.Units)
+            FetchCleanupUnitBox.Items.Add(new ComboBoxItem
+            {
+                Content = unit.Label,
+                Tag = unit.SecondsPerUnit.ToString()
+            });
+    }
+
+    private bool CleanupCustomSelected =>
+        (FetchCleanupBox.SelectedItem as ComboBoxItem)?.Tag as string == "custom";
+
+    private static int TagSeconds(object? item, int fallback) =>
+        (item as ComboBoxItem)?.Tag is string s && int.TryParse(s, out var v) ? v : fallback;
+
+    /// <summary>界面上当前选中的清理时间（秒）。**唯一入口** —— 保存与探针都走它。</summary>
+    private int SelectedCleanupSeconds => CleanupCustomSelected
+        ? CleanupSchedule.FromCustom(ToInt(FetchCleanupValueBox.Value, 1),
+                                     TagSeconds(FetchCleanupUnitBox.SelectedItem, 60))
+        : TagSeconds(FetchCleanupBox.SelectedItem, _cfg.FetchCleanupSeconds);
+
+    /// <summary>把配置里的秒数回填到界面上：命中档位就选它，否则选"自定义"并填好数字与单位。</summary>
+    private void SelectCleanup(int seconds)
+    {
+        var presetIndex = -1;
+        for (var i = 0; i < CleanupSchedule.Presets.Count; i++)
+        {
+            if (CleanupSchedule.Presets[i] != seconds) continue;
+            presetIndex = i;
+            break;
+        }
+
+        if (presetIndex < 0)
+        {
+            CleanupSchedule.SplitForCustom(seconds, out var value, out var unitSeconds);
+            FetchCleanupValueBox.Value = value;
+            for (var i = 0; i < FetchCleanupUnitBox.Items.Count; i++)
+            {
+                if (TagSeconds(FetchCleanupUnitBox.Items[i], 0) != unitSeconds) continue;
+                FetchCleanupUnitBox.SelectedIndex = i;
+                break;
+            }
+        }
+
+        FetchCleanupBox.SelectedIndex =
+            presetIndex >= 0 ? presetIndex : FetchCleanupBox.Items.Count - 1;   // 自定义…
+        UpdateCleanupCustomVisibility();
+    }
+
+    private void UpdateCleanupCustomVisibility() =>
+        FetchCleanupCustomRow.Visibility = CleanupCustomSelected
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+
+    private void FetchCleanup_Changed(object sender, SelectionChangedEventArgs e)
+    {
+        UpdateCleanupCustomVisibility();
+        RefreshFetchStatus();
+    }
+
+    private void FetchCleanupValue_Changed(NumberBox sender, NumberBoxValueChangedEventArgs args) =>
+        RefreshFetchStatus();
+
+    /// <summary>
+    /// 立刻清理临时目录。
+    ///
+    /// 优先走服务端持有的那个实例：它会**先关掉空闲的浏览器**，那个目录才会从
+    /// "正在用"变成"可清理"。服务端还没建出来（或已停）时退化成纯扫描 ——
+    /// 这个按钮在任何状态下都该能用。
+    /// </summary>
+    private void CleanupFetch_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            var report = _server?.CleanupTempProfiles() ?? BrowserFetcher.CleanupLeftovers();
+            var text = report.RemovedDirs == 0
+                ? "没有发现可清理的临时目录。"
+                : $"已清理 {report.RemovedDirs} 个临时目录，释放 {SizeText(report.FreedBytes)}。";
+            if (report.BrowserStopped) text += " 浏览器引擎已关闭。";
+            if (report.Busy) text += " 有抓取正在进行，当前实例的临时目录没有动。";
+
+            FetchCleanupResultText.Text = text;
+            ProxyLog.Write("手动清理浏览器临时目录：" + text);
+        }
+        catch (Exception ex)
+        {
+            FetchCleanupResultText.Text = "清理失败：" + ex.Message;
+            ProxyLog.WriteException("手动清理浏览器临时目录失败", ex);
+        }
+    }
+
+    /// <summary>
+    /// 体积说人话。**不能一律按 MB 显示**：一次真实抓取是 13–55 MB，但手工造的小目录
+    /// 会显示成"释放 0.0 MB"—— 看着像什么都没清掉，而实际上清掉了。
+    /// </summary>
+    private static string SizeText(long bytes) => bytes switch
+    {
+        >= 1024 * 1024 => $"{bytes / 1024.0 / 1024.0:F1} MB",
+        >= 1024 => $"{bytes / 1024.0:F0} KB",
+        > 0 => $"{bytes} 字节",
+        _ => "0 字节",
+    };
 
     /// <summary>
     /// 用**界面上当前的值**试抓一次，而不是用已保存的配置 —— 理由与"测试搜索"相同：
@@ -1208,7 +1331,7 @@ public sealed partial class MainWindow : Window
             FetchBrowserPath = path,
             FetchMaxChars = ToInt(FetchMaxCharsBox.Value, _cfg.FetchMaxChars),
             FetchTimeoutSeconds = ToInt(FetchTimeoutBox.Value, _cfg.FetchTimeoutSeconds),
-            FetchBrowserIdleSeconds = ToInt(FetchIdleBox.Value, _cfg.FetchBrowserIdleSeconds),
+            FetchCleanupSeconds = SelectedCleanupSeconds,
             FetchAllowPrivateHosts = FetchPrivateSwitch.IsOn,
             // 判据要能算出 FetchReady，所以这里把"本机有没有浏览器"一并填上
             FetchBrowserUsable = BrowserFetcher.FindChromium(path).Length > 0

@@ -347,7 +347,6 @@
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*" />
                                 <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="*" />
                             </Grid.ColumnDefinitions>
                             <NumberBox Grid.Column="0" x:Name="FetchMaxCharsBox"
                                        Header="正文上限（字符）" Minimum="500" Maximum="200000"
@@ -355,9 +354,40 @@
                             <NumberBox Grid.Column="1" x:Name="FetchTimeoutBox"
                                        Header="超时（秒）" Minimum="5" Maximum="180"
                                        SpinButtonPlacementMode="Compact" />
-                            <NumberBox Grid.Column="2" x:Name="FetchIdleBox"
-                                       Header="浏览器空闲关闭（秒）" Minimum="0" Maximum="3600"
-                                       SpinButtonPlacementMode="Compact" />
+                        </Grid>
+
+                        <!-- 临时目录清理：档位 + 自定义（数字 + 单位）。
+                             选项由 Core 的 CleanupSchedule 填进来，**不在这里硬编码** ——
+                             硬编码就会出现"界面写着 5 分钟、实际按别的秒数跑"这种没有症状的偏差。 -->
+                        <ComboBox x:Name="FetchCleanupBox" Header="临时目录清理"
+                                  HorizontalAlignment="Stretch"
+                                  SelectionChanged="FetchCleanup_Changed" />
+
+                        <Grid x:Name="FetchCleanupCustomRow" ColumnSpacing="10" Visibility="Collapsed">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <NumberBox Grid.Column="0" x:Name="FetchCleanupValueBox"
+                                       Header="自定义清理时间" Minimum="1" Maximum="999999"
+                                       SpinButtonPlacementMode="Compact"
+                                       ValueChanged="FetchCleanupValue_Changed" />
+                            <ComboBox Grid.Column="1" x:Name="FetchCleanupUnitBox" Header="单位"
+                                      HorizontalAlignment="Stretch"
+                                      SelectionChanged="FetchCleanup_Changed" />
+                        </Grid>
+
+                        <Grid ColumnSpacing="10">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Button Grid.Column="0" x:Name="CleanupFetchButton" Content="立即清理"
+                                    Click="CleanupFetch_Click" />
+                            <!-- 清理结果**单独一行**，不复用上面的状态块：状态块是常驻说明，
+                                 被一次性的反馈顶掉之后用户就看不到"这个设置会怎样"了。 -->
+                            <TextBlock Grid.Column="1" x:Name="FetchCleanupResultText"
+                                       TextWrapping="Wrap" VerticalAlignment="Center" Opacity="0.8" />
                         </Grid>
 
                         <ToggleSwitch x:Name="FetchPrivateSwitch"

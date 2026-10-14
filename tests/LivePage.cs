@@ -1,5 +1,12 @@
 using System.Diagnostics;
+using System.Net;
+using System.Net.Sockets;
 using AnimaAIProxy.Core;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
 namespace AnimaAIProxy.Tests;
 
@@ -46,6 +53,127 @@ public static class LivePage
         {
             Harness.Section($"引擎 = {engine}");
             foreach (var url in urls) One(engine, url, proxyOverride);
+        }
+
+        Lifecycle();
+    }
+
+    // ---------------------------------------------------------------- 浏览器实例与临时目录的生命周期
+
+    /// <summary>
+    /// 真实浏览器实例与临时目录的复用 / 清理。
+    ///
+    /// 为什么必须真跑一次：这一整套行为（"这段时间内复用同一个实例"、"到点关掉并删掉目录"）
+    /// 只有在真的起了 Edge、真的写了几百个文件的用户数据目录之后才成立 ——
+    /// 离线回归里的假浏览器没有目录、没有进程，覆盖不到任何一条。
+    ///
+    /// 用**本机桩页面**而不是外网站点：这件事与网络无关，而桩页面让它完全确定、可重复。
+    /// </summary>
+    private static void Lifecycle()
+    {
+        Harness.Section("浏览器实例与临时目录的生命周期（本机桩页面，真起 Edge）");
+
+        if (BrowserFetcher.FindChromium("").Length == 0)
+        {
+            Harness.Note("跳过：本机没有 Edge/Chrome");
+            return;
+        }
+
+        using var server = StartStubServer();
+        var url = server.Url;
+        var before = ProfileDirs();
+        Harness.Info($"桩页面：{url}；当前 %TEMP% 里的 aip-edge-* 目录：{before.Count} 个");
+
+        // 1) 空闲 300 秒 = 复用：抓两次必须是同一个目录、同一个实例
+        using (var fetcher = new BrowserFetcher())
+        {
+            var r1 = Fetch(fetcher, url, 300);
+            var dir1 = fetcher.CurrentProfileDir;
+            Harness.Eq("第一次抓取成功", r1.Ok, true);
+            Harness.True("第一次抓取后有一个临时目录", dir1.Length > 0);
+            Harness.Eq("临时目录真的在磁盘上", Directory.Exists(dir1), true);
+
+            var r2 = Fetch(fetcher, url, 300);
+            var dir2 = fetcher.CurrentProfileDir;
+            Harness.Eq("第二次抓取成功", r2.Ok, true);
+            Harness.Eq("第二次复用了同一个临时目录（这就是「复用」）", dir2, dir1);
+            Harness.Eq("实例还活着（没到清理时间）", fetcher.Running, true);
+
+            // 2) 「立即清理」按钮：关掉浏览器并删掉目录
+            var report = fetcher.CleanupNow();
+            Harness.Eq("手动清理报告关掉了浏览器", report.BrowserStopped, true);
+            Harness.True("手动清理报告清掉了目录", report.RemovedDirs >= 1);
+            Harness.Eq("手动清理后实例没了", fetcher.Running, false);
+            Harness.Eq("手动清理后目录也没了", Directory.Exists(dir1), false);
+        }
+
+        // 3) 立即清理档位（0 秒）：抓完就该自己关掉并删掉目录
+        string immediateDir;
+        using (var fetcher = new BrowserFetcher())
+        {
+            var r = Fetch(fetcher, url, 0);
+            Harness.Eq("立即清理档位下抓取成功", r.Ok, true);
+            immediateDir = fetcher.CurrentProfileDir;
+            Harness.Eq("抓完就关掉了实例（0 秒 = 不保留复用）", fetcher.Running, false);
+            Harness.Eq("抓完就把目录交还了", immediateDir, "");
+        }
+
+        // 4) 收尾核对：不留下任何新增目录
+        Thread.Sleep(500);
+        var after = ProfileDirs();
+        var leaked = after.Where(d => !before.Contains(d, StringComparer.OrdinalIgnoreCase)).ToList();
+        Harness.Eq("这一节没有留下新的残留目录", leaked.Count, 0);
+        if (leaked.Count > 0)
+            foreach (var d in leaked) Harness.Note("残留：" + d);
+    }
+
+    private static BrowserPage Fetch(BrowserFetcher fetcher, string url, int cleanupSeconds) =>
+        fetcher.FetchAsync(url, "", cleanupSeconds, TimeSpan.FromSeconds(60), CancellationToken.None)
+               .GetAwaiter().GetResult();
+
+    private static List<string> ProfileDirs() => BrowserFetcher.EnumerateProfiles();
+
+    /// <summary>
+    /// 一个只回一小段 HTML 的本机服务。**刻意不用外网站点**：这一节验的是生命周期，
+    /// 不是网络，桩页面让它确定、可重复、也不受代理影响。
+    /// </summary>
+    private static StubPageServer StartStubServer() => StubPageServer.Start();
+
+    private sealed class StubPageServer : IDisposable
+    {
+        private WebApplication? _app;
+        public string Url { get; private set; } = "";
+
+        public static StubPageServer Start()
+        {
+            var probe = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+            probe.Start();
+            var port = ((System.Net.IPEndPoint)probe.LocalEndpoint).Port;
+            probe.Stop();
+
+            var b = WebApplication.CreateSlimBuilder(new WebApplicationOptions
+            {
+                ContentRootPath = AppContext.BaseDirectory,
+                EnvironmentName = Environments.Production
+            });
+            b.Logging.ClearProviders();
+            b.Logging.SetMinimumLevel(LogLevel.None);
+            b.WebHost.ConfigureKestrel(o => o.Listen(System.Net.IPAddress.Loopback, port));
+
+            var app = b.Build();
+            app.MapGet("/", () => Results.Content(
+                "<!doctype html><html><head><meta charset=\"utf-8\"><title>桩页面</title></head>" +
+                "<body><h1>标题</h1><p>" + new string('文', 400) + "</p></body></html>",
+                "text/html; charset=utf-8"));
+            app.Start();
+
+            return new StubPageServer { _app = app, Url = $"http://127.0.0.1:{port}/" };
+        }
+
+        public void Dispose()
+        {
+            try { _app?.StopAsync().GetAwaiter().GetResult(); } catch { }
+            try { _app?.DisposeAsync().AsTask().GetAwaiter().GetResult(); } catch { }
         }
     }
 

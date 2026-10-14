@@ -94,6 +94,15 @@ public sealed class PageReader : IDisposable
     public bool BrowserRunning => (_browser as BrowserFetcher)?.Running ?? false;
 
     /// <summary>
+    /// 立刻清理浏览器临时目录（界面上的「立即清理」）。
+    ///
+    /// 用的是**实例**（如果拿得到）：它会先关掉空闲的浏览器，那个目录才成为可清对象。
+    /// 拿不到实例时退化成纯扫描 —— 界面上那个按钮在服务端还没建出来时也必须能用。
+    /// </summary>
+    public CleanupReport CleanupTempProfiles() =>
+        _browser is BrowserFetcher bf ? bf.CleanupNow() : BrowserFetcher.CleanupLeftovers();
+
+    /// <summary>
     /// 代理变了就重建 <see cref="HttpClient"/>。
     ///
     /// 为什么不直接改 <c>SocketsHttpHandler.Proxy</c>：那个属性的可变性依赖具体实现与版本，
@@ -459,7 +468,7 @@ public sealed class PageReader : IDisposable
         if (_browser is BrowserFetcher bf) bf.RefreshPath(cfg.FetchBrowserPath);
 
         var page = await _browser
-            .FetchAsync(url, cfg.FetchProxy, cfg.FetchBrowserIdleSeconds, timeout, ct).ConfigureAwait(false);
+            .FetchAsync(url, cfg.FetchProxy, cfg.FetchCleanupSeconds, timeout, ct).ConfigureAwait(false);
         if (!page.Ok)
             return Fail(page.Url.Length > 0 ? page.Url : url, page.Error);
 

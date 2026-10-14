@@ -14,6 +14,10 @@ public interface IBrowserEngine
     /// <summary>本机有没有可用的浏览器。没有时不该把 <c>web_fetch</c> 的 browser 模式当成可用。</summary>
     bool Available { get; }
 
-    Task<BrowserPage> FetchAsync(string url, string proxy, int idleSeconds,
+    /// <summary>
+    /// 渲染一个页面。<paramref name="cleanupSeconds"/> 是"多久没人用就关掉浏览器并清掉
+    /// 它的临时目录"，取值见 <see cref="CleanupSchedule"/>（<c>-1</c> = 永不、<c>0</c> = 立即）。
+    /// </summary>
+    Task<BrowserPage> FetchAsync(string url, string proxy, int cleanupSeconds,
                                  TimeSpan timeout, CancellationToken ct);
 }

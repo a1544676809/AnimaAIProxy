@@ -49,8 +49,105 @@ public static class PageRead
         Harness.Section("网页获取：瞬时失败重试");
         Retry().GetAwaiter().GetResult();
 
+        Harness.Section("网页获取：临时目录清理时间");
+        CleanupTime();
+
         Harness.Section("网页获取：浏览器与临时目录的回收");
         Reclaim();
+    }
+
+    // ---------------------------------------------------------------- 清理时间
+
+    /// <summary>
+    /// 清理时间这一项的换算与配置迁移。
+    ///
+    /// 为什么值得钉住：这个值有三处消费者（配置钳制、界面下拉框、状态行文案），
+    /// 而**任何一处走偏都没有症状** —— 界面写着"5 分钟"、实际按 3000 秒跑，
+    /// 用户只会觉得"有时候它关得慢"。所以换算只允许有一个实现（<see cref="CleanupSchedule"/>），
+    /// 这里把它逐条钉住。
+    /// </summary>
+    private static void CleanupTime()
+    {
+        // 档位就是用户点名要的那几个，顺序也照它
+        Harness.Eq("档位个数", CleanupSchedule.Presets.Count, 8);
+        Harness.Eq("第一个是立即清理", CleanupSchedule.Presets[0], CleanupSchedule.Immediate);
+        Harness.Eq("第二个是 5 分钟（默认）", CleanupSchedule.Presets[1], 300);
+        Harness.Eq("默认值就是 5 分钟", CleanupSchedule.DefaultSeconds, 300);
+        Harness.Eq("最后一个是永不清理", CleanupSchedule.Presets[^1], CleanupSchedule.Never);
+        Harness.Eq("档位里有 1 天", CleanupSchedule.Presets.Contains(86400), true);
+        Harness.Eq("档位里有 1 个月", CleanupSchedule.Presets.Contains(2_592_000), true);
+
+        // 自定义的单位就是用户点名的那几个
+        Harness.Eq("自定义单位个数", CleanupSchedule.Units.Count, 5);
+        Harness.Eq("自定义单位第一个是年", CleanupSchedule.Units[0].Label, "年");
+        Harness.Eq("自定义单位最后一个是分", CleanupSchedule.Units[^1].Label, "分");
+        Harness.Eq("一年按 365 天算", CleanupSchedule.Units[0].SecondsPerUnit, 31_536_000);
+        Harness.Eq("一个月按 30 天算", CleanupSchedule.Units[1].SecondsPerUnit, 2_592_000);
+
+        // 档位标签
+        Harness.Eq("立即清理的标签", CleanupSchedule.LabelFor(CleanupSchedule.Immediate), "立即清理");
+        Harness.Eq("永不清理的标签", CleanupSchedule.LabelFor(CleanupSchedule.Never), "永不清理");
+        Harness.Eq("300 秒说成 5 分钟", CleanupSchedule.LabelFor(300), "5 分钟");
+        Harness.Eq("2592000 秒说成 1 个月", CleanupSchedule.LabelFor(2_592_000), "1 个月");
+        Harness.Eq("5400 秒说成 1 小时 30 分钟", CleanupSchedule.Humanize(5400), "1 小时 30 分钟");
+        Harness.Eq("45 秒", CleanupSchedule.Humanize(45), "45 秒");
+
+        // 自定义换算
+        Harness.Eq("2 时 = 7200 秒", CleanupSchedule.FromCustom(2, 3600), 7200);
+        Harness.Eq("3 日 = 259200 秒", CleanupSchedule.FromCustom(3, 86400), 259_200);
+        Harness.Eq("手填 0 也当成 1（否则会变成'立即清理'这个完全不同的意思）",
+            CleanupSchedule.FromCustom(0, 3600), 3600);
+        Harness.Eq("填超大数被钳到上限，而不是溢出成负数",
+            CleanupSchedule.FromCustom(999_999, 31_536_000), CleanupSchedule.MaxSeconds);
+
+        // 反向：秒 → 界面那两个控件
+        CleanupSchedule.SplitForCustom(7200, out var v1, out var u1);
+        Harness.Eq("7200 秒显示成 2", v1, 2);
+        Harness.Eq("7200 秒用最大的整除单位（时）", u1, 3600);
+        CleanupSchedule.SplitForCustom(600, out var v2, out var u2);
+        Harness.Eq("600 秒显示成 10", v2, 10);
+        Harness.Eq("600 秒用分", u2, 60);
+        // 往返一致：能被单位整除的值必须原样回来
+        foreach (var seconds in new[] { 60, 600, 3600, 7200, 86400, 259_200, 2_592_000, 31_536_000 })
+        {
+            CleanupSchedule.SplitForCustom(seconds, out var v, out var u);
+            Harness.Eq($"往返一致：{seconds} 秒", CleanupSchedule.FromCustom(v, u), seconds);
+        }
+
+        // 钳制：认不出的值退回默认，-1/0 是合法档位
+        Harness.Eq("-1（永不）合法", CleanupSchedule.Normalize(-1), -1);
+        Harness.Eq("0（立即）合法", CleanupSchedule.Normalize(0), 0);
+        Harness.Eq("300 合法", CleanupSchedule.Normalize(300), 300);
+        Harness.Eq("-5 认不出 → 默认", CleanupSchedule.Normalize(-5), 300);
+        Harness.Eq("超过上限 → 默认", CleanupSchedule.Normalize(int.MaxValue), 300);
+
+        // 状态行必须把"永不清理"的代价说出来 —— 否则用户不知道它一直占着几百 MB
+        Harness.True("永不清理的状态行点明内存代价",
+            CleanupSchedule.Describe(CleanupSchedule.Never).Contains("MB"));
+        Harness.True("立即清理的状态行点明没有复用",
+            CleanupSchedule.Describe(CleanupSchedule.Immediate).Contains("不保留复用"));
+        Harness.True("普通档位的状态行说明会复用",
+            CleanupSchedule.Describe(300).Contains("复用"));
+
+        // 配置迁移：旧字段（浏览器空闲关闭秒数）搬进新字段
+        var legacy = new ProxyConfig { FetchBrowserIdleSeconds = 0 };
+        legacy.Normalize();
+        Harness.Eq("旧版 0 秒（抓完就关）→ 立即清理", legacy.FetchCleanupSeconds, CleanupSchedule.Immediate);
+        Harness.Eq("迁移后旧字段被清空（新配置里不再出现这个键）", legacy.FetchBrowserIdleSeconds, null);
+
+        var legacy2 = new ProxyConfig { FetchBrowserIdleSeconds = 1800 };
+        legacy2.Normalize();
+        Harness.Eq("旧版 1800 秒 → 1800 秒", legacy2.FetchCleanupSeconds, 1800);
+
+        // 旧值恰好等于新默认值时不动新字段（否则"照搬一遍"会让两个键同时存在，谁赢说不清）
+        var same = new ProxyConfig { FetchBrowserIdleSeconds = CleanupSchedule.DefaultSeconds };
+        same.Normalize();
+        Harness.Eq("旧值 == 新默认值时保持新字段不变", same.FetchCleanupSeconds, CleanupSchedule.DefaultSeconds);
+
+        // 新字段自己填的怪值也要被拉回来
+        var weird = new ProxyConfig { FetchCleanupSeconds = -77 };
+        weird.Normalize();
+        Harness.Eq("手改的非法值被拉回默认", weird.FetchCleanupSeconds, CleanupSchedule.DefaultSeconds);
     }
 
     // ---------------------------------------------------------------- 正文提取
@@ -633,22 +730,46 @@ public static class PageRead
         Directory.CreateDirectory(root);
         try
         {
-            var stale = Path.Combine(root, BrowserFetcher.ProfilePrefix + "stale001");
-            var fresh = Path.Combine(root, BrowserFetcher.ProfilePrefix + "fresh001");
+            var idle = Path.Combine(root, BrowserFetcher.ProfilePrefix + "idle001");
+            var busy = Path.Combine(root, BrowserFetcher.ProfilePrefix + "busy001");
             var other = Path.Combine(root, "some-other-dir");     // 不该被碰
-            Directory.CreateDirectory(stale);
-            Directory.CreateDirectory(fresh);
+            Directory.CreateDirectory(idle);
+            Directory.CreateDirectory(busy);
             Directory.CreateDirectory(other);
-            File.WriteAllText(Path.Combine(stale, "x.txt"), "x");
-            // 推到阈值之外（先建文件再改时间，否则建文件会把时间刷新）
-            Directory.SetLastWriteTimeUtc(stale,
-                DateTime.UtcNow - BrowserFetcher.StaleProfileAge - TimeSpan.FromMinutes(10));
+            File.WriteAllText(Path.Combine(idle, "x.txt"), "x");
+            File.WriteAllText(Path.Combine(busy, "y.txt"), new string('y', 2048));
 
-            var removed = BrowserFetcher.SweepStaleProfiles(BrowserFetcher.StaleProfileAge, root);
-            Harness.Eq("陈旧残留被清掉", removed, 1);
-            Harness.Eq("陈旧目录确实没了", Directory.Exists(stale), false);
-            Harness.Eq("新鲜目录被保留（可能是活着的实例）", Directory.Exists(fresh), true);
-            Harness.Eq("不匹配前缀的目录一概不碰", Directory.Exists(other), true);
+            // "在用"的判据是**那把锁**（活着的实例以 FileShare.None 持有它），
+            // 不是"目录有多旧"。早先靠 2 小时的猜测：猜大了残留堆积（实测 13 个 / 234 MB），
+            // 猜小了会删掉另一个活着的实例正在用的目录。锁没有这个两难。
+            Harness.Eq("没有锁文件的目录算'没人在用'", BrowserFetcher.ProfileInUse(idle), false);
+
+            using (new FileStream(Path.Combine(busy, BrowserFetcher.ProfileLockName),
+                                  FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                Harness.Eq("被锁着的目录算'在用'", BrowserFetcher.ProfileInUse(busy), true);
+
+                // 立即清理（olderThan = 0）：不看年龄，只认那把锁
+                Harness.Eq("立即清理只清掉没人在用的那个",
+                    BrowserFetcher.SweepProfiles(TimeSpan.Zero, root), 1);
+                Harness.Eq("在用中的目录还在（绝不误删活着的实例）", Directory.Exists(busy), true);
+                Harness.Eq("没人在用的目录立刻没了", Directory.Exists(idle), false);
+                Harness.Eq("不匹配前缀的目录一概不碰", Directory.Exists(other), true);
+            }
+
+            Harness.Eq("锁一释放，同一个目录就变成可清理", BrowserFetcher.ProfileInUse(busy), false);
+
+            var report = BrowserFetcher.CleanupLeftovers(root);
+            Harness.Eq("释放锁后立即清理清掉了它", report.RemovedDirs, 1);
+            Harness.True("报告了释放的字节数（界面要显示释放了多少）", report.FreedBytes >= 2048);
+            Harness.Eq("已清理的目录确实没了", Directory.Exists(busy), false);
+
+            // 年龄那道保险还在：传一个正的阈值时，新的目录要留着
+            var fresh = Path.Combine(root, BrowserFetcher.ProfilePrefix + "fresh001");
+            Directory.CreateDirectory(fresh);
+            Harness.Eq("阈值大于零时新目录被保留",
+                BrowserFetcher.SweepProfiles(TimeSpan.FromHours(2), root), 0);
+            Harness.Eq("新目录确实还在", Directory.Exists(fresh), true);
         }
         finally { try { Directory.Delete(root, true); } catch { } }
 

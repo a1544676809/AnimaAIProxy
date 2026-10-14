@@ -428,10 +428,29 @@ public sealed class ProxyConfig
     public string FetchBrowserPath { get; set; } = "";
 
     /// <summary>
-    /// 浏览器引擎空闲多久后自动关闭（秒），把那份 420–530 MB 内存还回去。
-    /// 0 = 每次抓完立刻关（最省内存，但每次都要重新付约 0.7 秒的启动开销）。
+    /// 浏览器临时目录多久没人用就清理（秒）。**这一个值同时决定三件事**：
+    /// 关掉浏览器、删掉它的临时目录、以及"这段时间内再抓取就复用同一个实例"。
+    ///
+    /// 为什么三件事必须是同一个值：临时目录的路径每次启动都是新的随机名
+    /// （<see cref="BrowserFetcher.NewProfileDir"/>，避免两个实例撞车），所以
+    /// **浏览器一关，那个目录就再也不会被复用了** —— 留着它纯粹是垃圾。
+    /// 分成两个设置会得到一个自相矛盾的组合："浏览器 1 分钟后关、目录 1 小时后清"，
+    /// 那 59 分钟里磁盘上躺着一个永远不会被再打开的目录。
+    ///
+    /// 取值见 <see cref="CleanupSchedule"/>：<c>-1</c> = 永不清理、<c>0</c> = 立即清理、
+    /// 正数 = 秒。默认 5 分钟。
     /// </summary>
-    public int FetchBrowserIdleSeconds { get; set; } = 300;
+    public int FetchCleanupSeconds { get; set; } = CleanupSchedule.DefaultSeconds;
+
+    /// <summary>
+    /// 旧版字段（"浏览器空闲关闭秒数"，0–3600），只用于读旧文件并迁移到
+    /// <see cref="FetchCleanupSeconds"/>。迁移后置为 null，新代码一律用新字段。
+    ///
+    /// 可空 + <c>WhenWritingNull</c> 的理由与 <see cref="UpstreamBaseUrl"/> 相同：
+    /// 让新配置文件里彻底不出现这个键，免得下次有人看到它以为还能手改。
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? FetchBrowserIdleSeconds { get; set; }
 
     /// <summary>
     /// 是否允许抓本机/内网地址。**默认关，这是 fail-closed 的**。
@@ -621,7 +640,8 @@ public sealed class ProxyConfig
         FetchBrowserPath = (FetchBrowserPath ?? "").Trim();
         if (FetchMaxChars is < 500 or > 200_000) FetchMaxChars = PageReader.DefaultMaxChars;
         if (FetchTimeoutSeconds is < 5 or > 180) FetchTimeoutSeconds = 30;
-        if (FetchBrowserIdleSeconds is < 0 or > 3600) FetchBrowserIdleSeconds = 300;
+        MigrateLegacyFetchIdle();
+        FetchCleanupSeconds = CleanupSchedule.Normalize(FetchCleanupSeconds);
 
         Providers ??= new List<ProviderProfile>();
         MigrateLegacyUpstream();
@@ -674,6 +694,28 @@ public sealed class ProxyConfig
 
         UpstreamBaseUrl = null;
         UpstreamKeyProtected = null;
+    }
+
+    /// <summary>
+    /// 把旧版"浏览器空闲关闭秒数"搬成新的"临时目录清理时间"。
+    ///
+    /// 只在旧值**不等于新默认值**时才搬：旧字段存在但值就是 300（老默认）时，
+    /// 新字段的默认值本来就是 300，搬过去是空操作 —— 而"照搬一遍"会让
+    /// 一份手改过的配置里两个键同时存在，谁赢说不清。用户真正改过的值（0 或别的秒数）
+    /// 才需要保下来，否则症状是"我明明设了立即清理，升级后又变回 5 分钟"，且没有任何提示。
+    /// </summary>
+    private void MigrateLegacyFetchIdle()
+    {
+        if (FetchBrowserIdleSeconds is { } legacy && legacy != CleanupSchedule.DefaultSeconds)
+        {
+            // 旧值 0 = 每次抓完立刻关，正好就是新的"立即清理"。
+            FetchCleanupSeconds = legacy <= 0
+                ? CleanupSchedule.Immediate
+                : Math.Min(legacy, CleanupSchedule.MaxSeconds);
+            ProxyLog.Write("已把旧版「浏览器空闲关闭 " + legacy + " 秒」迁移为「临时目录清理 " +
+                           CleanupSchedule.LabelFor(FetchCleanupSeconds) + "」");
+        }
+        FetchBrowserIdleSeconds = null;
     }
 
     private static readonly object SaveLock = new();

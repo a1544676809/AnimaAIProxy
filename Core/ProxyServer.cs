@@ -73,6 +73,12 @@ public sealed class ProxyServer : IAsyncDisposable
 
     public bool IsRunning => _app is not null;
 
+    /// <summary>
+    /// 立刻清理浏览器临时目录（界面上的「立即清理」按钮）。
+    /// 走服务端持有的那个 <see cref="PageReader"/>，因为它才拿着**正在被复用的**浏览器实例。
+    /// </summary>
+    public CleanupReport CleanupTempProfiles() => _reader.CleanupTempProfiles();
+
     /// <summary>实际监听的地址，供界面显示与用户复制到平台配置里。</summary>
     public string BaseUrl => $"http://{(_cfg.BindScope == "local" ? "127.0.0.1" : "0.0.0.0")}:{_cfg.Port}/v1";
 
