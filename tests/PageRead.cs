@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Headers;
+using System.Net.Sockets;
 using System.Text;
 using AnimaAIProxy.Core;
 using Microsoft.AspNetCore.Builder;
@@ -44,6 +45,9 @@ public static class PageRead
 
         Harness.Section("网页获取：代理真的生效（真桩代理）");
         Proxy().GetAwaiter().GetResult();
+
+        Harness.Section("网页获取：瞬时失败重试");
+        Retry().GetAwaiter().GetResult();
     }
 
     // ---------------------------------------------------------------- 正文提取
@@ -254,6 +258,94 @@ public static class PageRead
             PageReader.ShouldEscalate(Attempt(true, "", 200, 8000, 60000)), false);
     }
 
+    // ---------------------------------------------------------------- 瞬时失败重试
+
+    /// <summary>
+    /// 传输层抖动（TLS EOF、连接被重置）必须重试一次。否则一次抖动会被
+    /// <see cref="PageReader"/> 的降级判据读成"传输层失败"，于是为了一个几百字节的页面
+    /// 启动一个 500 MB 的 headless 浏览器。
+    ///
+    /// 实测依据（代理为 sing-box，同一站点连续 6 次）：<c>en.wikipedia.org</c> 成功 4 次、
+    /// <c>example.com</c> 只成功 2 次，失败全是 TLS 层的 EOF / 握手错误。
+    /// </summary>
+    private static async Task Retry()
+    {
+        var html = "<html><head><title>重试后拿到的</title></head><body><article><p>" +
+                   new string('正', 300) + "</p></article></body></html>";
+
+        // 1) 第一次传输失败、第二次成功 → 重试真的发生，且最终拿到正文、不起浏览器
+        {
+            var stub = new StubHandler
+            {
+                Fail = new HttpRequestException(
+                    "Received an unexpected EOF or 0 bytes from the transport stream."),
+                FailFirst = 1,
+                Reply = _ => Html(html)
+            };
+            var browser = new FakeBrowser();
+            using var reader = new PageReader(stub, browser);
+            var r = await reader.FetchAsync(Cfg("auto"), "https://flaky.example/");
+            Harness.Eq("瞬时失败后重试了一次", stub.Calls, 2);
+            Harness.Eq("重试成功即视为成功", r.Ok, true);
+            Harness.Eq("成功的是 HTTP 引擎（没有白起浏览器）", r.Engine, "http");
+            Harness.Eq("重试成功后不启动浏览器", browser.Calls, 0);
+            Harness.Eq("拿到的是重试那次的正文", r.Title, "重试后拿到的");
+        }
+
+        // 2) 一直失败 → 有上限，不会无限重试；两次都失败才交给降级判据
+        {
+            var stub = new StubHandler
+            {
+                Fail = new HttpRequestException("connection reset"),
+                FailFirst = 99
+            };
+            var browser = new FakeBrowser { Error = "浏览器也没读到正文" };
+            using var reader = new PageReader(stub, browser);
+            var r = await reader.FetchAsync(Cfg("auto"), "https://dead.example/");
+            Harness.Eq("一直失败也只试两次", stub.Calls, 2);
+            Harness.Eq("两次都失败则如实报错", r.Ok, false);
+            Harness.Eq("仍然按降级判据启动了浏览器", browser.Calls, 1);
+            Harness.True("错误里保留了传输失败的原因", r.Error.Contains("connection reset"));
+        }
+
+        // 3) 超时**不**重试 —— 重试会让实际等待翻倍，而调用方给的是一个整体预算。
+        //    用 http 模式：auto 会升级到浏览器，那样最终结果就不是 HTTP 层的结果了。
+        {
+            var stub = new StubHandler
+            {
+                // 调用方的 ct 没有被取消、而请求被取消了 —— 这正是"我们自己的超时"
+                // 在 PageReader 里的形态（超时用每请求一个 linked CTS 实现）。
+                Fail = new TaskCanceledException("The request was canceled due to the configured timeout."),
+                FailFirst = 99
+            };
+            using var reader = new PageReader(stub, new FakeBrowser());
+            var r = await reader.FetchAsync(Cfg("http"), "https://slow.example/");
+            Harness.Eq("超时不重试", stub.Calls, 1);
+            Harness.True("超时如实报成超时，不报成传输失败", r.Error.Contains("超时"));
+        }
+
+        // 4) 判据本身：**只认确实是抖动的那几类**，不是"凡失败都重试"。
+        //    这条很重要 —— 白名单写宽了，DNS 失败与连接被拒也会白等一次。
+        {
+            static HttpRequestException Wrapped(SocketError e) =>
+                new("transport", new SocketException((int)e));
+
+            Harness.Eq("TLS EOF → 重试", PageReader.IsTransientFailure(new HttpRequestException("EOF")), true);
+            Harness.Eq("连接被重置 → 重试",
+                PageReader.IsTransientFailure(Wrapped(SocketError.ConnectionReset)), true);
+            Harness.Eq("连接被中止 → 重试",
+                PageReader.IsTransientFailure(Wrapped(SocketError.ConnectionAborted)), true);
+            Harness.Eq("域名不存在 → 不重试（重试必然一样）",
+                PageReader.IsTransientFailure(Wrapped(SocketError.HostNotFound)), false);
+            Harness.Eq("域名无数据 → 不重试",
+                PageReader.IsTransientFailure(Wrapped(SocketError.NoData)), false);
+            Harness.Eq("目标拒绝连接 → 不重试（立即重试没有意义）",
+                PageReader.IsTransientFailure(Wrapped(SocketError.ConnectionRefused)), false);
+            Harness.Eq("超时异常 → 不重试",
+                PageReader.IsTransientFailure(new TaskCanceledException()), false);
+        }
+    }
+
     // ---------------------------------------------------------------- 双引擎编排
 
     private sealed class StubHandler : HttpMessageHandler
@@ -261,9 +353,18 @@ public static class PageRead
         public Func<HttpRequestMessage, HttpResponseMessage> Reply = _ => Html("");
         public List<string> Urls { get; } = new();
 
+        /// <summary>前 <see cref="FailFirst"/> 次请求直接抛这个异常，用来验重试。null = 不抛。</summary>
+        public Exception? Fail;
+        public int FailFirst;
+
+        /// <summary>实际发出的请求数 —— 重试有没有发生只能靠它看出来。</summary>
+        public int Calls;
+
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage req, CancellationToken ct)
         {
             lock (Urls) Urls.Add(req.RequestUri?.ToString() ?? "");
+            Calls++;
+            if (Fail is not null && Calls <= FailFirst) throw Fail;
             var resp = Reply(req);
             resp.RequestMessage ??= req;
             return Task.FromResult(resp);

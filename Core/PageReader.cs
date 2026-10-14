@@ -240,11 +240,38 @@ public sealed class PageReader : IDisposable
     // ---------------------------------------------------------------- http 引擎
 
     /// <summary>一次 http 尝试的完整信息。降级判据需要原始字节数与状态码，而它们不该出现在给模型的结果里。</summary>
+    /// <param name="Transient">
+    /// 这次失败是**传输层的抖动**（TLS EOF、连接被重置、代理瞬时不可用），而不是站点给的答复。
+    /// 它是重试的依据 —— 见 <see cref="ViaHttpAsync"/>。超时**不算**瞬时失败。
+    /// </param>
     internal sealed record HttpAttempt(FetchResult Result, int RawBytes, int Status,
-                                       bool UnsupportedCharset, bool Challenge);
+                                       bool UnsupportedCharset, bool Challenge, bool Transient = false);
 
+    /// <summary>
+    /// HTTP 引擎的入口：**瞬时传输失败重试一次**，之后才交给降级判据。
+    ///
+    /// 为什么必须重试（实测，代理为 sing-box）：同一个站点连续 6 次，
+    /// <c>en.wikipedia.org</c> 成功 4 次、<c>example.com</c> 只成功 2 次，失败全是
+    /// TLS 层的 EOF / 握手错误。不重试的后果不只是"偶发失败"—— 一次抖动会被
+    /// <see cref="ShouldEscalate"/> 判成"传输层失败"，于是为了一个 577 字节的页面
+    /// 去启动一个 500 MB 的 headless 浏览器。
+    ///
+    /// **超时不重试**：那会让实际等待翻倍，而调用方给的是一个整体预算。
+    /// </summary>
     private async Task<HttpAttempt> ViaHttpAsync(ProxyConfig cfg, string url, int budget,
                                                  TimeSpan timeout, CancellationToken ct)
+    {
+        var first = await HttpOnceAsync(cfg, url, budget, timeout, ct).ConfigureAwait(false);
+        if (!first.Transient || ct.IsCancellationRequested) return first;
+
+        ProxyLog.Write($"HTTP 抓取遇到瞬时传输错误，重试一次（{first.Result.Error}）：{url}");
+
+        // 重试成功就用它；仍然失败时也保留第二次的错误 —— 第一次的原因已经写在日志里了。
+        return await HttpOnceAsync(cfg, url, budget, timeout, ct).ConfigureAwait(false);
+    }
+
+    private async Task<HttpAttempt> HttpOnceAsync(ProxyConfig cfg, string url, int budget,
+                                                  TimeSpan timeout, CancellationToken ct)
     {
         EnsureProxy(cfg.FetchProxy);
 
@@ -332,11 +359,45 @@ public sealed class PageReader : IDisposable
         catch (Exception ex)
         {
             // SSL / DNS / 连接被拒 / 代理不可用都走这里。**这类错误恰恰是浏览器引擎
-            // 有可能救回来的**（实测 wikipedia 就是），所以原样交给降级判据。
+            // 有可能救回来的**（实测 wikipedia 就是），所以原样交给降级判据；
+            // 同时按 IsTransientFailure 判断值不值得立刻重试一次。
             return new HttpAttempt(
                 new FetchResult(false, url, "", "", "http", ex.Message, false, ""),
-                0, 0, false, false);
+                0, 0, false, false, Transient: IsTransientFailure(ex));
         }
+    }
+
+    /// <summary>
+    /// 这个失败值不值得**立刻**重试一次。
+    ///
+    /// 与浏览器引擎的 <c>IsTransientNav</c> 同一套纪律 —— 只认"确实是抖动"的那几类，
+    /// 而不是"凡失败都重试"：
+    /// * 域名解析不了（<c>HostNotFound</c> / <c>NoData</c>）—— 域名本身有问题，重试必然一样；
+    /// * 目标明确拒绝连接（<c>ConnectionRefused</c>）—— 重试是**立即**的、没有退避，同样没意义；
+    /// * 超时（<see cref="OperationCanceledException"/>）—— 它已经吃掉了整个超时预算，
+    ///   再等一遍就是两倍延迟。
+    ///
+    /// 其余（TLS EOF、连接被重置、代理瞬时不可用）都值得重试：实测经 sing-box 抓
+    /// <c>en.wikipedia.org</c> 时失败几乎全是 <c>The SSL connection could not be established</c>
+    /// 与 <c>Received an unexpected EOF</c>，而重试通常就通了。
+    ///
+    /// 做成纯函数是为了能离线回归。
+    /// </summary>
+    internal static bool IsTransientFailure(Exception ex)
+    {
+        if (ex is OperationCanceledException) return false;
+
+        return FindSocketError(ex) is not (SocketError.HostNotFound or SocketError.NoData
+                                        or SocketError.ConnectionRefused);
+    }
+
+    /// <summary>在异常链里找 <see cref="SocketException"/> 的 <see cref="SocketError"/>。</summary>
+    private static SocketError? FindSocketError(Exception? ex)
+    {
+        // 限深，避免异常链成环时死循环。
+        for (var i = 0; ex is not null && i < 6; i++, ex = ex.InnerException)
+            if (ex is SocketException s) return s.SocketErrorCode;
+        return null;
     }
 
     private static async Task<byte[]> ReadBoundedAsync(Stream stream, int max, CancellationToken ct)
