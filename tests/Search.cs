@@ -480,6 +480,14 @@ public static class Search
                       .GetAwaiter().GetResult();
         Harness.Eq("裸字符串参数也能搜", loose.Summary, "搜索「Qt 6.8」→ 1 条");
 
+        // 摘要前缀是 Core 与回归共用的契约（前缀表在 ToolHost.SummaryPrefixes）。
+        // 这一条钉的就是 web_search 自己：它加进来时前缀表忘了同步，于是
+        // Live 那边把"搜索执行了几次"数成 0。词库那三个工具由 Vocab.cs 第 7 节覆盖。
+        Harness.True("成功摘要被前缀表认出（Live 靠它数执行次数）",
+                     ToolHost.SummaryPrefixes.Any(p => res.Summary.StartsWith(p, StringComparison.Ordinal)));
+        Harness.Eq("前缀表条数与工具种类数一致",
+                   ToolHost.SummaryPrefixes.Length, Enum.GetValues<ToolKind>().Length);
+
         // 后端报错：摘要里说明失败，正文里带 error（模型据此决定重试还是放弃）
         using var bad = new FakeHandler("{}", HttpStatusCode.Unauthorized);
         var failing = new ToolHost(new VocabService(), new SearchClient(bad));

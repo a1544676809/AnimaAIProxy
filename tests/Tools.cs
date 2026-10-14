@@ -16,8 +16,8 @@ public static class Tools
     {
         Harness.Section("工具声明");
 
-        var all = ToolCatalog.All();
-        Harness.Eq("共三个工具", all.Count, 3);
+        var all = ToolCatalog.VocabTools();
+        Harness.Eq("词库工具共三个（web_search 由配置门控，不在这里）", all.Count, 3);
         Harness.True("名字都带 danbooru_ 前缀，降低与平台自己的工具撞名的概率",
                      all.All(t => t.Name.StartsWith("danbooru_", StringComparison.Ordinal)));
         Harness.True("每个工具都有 object 参数块",

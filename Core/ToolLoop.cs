@@ -58,6 +58,21 @@ public sealed class ToolLoop
     private static int StatusOf(UpstreamResult res) => res.Status > 0 ? res.Status : 502;
 
     /// <summary>
+    /// 轮次摘要的固定措辞，**Core 与回归共用的契约**。
+    ///
+    /// 回归从这一行里数"模型要求调用了几次"。改文案时只改这里，两边就不会走偏——
+    /// 曾经把"客户端"改成"接入方"时忘了同步测试的正则，于是请求数恒为 0、
+    /// 断言报"模型没有要求调用工具"，而真实情况是模型调了 8 次。
+    ///
+    /// <see cref="OursLabel"/> 叫"自有"而不是"词库"：这个计数包含**全部**自有工具
+    /// （三个词库工具 + web_search）。叫词库时，模型只调 web_search 的那一轮会写成
+    /// "词库 1"，读日志的人会以为它查了标签库。
+    /// </summary>
+    public const string RoundSummaryTag = "轮：调用";
+    public const string OursLabel = "自有";
+    public const string TheirsLabel = "接入方";
+
+    /// <summary>
     /// 跑一次带注入的对话。<paramref name="body"/> 是客户端原始请求体，
     /// 本方法**不会修改它**（内部一律 DeepClone）。
     /// </summary>
@@ -120,14 +135,14 @@ public sealed class ToolLoop
             var mine = parsed.ToolCalls.Where(c => plan.IsOurs(c.Name)).ToList();
             var theirs = parsed.ToolCalls.Where(c => !plan.IsOurs(c.Name)).ToList();
 
-            log.Add($"第 {upstreamCalls} 轮：调用 {parsed.ToolCalls.Count} 个" +
-                    $"（词库 {mine.Count} / 接入方 {theirs.Count}）");
+            log.Add($"第 {upstreamCalls} {RoundSummaryTag} {parsed.ToolCalls.Count} 个" +
+                    $"（{OursLabel} {mine.Count} / {TheirsLabel} {theirs.Count}）");
 
             // 一个我们的都没有 → 全是客户端的 → 原样回给客户端，循环结束。
             // 这是最常见的情况：模型在用它自己那套工具干活，我们只是路过。
             if (mine.Count == 0)
             {
-                log.Add("没有词库工具调用，原样交还接入方");
+                log.Add("没有自有工具调用，原样交还接入方");
                 var asIs = res.Body!;
                 Finish(asIs, body, usageResponses, parsed, collected, log);
                 return new Outcome(asIs, log, true, upstreamCalls, 200);
@@ -254,7 +269,7 @@ public sealed class ToolLoop
             // 用**名字**判定而不是这一轮的 plan：收尾路径上的 plan 已经换成空集了，
             // 而这一轮响应的身份必须按它当时下发的名字来认。
             ChatWire.KeepOnlyToolCalls(response, theirs.Select(c => c.Id).ToList());
-            log.Add($"摘除 {mine.Count} 个词库工具调用，保留 {theirs.Count} 个接入方调用");
+            log.Add($"摘除 {mine.Count} 个自有工具调用，保留 {theirs.Count} 个接入方调用");
         }
 
         // 把我们查到的东西写进 content，让它跟着客户端自己的对话历史走。

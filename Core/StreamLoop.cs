@@ -176,14 +176,16 @@ public sealed class StreamLoop
                     return Completed();
                 }
 
-                _log.Add($"第 {_upstreamCalls} 轮：调用 {calls.Count} 个" +
-                         $"（词库 {mine.Count} / 接入方 {theirs.Count}）");
+                // 措辞取自 ToolLoop 的常量（Core 与回归共用的契约），不在这里再抄一份：
+                // 抄一份的下场就是改文案时两边走偏，而回归靠这行数"模型要求了几次"。
+                _log.Add($"第 {_upstreamCalls} {ToolLoop.RoundSummaryTag} {calls.Count} 个" +
+                         $"（{ToolLoop.OursLabel} {mine.Count} / {ToolLoop.TheirsLabel} {theirs.Count}）");
 
                 // ---- 收尾轮：不再执行，也不再把我们的调用交出去 ----
                 if (_wrappingUp)
                 {
                     if (mine.Count > 0)
-                        _log.Add($"收尾轮里模型仍调用了 {mine.Count} 个词库工具，已摘除");
+                        _log.Add($"收尾轮里模型仍调用了 {mine.Count} 个自有工具，已摘除");
 
                     if (theirs.Count > 0)
                     {
@@ -204,7 +206,7 @@ public sealed class StreamLoop
                 // 正文此刻已经流过去了，这里补上工具调用与 finish_reason。
                 if (mine.Count == 0)
                 {
-                    _log.Add("没有词库工具调用，原样交还接入方");
+                    _log.Add("没有自有工具调用，原样交还接入方");
                     await CloseAsync(round.FinishReason.Length > 0 ? round.FinishReason : "tool_calls", calls)
                         .ConfigureAwait(false);
                     return Completed();

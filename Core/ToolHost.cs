@@ -38,6 +38,17 @@ public sealed class ToolHost
     public sealed record ToolResult(string Text, string Summary);
 
     /// <summary>
+    /// 工具执行摘要的前缀，**Core 与回归共用的契约**。
+    ///
+    /// 回归靠它数"我们的工具到底跑了几次"。新增工具时**必须**在这里补一条，
+    /// 否则测试会静默漏数：<c>web_search</c>（第 4 个工具）就是这么漏过一次——
+    /// 判据里只列了前三个，模型只用搜索时会被数成"执行 0 次"，
+    /// 看上去像模型没调工具，实际是判据没跟上。
+    /// </summary>
+    public static readonly string[] SummaryPrefixes =
+        { "查「", "核对「", "切分", "搜索「" };
+
+    /// <summary>
     /// 执行一次调用，返回回灌给模型的文本。
     ///
     /// **这个类是无状态的**（只持 <see cref="VocabService"/> 与 <see cref="SearchClient"/>

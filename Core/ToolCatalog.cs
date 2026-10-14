@@ -181,8 +181,16 @@ public static class ToolCatalog
             ["required"] = new JsonArray { "query" }
         });
 
-    /// <summary>本次要注入的全部工具，顺序固定（便于测试与日志比对）。</summary>
-    public static List<ToolDecl> All() => new() { SearchTool, ResolveTool, ScanTool };
+    /// <summary>
+    /// 三个**词库**工具，顺序固定（便于测试与日志比对）。
+    ///
+    /// **刻意不含 <see cref="WebSearchTool"/>**：它由配置门控
+    /// （<see cref="ProxyConfig.SearchReady"/>），只有 <see cref="Plan"/> 在联网搜索
+    /// 配好时才加上。这个方法以前叫 <c>All()</c>，那时它确实等于"全部工具"；
+    /// 第 4 个工具加进来后就名不副实了——凡是"遍历所有工具"的代码（比如回归里
+    /// 数执行次数的前缀表）都得自己记得补上 web_search，改名就是为了不再误导。
+    /// </summary>
+    public static List<ToolDecl> VocabTools() => new() { SearchTool, ResolveTool, ScanTool };
 
     /// <summary>
     /// 一个工具名是不是代理自有的，**不管它这次实际下发的名字是什么**。

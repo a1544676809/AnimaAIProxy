@@ -228,22 +228,32 @@ public static class Live
 
                 // 日志是判断"工具到底有没有被调"最直接的证据。这里分两个口径数，
                 // 不能混为一谈：
-                //   "第 N 轮：调用 X 个（我们 Y / 客户端 Z）" → Y 是模型**要求**调用的数量
-                //   "核对「…」→ …"                        → 真正**执行**成功的一次
+                //   "第 N 轮：调用 X 个（词库 Y / 接入方 Z）" → Y 是模型**要求**调用的数量
+                //   "核对「…」→ …"                          → 真正**执行**成功的一次
                 // 上限只约束后者：超限的那些会被挡下并回一句"工具调用太多"，
                 // 所以"要求 15 次、执行 12 次"是正常且符合设计的。
+                //
+                // 正则**从 Core 的常量拼出来**，不写死中文：这段文案改过一次
+                // （客户端→接入方），当时忘了同步这里的字面量，于是请求数恒为 0、
+                // 断言报"模型没有要求调用工具"，而模型其实调了 8 次。
                 var lines = ProxyLog.Snapshot().ToList();
                 Harness.Info($"代理本轮日志（共 {lines.Count} 行，取末尾）：");
                 foreach (var l in lines.TakeLast(40)) Harness.Info("  " + l);
 
+                var roundPattern = $@"{ToolLoop.RoundSummaryTag}\s*(\d+)\s*个" +
+                                   $@"（{ToolLoop.OursLabel}\s*(\d+)\s*/\s*{ToolLoop.TheirsLabel}\s*(\d+)）";
                 var requested = 0;
+                var rounds = 0;
                 foreach (var l in lines)
                 {
-                    var m = System.Text.RegularExpressions.Regex.Match(l, @"我们\s*(\d+)\s*/\s*客户端\s*(\d+)");
-                    if (m.Success) requested += int.Parse(m.Groups[1].Value);
+                    var m = System.Text.RegularExpressions.Regex.Match(l, roundPattern);
+                    if (!m.Success) continue;
+                    rounds++;
+                    requested += int.Parse(m.Groups[2].Value);   // 第 2 组 = 词库（我们的）那一侧
                 }
-                // 执行成功的那一行由 ToolHost 用三种前缀之一写出（查「/ 核对「/ 切分），
-                // 对应三个工具；数它们就等于数"我们的工具真的跑了几次"。
+                // 执行成功的那一行由 ToolHost 写出，前缀表是 ToolHost.SummaryPrefixes
+                // （Core 与回归共用的唯一来源，四个工具各一条）；数它们就等于数
+                // "我们的工具真的跑了几次"。
                 //
                 // 剥掉时间戳后 TrimStart 再判前缀。**不要用固定偏移**：调用方的缩进
                 // （ProxyServer 会再补两个空格）和日志自己的分隔空格加起来是可变的，
@@ -257,6 +267,10 @@ public static class Live
                       $"（上限 {cfg.MaxToolCallsPerRequest}）。"
                     : "结论：真实模型这一轮**没有调用**我们的工具（它认为不需要，或没理解工具用途）。");
 
+                // **先证明判据本身认得出格式**：文案或前缀表一改，这里会立刻指名报错，
+                // 而不是让下面那条"模型没要求调用工具"去误导人（那条看上去像模型的
+                // 问题，实际是测试的解析跟不上）。
+                Harness.True($"日志里认出了轮次摘要格式（{rounds} 轮）", rounds > 0);
                 Harness.True("模型确实要求调用我们的工具（真实上游认了这套工具声明）", requested > 0);
                 // **这一条是真正有意义的那个**：光是"要求"还不够，工具真的在本地执行了
                 // 才算链路通了。上面那次误数成 0 的教训就是——只断言 requested>0 时，
@@ -331,13 +345,9 @@ public static class Live
 
                 // 执行次数用固定偏移剥时间戳后判前缀。日志是**全程累计**的，
                 // 所以每一轮都要取"这一轮前后的差值"，而不是直接把累计值当结果。
-                static int CountExecuted(IEnumerable<string> ls) => ls.Count(l =>
-                {
-                    var m = l.Length > 23 ? l[23..].TrimStart() : l.TrimStart();
-                    return m.StartsWith("查「", StringComparison.Ordinal)
-                        || m.StartsWith("核对「", StringComparison.Ordinal)
-                        || m.StartsWith("切分", StringComparison.Ordinal);
-                });
+                // 判据调共用的 IsToolExecution，不在这里再抄一份前缀表。
+                static int CountExecuted(IEnumerable<string> ls) =>
+                    ls.Count(l => IsToolExecution(MsgOf(l)));
 
                 foreach (var effort in new[] { "high", "none" })
                 {
@@ -637,15 +647,13 @@ public static class Live
     /// <summary>
     /// 这一行是不是"我们的工具真的执行了一次"。
     ///
-    /// 三种前缀对应三个工具（由 <c>ToolHost</c> 写出）。**两处口调用同一个函数**：
-    /// 之前第 4 节自己抄了一份判据、还用了 <c>Contains(']')</c> 当锚点，而这些行
-    /// 里根本没有 <c>]</c>，于是时间戳留在开头、一条都数不到，断言报 0 次——
-    /// 而真实情况是工具已经执行过了。判据只留一份才不会再次走偏。
+    /// 前缀表**不在这里**，而是 <see cref="ToolHost.SummaryPrefixes"/> —— 那是 Core 与
+    /// 回归共用的唯一来源。这里曾经自己抄了一份三个前缀的判据，结果第 4 个工具
+    /// <c>web_search</c> 加进来时没人想起同步它，搜索的执行次数被静默数成 0。
+    /// 同一个文件里还抄过第二份（第 2.5 节），两处都改成调这里。
     /// </summary>
     private static bool IsToolExecution(string message) =>
-        message.StartsWith("查「", StringComparison.Ordinal)
-        || message.StartsWith("核对「", StringComparison.Ordinal)
-        || message.StartsWith("切分", StringComparison.Ordinal);
+        ToolHost.SummaryPrefixes.Any(p => message.StartsWith(p, StringComparison.Ordinal));
 
     private sealed record HttpResult(int Status, string Text);
 

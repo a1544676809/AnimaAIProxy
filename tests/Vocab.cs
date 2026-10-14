@@ -222,6 +222,30 @@ public static class Vocab
         var en = Resolve("hatsune miku");
         Harness.True("英文标签仍然照常解析",
                      en.Text.Contains("tag=hatsune miku", StringComparison.Ordinal));
+
+        // ---- 摘要前缀是 Core 与回归共用的契约 ----
+        Harness.Section("7. 工具摘要前缀（回归靠它数「执行了几次」，新增工具必须同步）");
+
+        // 不变量：**一个工具种类一条前缀**。新增 ToolKind 却忘了补前缀，就会让
+        // Live 那边"我们的工具执行了几次"静默漏数——web_search 加进来时正是这么漏的：
+        // 模型明明搜索了，计数却是 0，断言反而去怪"模型没调工具"。
+        Harness.Eq("摘要前缀数与工具种类数一致",
+                   ToolHost.SummaryPrefixes.Length, Enum.GetValues<ToolKind>().Length);
+
+        // 行为级：三个词库工具各跑一次，摘要都要被前缀表认出来。
+        // web_search 由 Search.cs 那一节覆盖（它要桩后端才跑得起来）。
+        var samples = new (ToolKind Kind, string Args)[]
+        {
+            (ToolKind.Search,  "{\"query\":\"lace\"}"),
+            (ToolKind.Resolve, "{\"tag\":\"弓\"}"),
+            (ToolKind.Scan,    "{\"text\":\"1girl, lace\"}"),
+        };
+        foreach (var (kind, callArgs) in samples)
+        {
+            var r = host.ExecuteAsync(toolCfg, kind, callArgs).GetAwaiter().GetResult();
+            Harness.True($"{kind} 的摘要被前缀表认出（{r.Summary}）",
+                         ToolHost.SummaryPrefixes.Any(p => r.Summary.StartsWith(p, StringComparison.Ordinal)));
+        }
     }
 }
 
