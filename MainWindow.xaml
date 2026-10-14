@@ -316,6 +316,68 @@
                     </StackPanel>
                 </Expander>
 
+                <!-- ===== 联网抓取 ===== -->
+                <Expander Header="联网抓取" HorizontalAlignment="Stretch"
+                          HorizontalContentAlignment="Stretch">
+                    <StackPanel Spacing="10" Padding="4,10,4,4">
+                        <ToggleSwitch x:Name="FetchEnabledSwitch"
+                                      Header="给模型 web_fetch 工具"
+                                      OnContent="模型可以自己决定读某个网页"
+                                      OffContent="不下发这个工具"
+                                      Toggled="FetchSetting_Changed" />
+                        <TextBlock x:Name="FetchStatusText" TextWrapping="Wrap" Opacity="0.8" />
+
+                        <ComboBox x:Name="FetchEngineBox" Header="引擎"
+                                  HorizontalAlignment="Stretch"
+                                  SelectionChanged="FetchEngine_Changed">
+                            <ComboBoxItem Content="自动（先 HTTP，读不到正文才起浏览器）" Tag="auto" />
+                            <ComboBoxItem Content="仅 HTTP（轻量，读不了 JS 页面）" Tag="http" />
+                            <ComboBoxItem Content="仅浏览器（每次都渲染，较重）" Tag="browser" />
+                        </ComboBox>
+
+                        <TextBox x:Name="FetchProxyBox" Header="代理（留空 = 直连）"
+                                 PlaceholderText="http://127.0.0.1:10809"
+                                 TextChanged="FetchSetting_TextChanged" />
+
+                        <TextBox x:Name="FetchBrowserPathBox"
+                                 Header="浏览器可执行文件（留空 = 自动查找 Edge / Chrome）"
+                                 TextChanged="FetchSetting_TextChanged" />
+
+                        <Grid ColumnSpacing="10">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <NumberBox Grid.Column="0" x:Name="FetchMaxCharsBox"
+                                       Header="正文上限（字符）" Minimum="500" Maximum="200000"
+                                       SpinButtonPlacementMode="Compact" />
+                            <NumberBox Grid.Column="1" x:Name="FetchTimeoutBox"
+                                       Header="超时（秒）" Minimum="5" Maximum="180"
+                                       SpinButtonPlacementMode="Compact" />
+                            <NumberBox Grid.Column="2" x:Name="FetchIdleBox"
+                                       Header="浏览器空闲关闭（秒）" Minimum="0" Maximum="3600"
+                                       SpinButtonPlacementMode="Compact" />
+                        </Grid>
+
+                        <ToggleSwitch x:Name="FetchPrivateSwitch"
+                                      Header="允许抓本机 / 内网地址"
+                                      OnContent="允许（页面可能诱导模型访问内网）"
+                                      OffContent="拦截（推荐）" />
+
+                        <Grid ColumnSpacing="10">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBox Grid.Column="0" x:Name="FetchTestUrlBox" Header="测试地址"
+                                     PlaceholderText="https://example.com/" />
+                            <Button Grid.Column="1" x:Name="TestFetchButton" Content="测试抓取"
+                                    Click="TestFetch_Click" VerticalAlignment="Bottom" />
+                        </Grid>
+                    </StackPanel>
+                </Expander>
+
                 <!-- ===== 监听 ===== -->
                 <Expander Header="监听" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
                     <StackPanel Spacing="10" Padding="4,10,4,4">

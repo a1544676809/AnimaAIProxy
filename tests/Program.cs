@@ -12,6 +12,7 @@ namespace AnimaAIProxy.Tests;
 ///     proxycheck merge      # 请求体改写：思考字段一律不劫持
 ///     proxycheck providers  # 多模型提供商：请求头解析、按模型名路由、模型表聚合、旧配置迁移
 ///     proxycheck search     # 联网搜索：注入门槛、五个后端的请求形状与解析、回灌截断
+///     proxycheck pageread   # 网页获取：正文提取、编码、内网拦截、双引擎自动降级、代理生效
 ///     proxycheck tokens     # 代理令牌与鉴权
 ///     proxycheck log        # 日志：摘要进界面面板，异常栈只进文件
 ///     proxycheck server     # HTTP 端点：真的起一次 Kestrel，走一遍路由与鉴权
@@ -21,6 +22,7 @@ namespace AnimaAIProxy.Tests;
 /// 另有一条**要联网、要真密钥、会花真 token** 的联调，刻意不进 all：
 ///
 ///     proxycheck live       # 客户端 → 代理 → 真实上游，看真实模型认不认我们的工具
+///     proxycheck livepage   # 真实网页抓取：两个引擎各跑一遍（要联网，不需要密钥）
 /// </summary>
 public static class Program
 {
@@ -42,11 +44,13 @@ public static class Program
             case "merge": Merge.Run(); break;
             case "providers": Providers.Run(); break;
             case "search": Search.Run(); break;
+            case "pageread": PageRead.Run(); break;
             case "tokens": Tokens.Run(); break;
             case "log": LogCheck.Run(); break;
             case "server": Server.Run(); break;
             case "e2e": E2E.Run(args); break;
             case "live": Live.Run(args); break;
+            case "livepage": LivePage.Run(args); break;
             case "all":
                 Vocab.Run(args);
                 Tools.Run();
@@ -55,6 +59,7 @@ public static class Program
                 Merge.Run();
                 Providers.Run();
                 Search.Run();
+                PageRead.Run();
                 Tokens.Run();
                 LogCheck.Run();
                 Server.Run();
@@ -62,7 +67,7 @@ public static class Program
                 break;
             default:
                 Console.WriteLine("未知的检查项：" + which);
-                Console.WriteLine("可用：vocab | tools | loop | stream | merge | providers | search | tokens | log | server | e2e | all | live");
+                Console.WriteLine("可用：vocab | tools | loop | stream | merge | providers | search | pageread | tokens | log | server | e2e | all | live | livepage");
                 return 2;
         }
 

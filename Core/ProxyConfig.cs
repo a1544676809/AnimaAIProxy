@@ -375,6 +375,122 @@ public sealed class ProxyConfig
         return "";
     }
 
+    // ---------------- 联网抓取（web_fetch） ----------------
+
+    /// <summary>
+    /// 是否允许给模型下发 <c>web_fetch</c> 工具。
+    ///
+    /// **默认开**，与 <see cref="SearchEnabled"/> 的默认关**刻意不同**，理由是判据不同：
+    /// 搜索没配后端时那个工具是**必然失败**的（下发它只会让模型白烧一轮预算、
+    /// 还可能改去凭记忆编答案），所以必须等用户配好；而抓取的 HTTP 引擎
+    /// **不需要任何配置就能用**（一个地址、一次 GET），默认关掉反而会让用户
+    /// 以为"这个工具没做出来"。
+    ///
+    /// 代价是它是本代理唯一一条**由模型决定去向的出网通道**。所以另外配了
+    /// <see cref="FetchAllowPrivateHosts"/> 默认拦截内网，见那里的说明。
+    /// </summary>
+    public bool FetchEnabled { get; set; } = true;
+
+    /// <summary>
+    /// 引擎策略：
+    /// * <c>auto</c>（默认）—— 先走轻量 HTTP，读不到正文才自动升级到浏览器，见 <see cref="PageReader"/>；
+    /// * <c>http</c> —— 只用 HTTP，绝不启动浏览器（不想让那 500 MB 出现时选它）；
+    /// * <c>browser</c> —— 只用浏览器，每次都渲染。
+    /// </summary>
+    public string FetchEngine { get; set; } = "auto";
+
+    /// <summary>
+    /// 抓取用的代理，空 = **直连**（连系统代理都不走，行为可预测）。
+    ///
+    /// 这一项不是可选项 —— 实测本机**直连读不到 danbooru 与 wikipedia**
+    /// （连接被拒 / 超时），填上本地代理（如 <c>http://127.0.0.1:10809</c>）才通。
+    ///
+    /// 两个引擎共用同一个值，但实现方式不同：HTTP 引擎走 <see cref="System.Net.WebProxy"/>，
+    /// 浏览器引擎走 <c>--proxy-server</c>。**这个差异是有用的**：实测同一条代理，
+    /// .NET 的 HTTP 客户端对某些站点 SSL 握手失败，而 Edge 能读通 —— 于是自动降级
+    /// 恰好能把这类站点救回来。
+    /// </summary>
+    public string FetchProxy { get; set; } = "";
+
+    /// <summary>
+    /// 回灌正文的字符上限。默认 20000：够放下一篇长文档，又不至于把用户真正问的东西
+    /// 挤出上下文（与 <see cref="SearchMaxResults"/> 是同一条理由）。
+    /// </summary>
+    public int FetchMaxChars { get; set; } = PageReader.DefaultMaxChars;
+
+    /// <summary>单页抓取超时（秒）。浏览器渲染比 HTTP 慢得多，但也不该等几分钟。</summary>
+    public int FetchTimeoutSeconds { get; set; } = 30;
+
+    /// <summary>
+    /// 浏览器可执行文件路径。留空 = 自动查找（Edge 的常见安装位置 → Chrome → PATH）。
+    /// 用到的启动参数都是 Chromium 通用的，所以指向 Chrome 或便携版 Chromium 也能用。
+    /// </summary>
+    public string FetchBrowserPath { get; set; } = "";
+
+    /// <summary>
+    /// 浏览器引擎空闲多久后自动关闭（秒），把那份 420–530 MB 内存还回去。
+    /// 0 = 每次抓完立刻关（最省内存，但每次都要重新付约 0.7 秒的启动开销）。
+    /// </summary>
+    public int FetchBrowserIdleSeconds { get; set; } = 300;
+
+    /// <summary>
+    /// 是否允许抓本机/内网地址。**默认关，这是 fail-closed 的**。
+    ///
+    /// 理由：这个工具的 URL 是**模型给的**，而模型刚刚可能读过一段不可信网页 ——
+    /// 一个被注入的页面完全可以指示模型去抓 <c>http://127.0.0.1:48620/…</c>
+    /// 或内网里的其它服务。与 <see cref="RequireToken"/> 默认拒绝一切是同一套思路。
+    ///
+    /// **已知边界**（不假装它不存在）：域名只能按字面判断，所以解析到内网 IP 的
+    /// 公网域名拦不住 —— 那需要先解析再连接，而 HttpClient 不提供那个钩子。
+    /// 真要抓内网页面（自建 wiki 之类）时打开这个开关。
+    /// </summary>
+    public bool FetchAllowPrivateHosts { get; set; }
+
+    /// <summary>可选引擎，顺序即界面下拉框的顺序。</summary>
+    public static readonly string[] FetchEngines = { "auto", "http", "browser" };
+
+    public static string NormalizeEngine(string? value) => value?.Trim().ToLowerInvariant() switch
+    {
+        "http" => "http",
+        "browser" => "browser",
+        _ => "auto"
+    };
+
+    [JsonIgnore]
+    public string FetchEngineKey => NormalizeEngine(FetchEngine);
+
+    /// <summary>
+    /// 运行时事实：本机有没有可用的浏览器引擎。**不是配置项**（所以不落盘），
+    /// 由 <c>ProxyServer</c> 在构造 <see cref="PageReader"/> 之后填写。
+    ///
+    /// 默认 **false** 是 fail-closed 的方向：engine=browser 而没人告诉我们浏览器在哪时，
+    /// 宁可不下发这个工具，也不要下发一个每次必然失败的。
+    /// </summary>
+    [JsonIgnore]
+    public bool FetchBrowserUsable { get; set; }
+
+    /// <summary>
+    /// <c>web_fetch</c> 要不要下发的**唯一判据**。
+    /// 与 <see cref="SearchReady"/> 一样，只判"配置与前提齐不齐"，不判网络可达性 ——
+    /// 可达与否是每次抓取的事，那种失败应该由工具如实告诉模型，而不是让它连工具都看不到。
+    /// </summary>
+    [JsonIgnore]
+    public bool FetchReady =>
+        FetchEnabled && (FetchEngineKey != "browser" || FetchBrowserUsable);
+
+    /// <summary>界面上那行状态说明。空串 = 没问题。</summary>
+    [JsonIgnore]
+    public string FetchProblem => FetchProblemFor(FetchEnabled, FetchEngineKey, FetchBrowserUsable);
+
+    /// <summary>判据的唯一实现，界面在用户**还没点保存**时也用它（与 <see cref="ProblemFor"/> 同理）。</summary>
+    public static string FetchProblemFor(bool enabled, string engineKey, bool browserUsable)
+    {
+        if (!enabled) return "";
+        if (engineKey == "browser" && !browserUsable)
+            return "本机没找到 Edge/Chrome，浏览器引擎用不了；改成「自动」或「仅 HTTP」，或指定浏览器路径";
+        return "";
+    }
+
     // ---------------- 鉴权 ----------------
 
     /// <summary>
@@ -496,6 +612,16 @@ public sealed class ProxyConfig
         SearchSniHost = (SearchSniHost ?? "").Trim();
         if (SearchMaxResults is < 1 or > 10) SearchMaxResults = 5;
         if (SearchTimeoutSeconds is < 5 or > 120) SearchTimeoutSeconds = 30;
+
+        // 抓取：引擎名收敛到白名单，数值拉到合法区间。
+        // 引擎填了认不出的值（手写 "edge"）时归到 auto，而不是留一个空串 ——
+        // auto 是"能用就用"的安全默认，而且界面下拉框有它，用户看得见结果。
+        FetchEngine = NormalizeEngine(FetchEngine);
+        FetchProxy = (FetchProxy ?? "").Trim();
+        FetchBrowserPath = (FetchBrowserPath ?? "").Trim();
+        if (FetchMaxChars is < 500 or > 200_000) FetchMaxChars = PageReader.DefaultMaxChars;
+        if (FetchTimeoutSeconds is < 5 or > 180) FetchTimeoutSeconds = 30;
+        if (FetchBrowserIdleSeconds is < 0 or > 3600) FetchBrowserIdleSeconds = 300;
 
         Providers ??= new List<ProviderProfile>();
         MigrateLegacyUpstream();

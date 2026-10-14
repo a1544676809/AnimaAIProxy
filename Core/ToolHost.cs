@@ -20,11 +20,13 @@ public sealed class ToolHost
 {
     private readonly VocabService _vocab;
     private readonly SearchClient _search;
+    private readonly PageReader _reader;
 
-    public ToolHost(VocabService vocab, SearchClient? search = null)
+    public ToolHost(VocabService vocab, SearchClient? search = null, PageReader? reader = null)
     {
         _vocab = vocab;
         _search = search ?? new SearchClient();
+        _reader = reader ?? new PageReader();
     }
 
     /// <summary>
@@ -44,9 +46,11 @@ public sealed class ToolHost
     /// 否则测试会静默漏数：<c>web_search</c>（第 4 个工具）就是这么漏过一次——
     /// 判据里只列了前三个，模型只用搜索时会被数成"执行 0 次"，
     /// 看上去像模型没调工具，实际是判据没跟上。
+    ///
+    /// 回归里有一条不变量钉住它：**条数必须等于 <see cref="ToolKind"/> 的取值个数**。
     /// </summary>
     public static readonly string[] SummaryPrefixes =
-        { "查「", "核对「", "切分", "搜索「" };
+        { "查「", "核对「", "切分", "搜索「", "抓「" };
 
     /// <summary>
     /// 执行一次调用，返回回灌给模型的文本。
@@ -68,6 +72,7 @@ public sealed class ToolHost
                 case ToolKind.Resolve: return Resolve(cfg, arguments);
                 case ToolKind.Scan: return Scan(cfg, arguments);
                 case ToolKind.WebSearch: return await WebSearchAsync(cfg, arguments, ct).ConfigureAwait(false);
+                case ToolKind.WebFetch: return await WebFetchAsync(cfg, arguments, ct).ConfigureAwait(false);
                 default: return new ToolResult("Unknown tool.", "未知工具。");
             }
         }
@@ -366,6 +371,61 @@ public sealed class ToolHost
             : $"搜索「{query}」→ 失败：{r.Error}");
     }
 
+    // ---------------- web_fetch ----------------
+
+    /// <summary>
+    /// 抓一个网页。与 <see cref="WebSearchAsync"/> 同一条原则：
+    /// **失败如实说**（<see cref="PageReader.ToToolContent"/> 里那套信封），
+    /// 绝不回一个空正文 —— 后者会让模型以为"这页没什么内容"，
+    /// 而真实情况是"我们没读到"，接着它就会凭记忆补一段出来。
+    /// </summary>
+    private async Task<ToolResult> WebFetchAsync(ProxyConfig cfg, string arguments, CancellationToken ct)
+    {
+        var url = ReadString(arguments, "url");
+        if (url.Length == 0)
+        {
+            return new ToolResult(
+                "The url was empty. Call this tool again with the full url of one page, " +
+                "for example \"https://learn.microsoft.com/dotnet/core/whats-new\".",
+                "抓（空网址）");
+        }
+
+        if (!cfg.FetchReady)
+        {
+            // 正常情况下走不到这里：没配好时这个工具根本不会被下发。
+            // 但模型可能凭上文记忆去调一个这次没下发的工具名，所以如实回一句。
+            return new ToolResult(
+                "Web page fetching is not available on this proxy right now, so this could not " +
+                "be performed. Do not pretend that you read the page, and do not invent its " +
+                "content. Tell the user that page fetching is unavailable.",
+                "抓 → 未启用");
+        }
+
+        var render = ReadBool(arguments, "render");
+        var r = await _reader.FetchAsync(cfg, url, render, null, ct).ConfigureAwait(false);
+        var text = PageReader.ToToolContent(r, url);
+
+        var label = ShortLabel(r.Url.Length > 0 ? r.Url : url);
+        var summary = r.Ok
+            ? $"抓「{label}」→ {r.Text.Length} 字符（{r.Engine}）"
+            : $"抓「{label}」→ 失败：{Cut(r.Error, 60)}";
+        return new ToolResult(text, summary);
+    }
+
+    /// <summary>日志里的短标签：主机 + 截短的路径。完整 URL 常常长到把日志撑爆。</summary>
+    private static string ShortLabel(string url)
+    {
+        try
+        {
+            if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)) return Cut(url, 50);
+            var path = uri.AbsolutePath == "/" ? "" : uri.AbsolutePath;
+            return Cut(uri.Host + path, 60);
+        }
+        catch { return Cut(url, 50); }
+    }
+
+    private static string Cut(string s, int n) => s.Length <= n ? s : s[..n] + "…";
+
     // ---------------- 参数读取 ----------------
 
     /// <summary>
@@ -393,6 +453,17 @@ public sealed class ToolHost
         catch { /* query 已经尽力取过了 */ }
 
         return (query, limit);
+    }
+
+    /// <summary>
+    /// 取一个布尔字段。模型给 <c>true</c>、<c>"true"</c>、<c>1</c>、<c>"yes"</c> 都认 ——
+    /// 把布尔写成字符串是常态，与 <see cref="ReadString"/> 的宽容度保持一致。
+    /// 认不出时返回 false（<c>render</c> 的默认就是"不强制渲染"）。
+    /// </summary>
+    internal static bool ReadBool(string arguments, string field)
+    {
+        var raw = ReadString(arguments, field).ToLowerInvariant();
+        return raw is "true" or "1" or "yes" or "y" or "on" or "是";
     }
 
     /// <summary>

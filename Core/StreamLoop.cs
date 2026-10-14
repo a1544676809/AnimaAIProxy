@@ -119,7 +119,7 @@ public sealed class StreamLoop
             _token = clientToken;
             _ct = ct;
             _clientModel = ChatWire.GetString(body, "model");
-            _plan = ToolCatalog.Plan(ChatWire.ClientToolNames(body), _cfg.SearchReady);
+            _plan = ToolCatalog.Plan(ChatWire.ClientToolNames(body), _cfg.SearchReady, _cfg.FetchReady);
 
             // 影子历史：从客户端发来的 messages 开始，后面每一轮追加我们执行过的
             // 工具调用与结果。它只用于我们和上游之间的后续轮次，绝不会整体回给

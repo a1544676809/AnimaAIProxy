@@ -46,6 +46,13 @@ public sealed class ProxyServer : IAsyncDisposable
     /// </summary>
     private readonly SearchClient _search = new();
 
+    /// <summary>
+    /// 网页获取器。同样在服务端持有一个：它内部有 HttpClient，而且**持有浏览器引擎** ——
+    /// 每次请求新建一个的话，那个 headless Edge（16–18 个进程、420–530 MB）
+    /// 会被反复启动又丢弃，"跨请求复用 + 空闲自动关"这套设计就全废了。
+    /// </summary>
+    private readonly PageReader _reader;
+
     private WebApplication? _app;
     private DateTimeOffset _startedAt;
 
@@ -55,6 +62,13 @@ public sealed class ProxyServer : IAsyncDisposable
         _tokens = tokens;
         _vocab = vocab;
         _upstream = new UpstreamClient(cfg);
+        _reader = new PageReader();
+
+        // 把"本机有没有浏览器"这个**机器事实**交给配置对象，因为 web_fetch 要不要下发
+        // 由 ProxyConfig.FetchReady 决定，而配置对象是 ToolLoop / StreamLoop 唯一拿得到的东西。
+        // 不这么做的话，engine=browser 而下发判据不知道浏览器在哪，
+        // 结果是下发一个每次必然失败的工具。
+        _cfg.FetchBrowserUsable = _reader.BrowserAvailable;
     }
 
     public bool IsRunning => _app is not null;
@@ -152,6 +166,7 @@ public sealed class ProxyServer : IAsyncDisposable
         await StopAsync().ConfigureAwait(false);
         _upstream.Dispose();
         _search.Dispose();
+        _reader.Dispose();
     }
 
     // ---------------- 鉴权 ----------------
@@ -272,7 +287,12 @@ public sealed class ProxyServer : IAsyncDisposable
             ["uptimeSeconds"] = (int)(DateTimeOffset.Now - _startedAt).TotalSeconds,
             ["tools"] = _cfg.ToolsEnabled,
             ["vocabReady"] = _vocab.IsLoaded,
-            ["webSearch"] = _cfg.SearchReady
+            ["webSearch"] = _cfg.SearchReady,
+            // 抓取的两个字段分开报：fetchReady 是"工具会不会下发"，
+            // browser 是"自动降级有没有后手"。两者不同：browser 缺失时
+            // auto 模式照样下发工具（HTTP 引擎能用），只是读不了前端渲染的页面。
+            ["webFetch"] = _cfg.FetchReady,
+            ["webFetchBrowser"] = _reader.BrowserAvailable
         };
         return ctx.Response.WriteAsync(ChatWire.ToJson(payload), ctx.RequestAborted);
     }
@@ -356,7 +376,7 @@ public sealed class ProxyServer : IAsyncDisposable
     {
         // ToolLoop / ToolHost 都是**一次请求一个实例**：ToolLoop 里持有
         // 本请求的轮数与工具调用计数，复用会把"每次请求"变成"全局"。
-        var loop = new ToolLoop(_upstream, new ToolHost(_vocab, _search), _cfg);
+        var loop = new ToolLoop(_upstream, new ToolHost(_vocab, _search, _reader), _cfg);
 
         ToolLoop.Outcome outcome;
         try
@@ -440,7 +460,7 @@ public sealed class ProxyServer : IAsyncDisposable
     private async Task RunStreamLoop(HttpContext ctx, JsonObject body, string token)
     {
         // 与非流式同样的理由：一次请求一个实例，计数才不会跨请求累加。
-        var loop = new StreamLoop(_upstream, new ToolHost(_vocab, _search), _cfg);
+        var loop = new StreamLoop(_upstream, new ToolHost(_vocab, _search, _reader), _cfg);
         var sink = new SseSink(ctx);
 
         // **在日志里标明这是流式路径。** 两条路产生的轮次/执行日志措辞一模一样，

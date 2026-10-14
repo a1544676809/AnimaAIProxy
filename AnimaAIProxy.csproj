@@ -119,6 +119,15 @@
     -->
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
     <!--
+      web_fetch 的正文提取要用它。选它的理由只有一条：**本地 NuGet 缓存里已有
+      1.11.71**（离线可建），而 AngleSharp / SmartReader / ReverseMarkdown 都不在。
+      SmartReader（Mozilla Readability 的 .NET 移植）提取质量确实更好，但为了它
+      新增一个必须联网下载的依赖不划算 —— 本项目一直保持"缓存里有什么用什么"。
+      容错性也够：HtmlAgilityPack 对畸形 HTML 的容忍度是它最强的部分，
+      而我们要抓的正是各种不规范的真实网页。
+    -->
+    <PackageReference Include="HtmlAgilityPack" Version="1.11.71" />
+    <!--
       托盘图标。版本 2.4.1 的 lib 是 net10.0-windows10.0.17763 —— 正是本 TFM
       所在的那条线。**这条约束是双向的**：以前本 TFM 是 net8.0 时，2.4.1 会
       NU1202（不兼容），只能停在 2.3.0；迁到 net10.0 后反过来，2.3.0 那条

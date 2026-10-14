@@ -786,6 +786,107 @@ public static class E2E
                     search.StopAsync().GetAwaiter().GetResult();
                 }
             }
+
+            // ===== 6. web_fetch：注入 → 真的抓页面 → 正文回灌 → 不外泄 =====
+            {
+                var page = new StubPage();
+                page.StartAsync().GetAwaiter().GetResult();
+                var oldEnabled = cfg.FetchEnabled;
+                var oldEngine = cfg.FetchEngine;
+                var oldAllowPrivate = cfg.FetchAllowPrivateHosts;
+                try
+                {
+                    // 6a. **默认就下发**，与 web_search 刻意不同：
+                    // 抓取的 HTTP 引擎不需要任何配置就能用，默认关掉会让人以为这个工具没做出来。
+                    cfg.FetchEnabled = true;
+                    cfg.FetchEngine = "http";
+                    stub.Enqueue(Answer("不抓。", 1, 1));
+                    stub.Received.Clear();
+                    Post(http, url, ChatWire.ToJson(ClientBody()), token);
+                    Harness.True("默认就下发 web_fetch（HTTP 引擎无需配置）",
+                                 SentToolNames(stub.Received[0]).Contains(ToolCatalog.WebFetchName));
+
+                    // 6b. 关掉开关 → 不下发
+                    cfg.FetchEnabled = false;
+                    stub.Enqueue(Answer("还是不抓。", 1, 1));
+                    stub.Received.Clear();
+                    Post(http, url, ChatWire.ToJson(ClientBody()), token);
+                    Harness.True("关掉开关后不下发 web_fetch",
+                                 !SentToolNames(stub.Received[0]).Contains(ToolCatalog.WebFetchName));
+
+                    // 6c. 内网地址默认被拦（桩页面就在 127.0.0.1 上）。
+                    // 这条在端到端里验一遍是必要的：拦截发生在 PageReader 里，
+                    // 而不是工具层，所以只有真走一遍才证明它确实生效。
+                    cfg.FetchEnabled = true;
+                    cfg.FetchAllowPrivateHosts = false;
+                    stub.Enqueue(ToolCall("call_fetch0", ToolCatalog.WebFetchName,
+                                          "{\"url\":\"" + page.BaseUrl + "/blocked\"}", 5, 2));
+                    stub.Enqueue(Answer("被拦了。", 6, 3));
+                    stub.Received.Clear();
+                    lock (page.Requests) page.Requests.Clear();
+                    Post(http, url, ChatWire.ToJson(ClientBody()), token);
+
+                    Harness.True("内网地址默认被拦", ToolText(stub, 1).Contains("内网", StringComparison.Ordinal));
+                    lock (page.Requests) Harness.Eq("被拦时一个请求都没发出去", page.Requests.Count, 0);
+
+                    // 6d. 打开开关 → 真的抓、正文回灌、客户端看不到我们的调用
+                    cfg.FetchAllowPrivateHosts = true;
+                    stub.Enqueue(ToolCall("call_fetch", ToolCatalog.WebFetchName,
+                                          "{\"url\":\"" + page.BaseUrl + "/doc\"}", 12, 4));
+                    stub.Enqueue(Answer("桩页面说的是这件事。", 20, 8));
+                    stub.Received.Clear();
+                    lock (page.Requests) page.Requests.Clear();
+
+                    var rf = Post(http, url, ChatWire.ToJson(ClientBody()), token);
+                    Harness.Eq("web_fetch 链路走通，200", rf.Status, 200);
+
+                    var sysF = ChatWire.GetString(
+                        ((JsonArray)stub.Received[0]["messages"]!)[0] as JsonObject, "content");
+                    Harness.True("系统提示里也介绍了 web_fetch",
+                                 sysF.Contains(ToolCatalog.WebFetchName, StringComparison.Ordinal) &&
+                                 sysF.Contains("You are a helpful agent.", StringComparison.Ordinal));
+
+                    lock (page.Requests)
+                    {
+                        Harness.Eq("代理真的去抓了那个页面", page.Requests.Count, 1);
+                        Harness.True("抓的是请求里给的那个路径",
+                                     page.Requests[0].Contains("/doc", StringComparison.Ordinal));
+                    }
+
+                    var fetched = ToolText(stub, 1);
+                    Harness.True("回灌里有页面标题", fetched.Contains("桩页面标题", StringComparison.Ordinal));
+                    Harness.True("回灌里有正文", fetched.Contains("桩页面里的正文", StringComparison.Ordinal));
+                    Harness.True("回灌里标了这次用的是哪个引擎",
+                                 fetched.Contains("engine: http", StringComparison.Ordinal));
+
+                    var parsedF = ChatWire.Parse(ChatWire.TryParseObject(rf.Text)!)!;
+                    Harness.Eq("客户端拿到的是最终回答", parsedF.Content, "桩页面说的是这件事。");
+                    Harness.Eq("客户端看不到 web_fetch 的 tool_call", parsedF.ToolCalls.Count, 0);
+                    Harness.True("交还给客户端的报文里连 web_fetch 这个名字都搜不到",
+                                 !rf.Text.Contains(ToolCatalog.WebFetchName, StringComparison.Ordinal));
+
+                    // 6e. 抓取失败：必须如实报错，并且明说"这不代表页面不存在"
+                    stub.Enqueue(ToolCall("call_fetch2", ToolCatalog.WebFetchName,
+                                          "{\"url\":\"http://127.0.0.1:9/nope\"}", 5, 2));
+                    stub.Enqueue(Answer("抓不到。", 6, 3));
+                    stub.Received.Clear();
+                    Post(http, url, ChatWire.ToJson(ClientBody()), token);
+
+                    var failed = ToolText(stub, 1);
+                    Harness.True("抓取失败时如实报错", failed.Contains("fetch failed", StringComparison.Ordinal));
+                    Harness.True("并说明这不代表页面不存在",
+                                 failed.Contains("does NOT mean", StringComparison.Ordinal));
+                    Harness.True("并禁止编造页面内容",
+                                 failed.Contains("Do not invent", StringComparison.Ordinal));
+                }
+                finally
+                {
+                    cfg.FetchEnabled = oldEnabled;
+                    cfg.FetchEngine = oldEngine;
+                    cfg.FetchAllowPrivateHosts = oldAllowPrivate;
+                    page.StopAsync().GetAwaiter().GetResult();
+                }
+            }
         }
         finally
         {
@@ -795,6 +896,68 @@ public static class E2E
             ProxyConfig.FilePathOverride = oldCfgPath;
             try { Directory.Delete(tmpDir, recursive: true); } catch { }
         }
+    }
+
+    /// <summary>
+    /// 桩网页服务器：<c>web_fetch</c> 真的去抓的那一页。
+    /// 它同时记录收到的请求 —— "代理到底有没有发出这次抓取"只有真收到才算数，
+    /// 断言工具结果里有没有正文是不够的（那段正文也可能是别处来的）。
+    /// </summary>
+    private sealed class StubPage
+    {
+        private WebApplication? _app;
+        public int Port { get; private set; }
+        public string BaseUrl => $"http://127.0.0.1:{Port}";
+
+        /// <summary>收到的请求（方法 + 路径），按顺序。</summary>
+        public List<string> Requests { get; } = new();
+
+        public async Task StartAsync()
+        {
+            Port = FreePort();
+            var b = WebApplication.CreateSlimBuilder(new WebApplicationOptions
+            {
+                ContentRootPath = AppContext.BaseDirectory,
+                EnvironmentName = Environments.Production
+            });
+            b.Logging.ClearProviders();
+            b.Logging.SetMinimumLevel(LogLevel.None);
+            b.WebHost.ConfigureKestrel(o => o.Listen(IPAddress.Loopback, Port));
+
+            var app = b.Build();
+            app.Run(async ctx =>
+            {
+                lock (Requests) Requests.Add(ctx.Request.Method + " " + ctx.Request.Path);
+                ctx.Response.ContentType = "text/html; charset=utf-8";
+                await ctx.Response.WriteAsync(
+                    "<html><head><title>桩页面</title>" +
+                    "<meta name=\"description\" content=\"端到端用的桩页面\"></head><body>" +
+                    "<nav><a href=\"/x\">导航</a><a href=\"/y\">另一条导航</a></nav>" +
+                    "<article><h1>桩页面标题</h1>" +
+                    "<p>这是桩页面里的正文，用来验证 web_fetch 真的抓到了它，并且把正文交回了模型。</p>" +
+                    "</article></body></html>");
+            });
+
+            _app = app;
+            await app.StartAsync();
+        }
+
+        public async Task StopAsync()
+        {
+            if (_app is null) return;
+            await _app.StopAsync();
+            await _app.DisposeAsync();
+            _app = null;
+        }
+    }
+
+    /// <summary>取某一次发往上游的请求里第一条 tool 消息的内容。</summary>
+    private static string ToolText(StubUpstream stub, int requestIndex)
+    {
+        if (stub.Received.Count <= requestIndex) return "";
+        var msgs = ((JsonArray)stub.Received[requestIndex]["messages"]!).Where(m =>
+            ChatWire.GetString(m as JsonObject, "role") == "tool").ToList();
+        return msgs.Count > 0 ? ChatWire.GetString(msgs[0] as JsonObject, "content") : "";
     }
 
     private sealed record HttpResult(int Status, string Text);

@@ -3,7 +3,7 @@ AnimaAIProxy 回归：all
 === 1. 词库内核（vendored：VocabDb / TagSearch / TagSections） ===
        词库：vocab.sqlite（113.0 MB）
        seed：E:\ComfyUI\anima-vocab\seed.json
-       载入耗时 1287 ms
+       载入耗时 1404 ms
   ok   标签数 > 30 万                                           True
   ok   Anima 索引非空
 
@@ -62,8 +62,14 @@ AnimaAIProxy 回归：all
   ok   没有退而求其次挑一个冷门同名变体（不许变成 hatsune miku (cosplay)）
   ok   英文标签仍然照常解析
 
+=== 7. 工具摘要前缀（回归靠它数「执行了几次」，新增工具必须同步） ===
+  ok   摘要前缀数与工具种类数一致                                        5
+  ok   Search 的摘要被前缀表认出（查「lace」→ 25 条）
+  ok   Resolve 的摘要被前缀表认出（核对「弓」→ bow (weapon)（Anima 常用））
+  ok   Scan 的摘要被前缀表认出（切分 → 无命中）
+
 === 工具声明 ===
-  ok   共三个工具                                                3
+  ok   词库工具共三个（web_search 由配置门控，不在这里）                       3
   ok   名字都带 danbooru_ 前缀，降低与平台自己的工具撞名的概率
   ok   每个工具都有 object 参数块
   ok   每个工具都写了说明（平台不会替我们介绍它）
@@ -123,7 +129,10 @@ AnimaAIProxy 回归：all
   ok   混合场景下把已查到的结果写回 content（客户端会带着历史再回来）
   ok   客户端原名的工具还在
   ok   我们让路改用了带后缀的名字
-  ok   工具总数 = 客户端 2 + 我们 3                                  5
+  ok   web_fetch 默认下发
+  ok   工具总数 = 客户端 2 + 我们 4                                  6
+  ok   关掉抓取后只剩我们的 3 个词库工具                                   4
+  ok   关掉后确实没有 web_fetch
   ok   reasoning_effort 原样透传                                "high"
   ok   enable_thinking 原样透传                                 True
   ok   temperature 原样透传                                     0.42
@@ -307,11 +316,11 @@ AnimaAIProxy 回归：all
   ok   LoadReal 读真配置之后，重定向仍然生效（没有被「读完恢复」拆掉）
 
 === 配置路径可被测试重定向（回归不许写掉用户的真配置） ===
-  ok   重定向后 ConfigPath 指向临时文件                               "C:\Users\14947\AppData\Local\Temp\aip-cfg-90e404be.json"
+  ok   重定向后 ConfigPath 指向临时文件                               "C:\Users\14947\AppData\Local\Temp\aip-cfg-1e3db2ce.json"
   ok   重定向后不再指向真配置
   ok   Save 写的是临时文件
   ok   读回来的就是刚写的那份                                          45999
-  ok   还原后回到进程级防线设的路径（而不是真配置）                               "C:\Users\14947\AppData\Local\Temp\aip-check-6b3125ed\proxy.config.json"
+  ok   还原后回到进程级防线设的路径（而不是真配置）                               "C:\Users\14947\AppData\Local\Temp\aip-check-9df033e3\proxy.config.json"
   ok   还原后依然不指向真配置
 
 === 自定义请求头：解析 ===
@@ -342,30 +351,30 @@ AnimaAIProxy 回归：all
   ok   兜底之后实体头确实生效了                                         "text/plain"
 
 === 按模型名路由到站点 ===
-  ok   模型表命中站点A                                             "01855c7101bf"
-  ok   模型名大小写不敏感                                            "07b9972c5472"
+  ok   模型表命中站点A                                             "03b10799956c"
+  ok   模型名大小写不敏感                                            "42434324e302"
   ok   命中的是模型表里的那个名字（发往上游的就是它）                              "a1"
   ok   客户端报的名字原样记着（响应里回写用它）                                 "a1"
   ok   命中的判定值得进日志
-  ok   不在模型表里 → 默认站点                                        "01855c7101bf"
+  ok   不在模型表里 → 默认站点                                        "03b10799956c"
   ok   不在模型表里 → 模型名原样透传（上游自己会回准确的错）                         "local-llama"
   ok   这种判定不写日志（否则每个请求都刷一行）                                 False
-  ok   关掉的模型不再路由到它的站点                                       "07b9972c5472"
+  ok   关掉的模型不再路由到它的站点                                       "42434324e302"
   ok   模型名仍然原样发出（不猜、不改）                                     "a2"
   ok   这是回落，不值得每个请求都写一行日志                                   False
-  ok   停用的站点不再接受路由                                          "01855c7101bf"
+  ok   停用的站点不再接受路由                                          "03b10799956c"
   ok   模型名仍然原样发出                                            "b1"
 
 === 模型名映射优先于模型表 ===
   ok   映射先换名字                                               "b1"
-  ok   再按换过的名字路由到站点B                                        "07b9972c5472"
+  ok   再按换过的名字路由到站点B                                        "42434324e302"
   ok   映射的判定进日志（用户配了它就想看到生效）
   ok   日志里说清了换成了什么
 
 === 默认站点的选取与失效 ===
-  ok   指针指到谁就是谁                                             "07b9972c5472"
-  ok   指针失效 → 回落到第一个启用的站点（而不是让请求全废）                         "01855c7101bf"
-  ok   指针指向一个已停用的站点 → 回落到启用的那个                              "01855c7101bf"
+  ok   指针指到谁就是谁                                             "42434324e302"
+  ok   指针失效 → 回落到第一个启用的站点（而不是让请求全废）                         "03b10799956c"
+  ok   指针指向一个已停用的站点 → 回落到启用的那个                              "03b10799956c"
   ok   全部停用 → 没有可用站点（如实报错，而不是偷偷发给一个停用的站点）                   null
   ok   此时路由也拿不到站点                                           null
   ok   一个站点都没有时给 null（调用方据此报「没有可用的模型提供商」）                   null
@@ -408,6 +417,9 @@ AnimaAIProxy 回归：all
   ok   地址去空白                                                "http://y/v1"
   ok   名字去空白                                                "名字"
   ok   同名模型只留一条（两条会让开关看起来失灵）                                1
+  ok   空白的「从未拉过」收敛为 null                                    null
+  ok   已有时间戳的原样保留（别把真值也当成空白清掉）                              "2026-10-13 22:10:02"
+  ok   全新配置里「没拉过」写成字段缺失，而不是空串
   ok   显示名回落：没起名时用主机名                                       "api.deepseek.com"
   ok   没有 scheme 也解析得出主机名（用户常常先敲半截）                         "api.deepseek.com"
   ok   去掉端口                                                 "127.0.0.1"
@@ -417,8 +429,8 @@ AnimaAIProxy 回归：all
   ok   迁移出一个站点                                              1
   ok   地址原样搬过去                                              "https://api.deepseek.com/v1"
   ok   名字从主机名派生（旧配置没有名字）                                    "api.deepseek.com"
-  ok   密文**原样**搬走（不解密再加密，少一次经手）                             "AQAAANCMnd8BFdERjHoAwE/Cl+sBAAAAOGt2ynk9wEmzfYBGqIqeCgAAAAACAAAAAAAQZgAAAAEAACAAAACSd3Ghup…"
-  ok   默认站点指向它                                              "bbb6cf1cd592"
+  ok   密文**原样**搬走（不解密再加密，少一次经手）                             "AQAAANCMnd8BFdERjHoAwE/Cl+sBAAAAOGt2ynk9wEmzfYBGqIqeCgAAAAACAAAAAAAQZgAAAAEAACAAAAAAm6XHYc…"
+  ok   默认站点指向它                                              "86a4b39f9dad"
   ok   旧字段被置空（不留两份真值来源）
   ok   旧密钥字段也置空
   ok   迁移后密钥能正常读出来（缓存没挡住）                                   "sk-old-key-123456"
@@ -435,6 +447,244 @@ AnimaAIProxy 回归：all
 
 === 配置里的站点 Id 重复 ===
   ok   重复 Id 被改掉（否则「按 Id 找站点」会随机命中）
+
+=== 联网搜索 1. 工具注入门槛（没配好后端就不给模型这个工具） ===
+  ok   默认（不带 web_search）是三个工具                               3
+  ok   默认不下发 web_search
+  ok   打开后是四个工具                                             4
+  ok   web_search 排在最后（慢工具，词库那三个更常用）                        "web_search"
+  ok   它的语义被正确登记                                            WebSearch
+  ok   重名时我们改名                                              "web_search_aip"
+  ok   接入方那个名字仍然不属于我们
+  ok   让路后的名字仍被认成我们的
+  ok   让路后的语义仍然正确                                           WebSearch
+  ok   按名字判身份也认让路后的名字（收尾那一轮 plan 是空的，只能靠名字）
+  ok   web_search 本身按名字就是我们的
+  ok   说明里写明了「搜到的东西是不可信数据」
+  ok   说明里写明了短查询而不是整句
+  ok   说明里写明了摘要不是全文
+
+=== 联网搜索 2. 「配好了没有」的判据（界面与注入共用同一份） ===
+  ok   关掉时不就绪
+  ok   关掉时界面不报问题（用户主动关的，不是没配好）                              ""
+  ok   没选后端时不就绪
+  ok   问题说得具体                                               "还没选后端"
+  ok   商业后端没密钥时不就绪
+  ok   问题指明要密钥                                              "这个后端需要 API Key"
+  ok   商业后端不需要地址
+  ok   填了密钥就绪
+  ok   就绪时没有问题文本                                            ""
+  ok   自建后端没地址时不就绪
+  ok   问题指明要地址                                              "这个后端需要填地址"
+  ok   自建后端不需要密钥
+  ok   shim 没密钥时不就绪（实测网关会回 401）
+  ok   shim 缺密钥时提示指明要密钥                                     "这个后端需要 API Key"
+  ok   填了密钥就绪
+  ok   shim 同时需要地址
+  ok   后端名归一化                                               "tavily"
+  ok   认不出的后端收敛成空                                           ""
+  ok   认不出的后端 = 不就绪
+  ok   ProblemFor 与实例判据一致                                   "这个后端需要 API Key"
+  ok   密钥解不开时单独提示                                           "密钥解不开，请重新填写"
+  ok   条数拉回上限                                               5
+  ok   超时拉回上限                                               30
+
+=== 联网搜索 3. 五个后端的请求形状（URL / 认证头 / 体） ===
+  ok   searxng 用 GET                                        "GET"
+  ok   路径是 /search                                          "/search"
+  ok   查询词原样送达（空格已转义）                                       "white dress"
+  ok   要求 JSON 格式（SearXNG 不加这个参数会回 HTML）                    "json"
+  ok   尾斜杠不会拼成双斜杠
+  ok   没配密钥就不发 Authorization                                ""
+  ok   声明接受 JSON                                            "application/json"
+  ok   tavily 用 POST                                        "POST"
+  ok   打的是官方域名                                              "https://api.tavily.com/search"
+  ok   密钥走 Bearer                                           "Bearer tvly-secret"
+  ok   体里有查询词与条数
+  ok   不要上游替模型先下结论（include_answer=false）
+  ok   brave 用 GET                                          "GET"
+  ok   查询与条数在 URL 里
+  ok   密钥走 X-Subscription-Token                             "brave-key"
+  ok   不要错发 Authorization                                   ""
+  ok   serper 用 POST                                        "POST"
+  ok   打的是官方域名                                              "https://google.serper.dev/search"
+  ok   密钥走 X-API-KEY                                        "serper-key"
+  ok   体的字段名是 q/num（不是 query/max_results）
+  ok   shim 打 /v1/messages                                  "https://192.0.2.10:49977/v1/messages"
+  ok   Host 头写成 SNI 名（不一致时反向代理会静默回 200 空体）                  "nas.example.top"
+  ok   带 anthropic-version                                  "2023-06-01"
+  ok   密钥同时走 x-api-key                                      "shim-key"
+  ok   体里声明了 web_search server tool
+  ok   没密钥时如实失败
+  ok   而且一个请求都没发（不拿必然 401 的请求去撞上游）                          0
+  ok   第一次搜索成功
+  ok   第二次搜索同样成功（超时不靠改 HttpClient.Timeout）
+  ok   两次请求都真的发出去了                                          2
+  ok   超时被判成失败而不是空结果
+  ok   错误里说明是超时
+  ok   超时的正文里也带上这句（模型据此重试或放弃）
+
+=== 联网搜索 4. 五个后端的响应解析 ===
+  ok   searxng 条数                                           2
+  ok   searxng 取 content                                    "正文"
+  ok   searxng content 缺了才回落 snippet                        "摘要"
+  ok   引擎全挂时没有结果                                            0
+  ok   引擎全挂时给出问题说明（而不是静默的空结果）
+  ok   tavily 条数                                            1
+  ok   tavily 字段                                            "https://t"
+  ok   brave 从 web.results 取                                1
+  ok   brave 取 description                                  "d"
+  ok   serper 从 organic 取                                   1
+  ok   serper 的网址字段叫 link（不是 url）                           "https://s"
+  ok   shim 条数                                              2
+  ok   shim 摘要按 url 配对取回                                    "配对上的正文"
+  ok   配不上的那条留空，而不是错配                                       ""
+  ok   条数上限生效                                               2
+  ok   摘要里的换行被压平                                            "a b  c"
+
+=== 联网搜索 5. 回灌内容（截断 / 故障与空结果分开说） ===
+  ok   失败时带 error 字段
+  ok   失败时明确说明「这不代表那东西不存在」
+  ok   空结果里没有 error 字段
+  ok   空结果如实说没有结果
+  ok   中文原样保留（不转义成 \uXXXX）
+  ok   总量被截断（不会把 10 条 5000 字的摘要原样塞回去）
+  ok   截断后仍然是合法 JSON
+
+=== 联网搜索 6. 经 ToolHost 执行（含未配置时的兜底） ===
+  ok   未配置时如实说明不可用
+  ok   并且明确禁止编造来源
+  ok   摘要用中文前缀，便于日志比对
+  ok   空查询时要求重试
+  ok   空查询的摘要                                               "搜索（空查询）"
+  ok   结果里有网址
+  ok   结果里有摘要
+  ok   摘要带条数                                                "搜索「Qt 6.8」→ 1 条"
+  ok   裸字符串参数也能搜                                            "搜索「Qt 6.8」→ 1 条"
+  ok   成功摘要被前缀表认出（Live 靠它数执行次数）
+  ok   前缀表条数与工具种类数一致                                        5
+  ok   失败时正文里有 error
+  ok   失败时摘要写明失败
+
+=== 网页获取：正文提取 ===
+  ok   选中 article 并保留正文
+  ok   导航被丢掉
+  ok   页脚被丢掉
+  ok   标题里的实体被解码
+  ok   h1 渲染成 Markdown 标题                                   True
+  ok   div 排版也能选中正文
+  ok   div 排版下第二块也在
+  ok   div 排版下导航仍被丢掉
+  ok   脚本源码没有进正文
+  ok   脚本旁边仍能选出正文
+  ok   article 里的 header 不被当垃圾丢掉
+  ok   h2 渲染成 ##                                            True
+  ok   列表渲染成 -                                              True
+  ok   相对链接补成绝对链接                                           True
+  ok   pre 保留代码块围栏                                          True
+  ok   pre 里的实体按浏览器语义解码                                     True
+  ok   行内标签两侧的空格被保留                                         True
+  ok   og:title 优先于 title                                   "OG 标题"
+  ok   og:description 被取到                                   "这是页面描述"
+  ok   超过上限时标记截断                                            True
+  ok   截断处有明确标记
+  ok   截断后长度受控
+  ok   薄正文判定：空串算薄                                           True
+  ok   薄正文判定：长文不算薄                                          False
+  ok   畸形 HTML 不抛异常
+
+=== 网页获取：编码 ===
+  ok   GBK 能被解码（代码页已注册）                                     "中文"
+  ok   GBK 不被标记为不支持                                         False
+  ok   GB2312 别名也能解                                         "中文"
+  ok   UTF-8 正常                                             "中文内容"
+  ok   UTF-8 BOM 被剥掉                                        "abc"
+  ok   能从 meta 里嗅出 charset                                  "gbk"
+  ok   认不出的编码被标记                                            True
+  ok   charset 归一化：utf8 → utf-8                             "utf-8"
+  ok   charset 归一化：去引号                                      "gbk"
+
+=== 网页获取：地址与内网拦截 ===
+  ok   补协议                                                  "https://example.com/a"
+  ok   保留已有协议                                               "http://a.com/b"
+  ok   去掉页内锚点                                               "https://a.com/b"
+  ok   拒绝非 http 协议                                          ""
+  ok   拒绝空串                                                 ""
+  ok   去掉模型爱加的尖括号                                           "https://a.com/"
+  ok   localhost 被拦                                         True
+  ok   127.0.0.1 被拦                                         True
+  ok   10.x 被拦                                              True
+  ok   192.168.x 被拦                                         True
+  ok   172.16-31 被拦                                         True
+  ok   169.254.x 被拦                                         True
+  ok   IPv6 回环被拦                                            True
+  ok   IPv6 ULA 被拦                                          True
+  ok   内网域名被拦                                               True
+  ok   公网 IP 不拦                                             False
+  ok   公网域名不拦                                               False
+  ok   172.15 不拦                                            False
+  ok   172.32 不拦                                            False
+
+=== 网页获取：降级判据 ===
+  ok   人机校验页 → 升级                                           True
+  ok   编码解不了 → 升级                                           True
+  ok   传输层失败 → 升级（浏览器可能读得通）                                 True
+  ok   403 → 升级                                             True
+  ok   429 → 升级                                             True
+  ok   503 → 升级                                             True
+  ok   404 不升级                                              False
+  ok   410 不升级                                              False
+  ok   401 不升级                                              False
+  ok   大 HTML + 薄正文 → 升级                                    True
+  ok   小 HTML + 薄正文 → 不升级                                   False
+  ok   正常正文 → 不升级                                           False
+
+=== 网页获取：双引擎编排（桩 HTTP + 假浏览器） ===
+  ok   auto：SPA 升级到浏览器                                      "browser"
+  ok   auto：浏览器被调用一次                                        1
+  ok   auto：拿到渲染后的正文
+  ok   auto：没有浏览器时不升级                                       "http"
+  ok   auto：没有浏览器时不调用                                       0
+  ok   auto：明确说明可能是 JS 页面
+  ok   auto：正常页面走 HTTP                                      "http"
+  ok   auto：正常页面不起浏览器                                       0
+  ok   engine=http：不起浏览器                                    0
+  ok   engine=http：引擎标注正确                                   "http"
+  ok   engine=browser：用浏览器                                  "browser"
+  ok   engine=browser：没有多余的 HTTP 请求                         0
+  ok   render=true 强制走浏览器                                   "browser"
+  ok   render=true 不发 HTTP                                  0
+  ok   浏览器渲染更少时保留 HTTP 那份                                   "http"
+  ok   并说明了为什么保留
+  ok   内容确实是 HTTP 抓到的那份
+  ok   校验页升级后浏览器确实被调用                                       1
+  ok   两条失败都失败时如实报错                                         False
+  ok   错误里同时含 HTTP 与浏览器两条原因
+  ok   404 不启动浏览器                                           0
+  ok   默认拦截内网地址                                             False
+  ok   拦截原因说得清楚
+  ok   打开开关后放行                                              True
+  ok   PDF 如实拒绝                                             False
+  ok   拒绝原因含内容类型
+  ok   纯文本成功                                                True
+  ok   纯文本内容保留
+  ok   失败信封写明不等于不存在
+  ok   失败信封禁止编造
+  ok   摘要前缀表含 web_fetch
+  ok   前缀条数 == 工具种类数                                        5
+  ok   连接被关 → 值得重试                                          True
+  ok   连接被重置 → 值得重试                                         True
+  ok   域名解析不了 → 不重试（重试必然一样）                                 False
+  ok   超时 → 不重试（再等一遍就是两倍延迟）                                 False
+  ok   非导航错误 → 不重试                                          False
+
+=== 网页获取：代理真的生效（真桩代理） ===
+  ok   填了代理后抓取成功                                            True
+  ok   正文来自桩代理
+  ok   代理确实收到了请求
+  ok   不填代理时同一地址失败（对照）                                      False
+  ok   回环目标也走代理（不被 BypassProxyOnLocal 绕过）                   True
+  ok   代理收到了那个回环目标的请求
 
 === 令牌：生成与校验 ===
   ok   明文带 aip- 前缀（一眼看出是代理签发的）
@@ -477,7 +727,7 @@ AnimaAIProxy 回归：all
   ok   大小写不敏感                                               "deepseek-v4-pro"
   ok   没配映射的原样透传（不猜）                                        "some-local-model"
   ok   空模型名原样                                               ""
-  ok   映射后按换过的名字路由到那个站点                                     "8eb4b8200566"
+  ok   映射后按换过的名字路由到那个站点                                     "44a4c43b1204"
   ok   开了兜底时未映射的走兜底                                         "backup-model"
   ok   默认不开兜底：静默换模型比报错更难查                                   False
 
@@ -517,7 +767,7 @@ AnimaAIProxy 回归：all
   ok   上游连不上 → 502                                          502
   ok   错误体里有 error.message
   ok   错误信息说清了是连不上上游，而不是含糊的「请求失败」
-       上游不可达时的响应：{"error":{"message":"连不上上游：由于目标计算机积极拒绝，无法连接。 (127.0.0.1:61927)","type":"upstream_error"}}
+       上游不可达时的响应：{"error":{"message":"连不上上游：由于目标计算机积极拒绝，无法连接。 (127.0.0.1:55222)","type":"upstream_error"}}
   ok   坏 JSON → 400                                         400
   ok   上游连不上也照常回 200（模型表是本地勾选的结果）                           200
   ok   勾选启用的模型在表里
@@ -563,8 +813,8 @@ AnimaAIProxy 回归：all
   ok   流式路径也注入了我们的工具（旧行为是不注入）
   ok   流式路径也带了 reasoning_effort（不劫持）                        "high"
   ok   数据是分多次到达的（收到 6 次读，不是一次）
-  ok   首块远早于最后一块（首块 0ms / 总 1090ms）
-       流式时序：读次数=6，首块=0ms，总耗时=1090ms
+  ok   首块远早于最后一块（首块 0ms / 总 1078ms）
+       流式时序：读次数=6，首块=0ms，总耗时=1078ms
   ok   流式注入：上游被问了两次（工具轮 + 收尾轮）                              2
   ok   第二轮请求里带上了 role:tool 的工具结果
   ok   流式路径里工具是真的在本地执行的（弓 → bow (weapon)）
@@ -585,5 +835,41 @@ AnimaAIProxy 回归：all
   ok   第二个自定义头也发出去了
   ok   站点1 的历史请求里没有站点2 的专属头
   ok   响应里的模型名回写成客户端报的那个                                    "only-on-2"
+  ok   空串时间戳的站点：/v1/models 仍然 200                           200
+  ok   空串被当成「从未拉过」，拉取真的发生了（而不是被静默跳过）
+  ok   拉到的模型进了它自己的表
+  ok   默认不下发 web_search
+  ok   只勾开关、没填地址时也不下发（缺配置是必然失败）
+  ok   web_search 链路走通，200                                  200
+  ok   配好后 web_search 出现在发往上游的工具里
+  ok   系统提示里也介绍了它（否则模型不会想到用）
+  ok   代理真的发出了搜索请求                                          1
+  ok   搜索词原样送达                                              "Qt 6.8 release date"
+  ok   第二轮请求里带上了搜索结果                                        1
+  ok   结果里有真实网址（模型要能引用它）
+  ok   结果里有摘要正文
+  ok   客户端拿到的是最终回答                                          "Qt 6.8 于 2024 年 10 月发布。"
+  ok   客户端看不到 web_search 的 tool_call                        0
+  ok   finish_reason 改回 stop                                "stop"
+  ok   交还给客户端的报文里连 web_search 这个名字都搜不到
+  ok   引擎全挂时如实报错（不把故障说成「没这东西」）
+  ok   故障时明确告诉模型这不代表那东西不存在
+  ok   默认就下发 web_fetch（HTTP 引擎无需配置）
+  ok   关掉开关后不下发 web_fetch
+  ok   内网地址默认被拦
+  ok   被拦时一个请求都没发出去                                         0
+  ok   web_fetch 链路走通，200                                   200
+  ok   系统提示里也介绍了 web_fetch
+  ok   代理真的去抓了那个页面                                          1
+  ok   抓的是请求里给的那个路径
+  ok   回灌里有页面标题
+  ok   回灌里有正文
+  ok   回灌里标了这次用的是哪个引擎
+  ok   客户端拿到的是最终回答                                          "桩页面说的是这件事。"
+  ok   客户端看不到 web_fetch 的 tool_call                         0
+  ok   交还给客户端的报文里连 web_fetch 这个名字都搜不到
+  ok   抓取失败时如实报错
+  ok   并说明这不代表页面不存在
+  ok   并禁止编造页面内容
 
 全部通过。

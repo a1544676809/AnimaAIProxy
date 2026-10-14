@@ -244,7 +244,23 @@ public static class Loop
             Harness.True("客户端原名的工具还在", names.Contains(ToolCatalog.SearchName));
             Harness.True("我们让路改用了带后缀的名字",
                          names.Contains(ToolCatalog.SearchName + ToolCatalog.CollisionSuffix));
-            Harness.Eq("工具总数 = 客户端 2 + 我们 3", names.Count, 5);
+            // web_fetch 默认就是下发的（HTTP 引擎不需要任何配置，见 ProxyConfig.FetchEnabled），
+            // 所以默认配置下我们发的是 4 个工具而不是 3 个。
+            Harness.True("web_fetch 默认下发", names.Contains(ToolCatalog.WebFetchName));
+            Harness.Eq("工具总数 = 客户端 2 + 我们 4", names.Count, 6);
+
+            // 关掉抓取后回到 4（这一条没有再加客户端那个重名工具，所以客户端是 1 个）。
+            // 这一条钉住的是"默认开"这个决定本身 ——
+            // 少了它，哪天默认值被改掉，唯一的症状就是工具悄悄少了一个，没人会发现。
+            var noFetch = new ProxyConfig { FetchEnabled = false };
+            var up2 = new FakeUpstream();
+            up2.Enqueue(Reply("好。"));
+            new ToolLoop(up2, Host(), noFetch)
+                .RunAsync(ClientBody(), "tok", CancellationToken.None).GetAwaiter().GetResult();
+            var names2 = ((JsonArray)up2.Received[0]["tools"]!)
+                .Select(t => ChatWire.GetString(t!["function"] as JsonObject, "name")).ToList();
+            Harness.Eq("关掉抓取后只剩我们的 3 个词库工具", names2.Count, 4);
+            Harness.True("关掉后确实没有 web_fetch", !names2.Contains(ToolCatalog.WebFetchName));
         }
 
         // ---------- 5. 思考相关字段一律不劫持 ----------

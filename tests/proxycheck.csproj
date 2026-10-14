@@ -23,6 +23,12 @@
   <ItemGroup>
     <!-- 与应用**同版本**，避免"测试跑过的代码路径和应用实际跑的不是同一套托管依赖"。 -->
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
+    <!--
+      Core/ArticleExtractor.cs 用它解析 HTML，所以这里也要。
+      版本与 AnimaAIProxy.csproj **必须一致**（同一条理由）。
+      它是纯托管的、netstandard2.0 资产，不带任何平台依赖，不削弱本工程的守卫作用。
+    -->
+    <PackageReference Include="HtmlAgilityPack" Version="1.11.71" />
   </ItemGroup>
 
   <ItemGroup>
@@ -51,10 +57,13 @@
     <Compile Include="Merge.cs" />
     <Compile Include="Providers.cs" />
     <Compile Include="Search.cs" />
+    <Compile Include="PageRead.cs" />
     <Compile Include="LogCheck.cs" />
     <Compile Include="Server.cs" />
     <Compile Include="E2E.cs" />
     <!-- 要联网、要真密钥、花真 token，所以不进 all；见 Program.cs 的说明。 -->
     <Compile Include="Live.cs" />
+    <!-- 要联网、要本机有 Edge，但不需要密钥；同样不进 all。 -->
+    <Compile Include="LivePage.cs" />
   </ItemGroup>
 </Project>

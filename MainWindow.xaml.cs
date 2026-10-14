@@ -119,6 +119,18 @@ public sealed partial class MainWindow : Window
             SearchKeyBox.Password = "";
             RefreshSearchStatus();
 
+            FetchEnabledSwitch.IsOn = _cfg.FetchEnabled;
+            SelectFetchEngine(_cfg.FetchEngineKey);
+            FetchProxyBox.Text = _cfg.FetchProxy;
+            FetchBrowserPathBox.Text = _cfg.FetchBrowserPath;
+            FetchMaxCharsBox.Value = _cfg.FetchMaxChars;
+            FetchTimeoutBox.Value = _cfg.FetchTimeoutSeconds;
+            FetchIdleBox.Value = _cfg.FetchBrowserIdleSeconds;
+            FetchPrivateSwitch.IsOn = _cfg.FetchAllowPrivateHosts;
+            if ((FetchTestUrlBox.Text ?? "").Trim().Length == 0)
+                FetchTestUrlBox.Text = "https://example.com/";
+            RefreshFetchStatus();
+
             RefreshProviderList();
             RefreshModelList();
             RefreshTokenList();
@@ -182,6 +194,15 @@ public sealed partial class MainWindow : Window
             _cfg.SearchApiKey = typedSearchKey;
             SearchKeyBox.Password = "";
         }
+
+        _cfg.FetchEnabled = FetchEnabledSwitch.IsOn;
+        _cfg.FetchEngine = SelectedFetchEngine;
+        _cfg.FetchProxy = (FetchProxyBox.Text ?? "").Trim();
+        _cfg.FetchBrowserPath = (FetchBrowserPathBox.Text ?? "").Trim();
+        _cfg.FetchMaxChars = ToInt(FetchMaxCharsBox.Value, _cfg.FetchMaxChars);
+        _cfg.FetchTimeoutSeconds = ToInt(FetchTimeoutBox.Value, _cfg.FetchTimeoutSeconds);
+        _cfg.FetchBrowserIdleSeconds = ToInt(FetchIdleBox.Value, _cfg.FetchBrowserIdleSeconds);
+        _cfg.FetchAllowPrivateHosts = FetchPrivateSwitch.IsOn;
 
         _cfg.Normalize();
         _cfg.Save();
@@ -1069,6 +1090,129 @@ public sealed partial class MainWindow : Window
         if (typed.Length > 0) probe.SearchApiKey = typed;
         else probe.SearchApiKeyProtected = _cfg.SearchApiKeyProtected;   // 用已存的那把
 
+        probe.Normalize();
+        return probe;
+    }
+
+    // ---------------- 联网抓取 ----------------
+
+    private string SelectedFetchEngine =>
+        (FetchEngineBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "auto";
+
+    private void SelectFetchEngine(string engine)
+    {
+        for (var i = 0; i < FetchEngineBox.Items.Count; i++)
+        {
+            if (FetchEngineBox.Items[i] is ComboBoxItem item &&
+                string.Equals(item.Tag as string, engine, StringComparison.Ordinal))
+            {
+                FetchEngineBox.SelectedIndex = i;
+                return;
+            }
+        }
+        FetchEngineBox.SelectedIndex = 0;   // auto
+    }
+
+    private void FetchEngine_Changed(object sender, SelectionChangedEventArgs e) => RefreshFetchStatus();
+
+    private void FetchSetting_Changed(object sender, RoutedEventArgs e) => RefreshFetchStatus();
+
+    private void FetchSetting_TextChanged(object sender, TextChangedEventArgs e) => RefreshFetchStatus();
+
+    /// <summary>
+    /// 抓取面板的实时状态。
+    ///
+    /// 浏览器是否可用**在界面这一层独立探测一次**（<see cref="BrowserFetcher.FindChromium"/> 是纯函数），
+    /// 而不是去问服务端：服务端是懒启动的，用户打开界面时它可能还没建出来，
+    /// 而"还没建出来"与"本机没有浏览器"在界面上必须长得不一样 ——
+    /// 否则用户会以为自己没装 Edge。
+    ///
+    /// 判据本身用 <see cref="ProxyConfig.FetchProblemFor"/>，与下发工具用的是同一份，
+    /// 理由与搜索面板相同：两份判据一旦走偏，症状是"界面说就绪、实际没下发工具"。
+    /// </summary>
+    private void RefreshFetchStatus()
+    {
+        var engine = SelectedFetchEngine;
+        var path = BrowserFetcher.FindChromium((FetchBrowserPathBox.Text ?? "").Trim());
+        var usable = path.Length > 0;
+
+        FetchBrowserPathBox.PlaceholderText = usable
+            ? "已找到：" + path
+            : "留空 = 自动查找 Edge / Chrome（本机没找到）";
+
+        var hint = engine switch
+        {
+            "auto" => "先用 HTTP 读（约 0.3 秒）；正文读不到时才自动起浏览器渲染" +
+                      "（约 1–2 秒、几百 MB 内存，空闲后自动关闭）。",
+            "http" => "只用 HTTP：最轻，但读不了需要 JavaScript 的页面。",
+            "browser" => "每次都渲染：最接近真实浏览器，但每次都要起一遍浏览器。",
+            _ => ""
+        };
+
+        var problem = ProxyConfig.FetchProblemFor(FetchEnabledSwitch.IsOn, engine, usable);
+        var state = !FetchEnabledSwitch.IsOn
+            ? "未启用：模型看不到这个工具。"
+            : problem.Length > 0
+                ? "⚠ " + problem
+                : "已就绪：模型可以调用 " + ToolCatalog.WebFetchName + "。";
+
+        var browser = usable
+            ? "浏览器引擎：" + Path.GetFileName(path)
+            : "浏览器引擎：本机没找到 Edge / Chrome（自动降级会退化成只用 HTTP）";
+
+        FetchStatusText.Text = hint + "\n" + browser + "\n" + state;
+    }
+
+    /// <summary>
+    /// 用**界面上当前的值**试抓一次，而不是用已保存的配置 —— 理由与"测试搜索"相同：
+    /// 用户点测试的时机就是刚填完还没保存的时候。
+    /// </summary>
+    private async void TestFetch_Click(object sender, RoutedEventArgs e)
+    {
+        var url = (FetchTestUrlBox.Text ?? "").Trim();
+        if (url.Length == 0)
+        {
+            FetchStatusText.Text = "先填一个测试地址。";
+            return;
+        }
+
+        TestFetchButton.IsEnabled = false;
+        FetchStatusText.Text = "正在抓取…";
+        try
+        {
+            using var reader = new PageReader();
+            var (ok, message) = await reader.TestAsync(BuildFetchProbe(), url);
+            FetchStatusText.Text = (ok ? "✓ " : "✗ ") + message;
+            ProxyLog.Write("抓取自测：" + message);
+        }
+        catch (Exception ex)
+        {
+            FetchStatusText.Text = "✗ 测试失败：" + ex.Message;
+            ProxyLog.WriteException("抓取自测失败", ex);
+        }
+        finally
+        {
+            TestFetchButton.IsEnabled = true;
+        }
+    }
+
+    /// <summary>把界面上当前填的抓取设置做成一份配置（不落盘、不动真配置）。</summary>
+    private ProxyConfig BuildFetchProbe()
+    {
+        var path = (FetchBrowserPathBox.Text ?? "").Trim();
+        var probe = new ProxyConfig
+        {
+            FetchEnabled = FetchEnabledSwitch.IsOn,
+            FetchEngine = SelectedFetchEngine,
+            FetchProxy = (FetchProxyBox.Text ?? "").Trim(),
+            FetchBrowserPath = path,
+            FetchMaxChars = ToInt(FetchMaxCharsBox.Value, _cfg.FetchMaxChars),
+            FetchTimeoutSeconds = ToInt(FetchTimeoutBox.Value, _cfg.FetchTimeoutSeconds),
+            FetchBrowserIdleSeconds = ToInt(FetchIdleBox.Value, _cfg.FetchBrowserIdleSeconds),
+            FetchAllowPrivateHosts = FetchPrivateSwitch.IsOn,
+            // 判据要能算出 FetchReady，所以这里把"本机有没有浏览器"一并填上
+            FetchBrowserUsable = BrowserFetcher.FindChromium(path).Length > 0
+        };
         probe.Normalize();
         return probe;
     }
