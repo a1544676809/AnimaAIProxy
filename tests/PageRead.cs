@@ -48,6 +48,9 @@ public static class PageRead
 
         Harness.Section("网页获取：瞬时失败重试");
         Retry().GetAwaiter().GetResult();
+
+        Harness.Section("网页获取：浏览器与临时目录的回收");
+        Reclaim();
     }
 
     // ---------------------------------------------------------------- 正文提取
@@ -591,6 +594,70 @@ public static class PageRead
             BrowserFetcher.IsTransientNav("导航失败：net::ERR_TIMED_OUT"), false);
         Harness.Eq("非导航错误 → 不重试",
             BrowserFetcher.IsTransientNav("页面卡在 Cloudflare 之类的人机校验上"), false);
+    }
+
+    // ---------------------------------------------------------------- 回收
+
+    /// <summary>
+    /// 浏览器实例与它那份临时用户数据目录的回收。
+    ///
+    /// 为什么值得单独钉住：**进程回收与目录回收是两件事**，而目录那一半曾经静默漏掉 ——
+    /// 实测一次抓取在 %TEMP% 里留下 13.6 MB，反复调试期间积了 13 个目录、共 234 MB。
+    /// 漏掉的机制是：删除是 fire-and-forget 的后台任务，而 Dispose 之后进程往往立刻退出
+    /// （应用关闭、回归跑完），它根本没机会跑完。
+    /// </summary>
+    private static void Reclaim()
+    {
+        // 启动参数：少了 --headless=new 就会弹出一个**可见窗口**，而抓取照常成功、
+        // 进程照常回收 —— 功能上完全看不出来，所以只能靠断言钉住。
+        var args = BrowserFetcher.LaunchArgs(@"C:\tmp\prof", "http://127.0.0.1:10808");
+        Harness.True("启动参数含 --headless=new（否则会弹出可见窗口）",
+            args.Contains("--headless=new"));
+        Harness.True("用户数据目录指向我们自己的临时目录",
+            args.Contains(@"--user-data-dir=C:\tmp\prof"));
+        Harness.True("代理透传给浏览器", args.Contains("--proxy-server=http://127.0.0.1:10808"));
+        Harness.Eq("不给代理时不加 --proxy-server",
+            BrowserFetcher.LaunchArgs(@"C:\tmp\prof", "   ").Any(a => a.StartsWith("--proxy-server")), false);
+        Harness.True("用随机调试端口（固定端口会撞上用户自己开着的 Edge）",
+            args.Contains("--remote-debugging-port=0"));
+
+        // 目录名与扫描判据必须是同一个前缀 —— 两处走偏，残留就永远清不掉。
+        var dir = BrowserFetcher.NewProfileDir();
+        Harness.True("新建目录带统一前缀",
+            Path.GetFileName(dir).StartsWith(BrowserFetcher.ProfilePrefix, StringComparison.Ordinal));
+        Harness.True("目录建在 %TEMP% 下",
+            dir.StartsWith(Path.GetTempPath(), StringComparison.OrdinalIgnoreCase));
+
+        // 扫描在自己的临时根里验，不碰真的 %TEMP%
+        var root = Path.Combine(Path.GetTempPath(), "aip-sweeptest-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(root);
+        try
+        {
+            var stale = Path.Combine(root, BrowserFetcher.ProfilePrefix + "stale001");
+            var fresh = Path.Combine(root, BrowserFetcher.ProfilePrefix + "fresh001");
+            var other = Path.Combine(root, "some-other-dir");     // 不该被碰
+            Directory.CreateDirectory(stale);
+            Directory.CreateDirectory(fresh);
+            Directory.CreateDirectory(other);
+            File.WriteAllText(Path.Combine(stale, "x.txt"), "x");
+            // 推到阈值之外（先建文件再改时间，否则建文件会把时间刷新）
+            Directory.SetLastWriteTimeUtc(stale,
+                DateTime.UtcNow - BrowserFetcher.StaleProfileAge - TimeSpan.FromMinutes(10));
+
+            var removed = BrowserFetcher.SweepStaleProfiles(BrowserFetcher.StaleProfileAge, root);
+            Harness.Eq("陈旧残留被清掉", removed, 1);
+            Harness.Eq("陈旧目录确实没了", Directory.Exists(stale), false);
+            Harness.Eq("新鲜目录被保留（可能是活着的实例）", Directory.Exists(fresh), true);
+            Harness.Eq("不匹配前缀的目录一概不碰", Directory.Exists(other), true);
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+
+        // 边界：目录本来就不存在算成功（调用方要的是"它没了"），空路径/null 不抛。
+        Harness.Eq("删不存在的目录算成功",
+            BrowserFetcher.TryDeleteProfile(
+                Path.Combine(Path.GetTempPath(), "aip-nope-" + Guid.NewGuid().ToString("N")[..8]), 1, 1), true);
+        Harness.Eq("空路径不抛", BrowserFetcher.TryDeleteProfile("", 1, 1), true);
+        Harness.Eq("null 不抛", BrowserFetcher.TryDeleteProfile(null, 1, 1), true);
     }
 
     // ---------------------------------------------------------------- 代理

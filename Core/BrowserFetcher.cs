@@ -69,6 +69,103 @@ public sealed class BrowserFetcher : IBrowserEngine, IDisposable
     public BrowserFetcher(string? configuredPath = null)
     {
         Path = FindChromium(configuredPath);
+
+        // 启动时清掉上次留下的残留目录 —— 见 SweepStaleProfiles 的注释：
+        // 强杀和"Dispose 后立刻退出"这两种场合，后台删除必然跑不完。
+        var swept = SweepStaleProfiles(StaleProfileAge);
+        if (swept > 0) ProxyLog.Write($"清理了 {swept} 个上次遗留的浏览器临时目录");
+    }
+
+    // ---------------------------------------------------------------- 用户数据目录的回收
+
+    /// <summary>
+    /// 临时用户数据目录的前缀。**改它必须同时改 <see cref="SweepStaleProfiles"/> 的判据**，
+    /// 否则旧前缀的目录会永远留在 %TEMP% 里（回归里有一条断言钉住这两处一致）。
+    /// </summary>
+    internal const string ProfilePrefix = "aip-edge-";
+
+    /// <summary>
+    /// 比这个更旧的残留目录，在**进程启动时**清掉。
+    ///
+    /// 为什么需要它：<see cref="Kill"/> 里的删除是 fire-and-forget 的后台任务，
+    /// 有两种必然跑不完的场合 —— 应用被强杀（没有 Dispose，也就没有 Kill），
+    /// 以及 Dispose 之后进程立刻退出（后台任务还没跑完，进程就没了）。
+    /// 实测：一次抓取留下 13.6 MB，反复调试期间 %TEMP% 里积了 13 个目录、共 234 MB。
+    ///
+    /// 为什么是 2 小时而不是"一上来全清"：只有"同时跑着第二个实例、且它的浏览器
+    /// 已空闲超过 2 小时"才会误删到活着的实例（默认空闲 300 秒就自己关了，所以这需要
+    /// 用户把空闲时间调到 2 小时以上并且长时间不用）。误删的后果也只是那个实例下次
+    /// 抓取时重启浏览器 —— 有界、可恢复，所以这里接受这个取舍。
+    /// </summary>
+    internal static readonly TimeSpan StaleProfileAge = TimeSpan.FromHours(2);
+
+    internal static string NewProfileDir() =>
+        System.IO.Path.Combine(System.IO.Path.GetTempPath(),
+                               ProfilePrefix + Guid.NewGuid().ToString("N")[..8]);
+
+    /// <summary>
+    /// 删掉一个用户数据目录，最多等 <paramref name="attempts"/> × <paramref name="sleepMs"/>。
+    ///
+    /// 为什么要重试：Edge 的子进程被杀之后还会短暂持有目录里的文件句柄，第一次删除
+    /// 常常因共享冲突失败。**目录本来就不存在算成功** —— 调用方要的是"它没了"。
+    /// </summary>
+    internal static bool TryDeleteProfile(string? dir, int attempts, int sleepMs)
+    {
+        if (string.IsNullOrWhiteSpace(dir)) return true;
+        for (var i = 0; i < attempts; i++)
+        {
+            try { Directory.Delete(dir, recursive: true); return true; }
+            catch (DirectoryNotFoundException) { return true; }
+            catch { if (i < attempts - 1) Thread.Sleep(sleepMs); }
+        }
+        return !Directory.Exists(dir);
+    }
+
+    /// <summary>
+    /// 清掉陈旧的残留目录，返回清掉的个数。**只认前缀，别的目录一概不碰。**
+    /// <paramref name="root"/> 可换，是为了让回归在自己的临时目录里验它、不碰真的 %TEMP%。
+    /// </summary>
+    internal static int SweepStaleProfiles(TimeSpan olderThan, string? root = null)
+    {
+        var removed = 0;
+        try
+        {
+            var baseDir = root ?? System.IO.Path.GetTempPath();
+            var cutoff = DateTime.UtcNow - olderThan;
+            foreach (var d in Directory.EnumerateDirectories(baseDir, ProfilePrefix + "*"))
+            {
+                try
+                {
+                    // 可能是活着的实例，别动它
+                    if (Directory.GetLastWriteTimeUtc(d) > cutoff) continue;
+                    if (TryDeleteProfile(d, 3, 200)) removed++;
+                }
+                catch { /* 单个目录失败不影响其它 */ }
+            }
+        }
+        catch { /* %TEMP% 读不了就跳过 —— 绝不能因此起不来 */ }
+        return removed;
+    }
+
+    /// <summary>
+    /// 启动参数。抽成纯函数是为了能被离线回归钉住 ——
+    /// <c>--headless=new</c> 一旦少了，浏览器就会**弹出一个可见窗口**，而进程照常工作、
+    /// 抓取也照常成功，所以从功能上完全看不出问题。实测确认过：带这个参数时，
+    /// 浏览器那 5 个顶层窗口全是 hidden（不带的话会是一个真的 Edge 窗口）。
+    /// </summary>
+    internal static IReadOnlyList<string> LaunchArgs(string userDataDir, string? proxy)
+    {
+        var args = new List<string>
+        {
+            "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+            "--disable-extensions", "--disable-sync", "--disable-background-networking",
+            "--disable-features=OptimizationHints,MediaRouter,Translate,BackForwardCache,AcceptCHFrame",
+            "--renderer-process-limit=1", "--window-size=1280,900", "--mute-audio",
+            "--remote-debugging-port=0", "--user-data-dir=" + userDataDir,
+        };
+        if (!string.IsNullOrWhiteSpace(proxy)) args.Add("--proxy-server=" + proxy.Trim());
+        args.Add("about:blank");
+        return args;
     }
 
     /// <summary>
@@ -350,26 +447,15 @@ public sealed class BrowserFetcher : IBrowserEngine, IDisposable
 
     private async Task StartAsync(string proxy, CancellationToken ct)
     {
-        var udd = System.IO.Path.Combine(
-            System.IO.Path.GetTempPath(), "aip-edge-" + Guid.NewGuid().ToString("N")[..8]);
+        var udd = NewProfileDir();
         Directory.CreateDirectory(udd);
 
         var psi = new ProcessStartInfo(Path) { UseShellExecute = false, CreateNoWindow = true };
-        foreach (var a in new[]
-        {
-            "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
-            "--disable-extensions", "--disable-sync", "--disable-background-networking",
-            "--disable-features=OptimizationHints,MediaRouter,Translate,BackForwardCache,AcceptCHFrame",
-            "--renderer-process-limit=1", "--window-size=1280,900", "--mute-audio",
-            "--remote-debugging-port=0", "--user-data-dir=" + udd,
-        })
-            psi.ArgumentList.Add(a);
+        foreach (var a in LaunchArgs(udd, proxy)) psi.ArgumentList.Add(a);
 
         // 代理交给浏览器自己走。**这比在 .NET 侧做要可靠**：实测同一个代理，
         // .NET 的 HttpClient 对 en.wikipedia.org 直接 SSL 握手失败，而 Edge 走通了
         // （拿到 11969 字符正文）——浏览器的 TLS 栈与代理协商方式跟 .NET 不一样。
-        if (!string.IsNullOrWhiteSpace(proxy)) psi.ArgumentList.Add("--proxy-server=" + proxy.Trim());
-        psi.ArgumentList.Add("about:blank");
 
         var proc = Process.Start(psi) ?? throw new InvalidOperationException("浏览器没能启动");
 
@@ -520,8 +606,10 @@ public sealed class BrowserFetcher : IBrowserEngine, IDisposable
         catch { /* 定时器回调里绝不抛 */ }
     }
 
-    private void Kill()
+    /// <summary>杀掉浏览器实例并**返回它的用户数据目录**（没有实例时返回 null）。</summary>
+    private string? Kill()
     {
+        string? udd;
         lock (_stateLock)
         {
             try { _ws?.Dispose(); } catch { }
@@ -530,33 +618,33 @@ public sealed class BrowserFetcher : IBrowserEngine, IDisposable
             try { _proc?.Dispose(); } catch { }
             _proc = null;
 
-            var udd = _userDataDir;
+            udd = _userDataDir;
             _userDataDir = null;
-            if (udd is not null)
-            {
-                // 用户数据目录里有几百个文件，删不掉不影响功能，但别让它堆在 %TEMP% 里。
-                _ = Task.Run(() =>
-                {
-                    for (var i = 0; i < 3; i++)
-                    {
-                        try { Directory.Delete(udd, recursive: true); return; }
-                        catch { Thread.Sleep(300); }
-                    }
-                });
-            }
         }
+
+        // 用户数据目录里有几百个文件，删不掉不影响功能，但别让它堆在 %TEMP% 里。
+        // 放在锁外：删除要重试好几秒，不该占着状态锁。
+        if (udd is not null) _ = Task.Run(() => TryDeleteProfile(udd, 20, 250));
+
         lock (_pending)
         {
             foreach (var tcs in _pending.Values) tcs.TrySetException(new InvalidOperationException("浏览器已关闭"));
             _pending.Clear();
         }
+        return udd;
     }
 
     public void Dispose()
     {
         _disposed = true;
         try { _idleTimer?.Dispose(); } catch { }
-        Kill();
+        var udd = Kill();
+
+        // Kill 里那次删除是 fire-and-forget 的后台任务，而 Dispose 之后进程往往**立刻退出**
+        // （应用关闭、回归跑完），后台任务根本没机会跑完 —— 实测就是这样在 %TEMP% 里
+        // 留下了 13–55 MB 的残留目录。这里同步再删一次兜住它；目录已经没了就立刻返回。
+        TryDeleteProfile(udd, 8, 200);
+
         _startGate.Dispose();
         _sendGate.Dispose();
     }
