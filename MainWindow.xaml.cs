@@ -105,6 +105,7 @@ public sealed partial class MainWindow : Window
 
             PortBox.Value = _cfg.Port;
             RequireTokenSwitch.IsOn = _cfg.RequireToken;
+            McpEnabledSwitch.IsOn = _cfg.McpEnabled;
             LogBodiesSwitch.IsOn = _cfg.LogBodies;
             SelectScope(_cfg.BindScope);
 
@@ -158,11 +159,18 @@ public sealed partial class MainWindow : Window
         ScopeBox.SelectedIndex = 0;
     }
 
-    /// <summary>把界面上的值收回配置对象。返回"监听参数变了没有"（变了要重启才生效）。</summary>
+    /// <summary>
+    /// 把界面上的值收回配置对象。返回"需要重启代理才生效的东西变了没有"。
+    ///
+    /// 端口与监听范围要重启是因为 Kestrel 的监听在建服务时定死；MCP 开关同样，
+    /// 因为它的路由也是在 StartAsync 里注册的 —— 关掉之后那个端点**就不存在了**，
+    /// 而不是留一个永远回 403 的壳。
+    /// </summary>
     private bool SaveFromUi()
     {
         var oldPort = _cfg.Port;
         var oldScope = _cfg.BindScope;
+        var oldMcp = _cfg.McpEnabled;
 
         _cfg.TimeoutSeconds = ToInt(TimeoutBox.Value, _cfg.TimeoutSeconds);
         _cfg.ModelMap = ParseModelMap(ModelMapBox.Text);
@@ -175,6 +183,7 @@ public sealed partial class MainWindow : Window
 
         _cfg.Port = ToInt(PortBox.Value, _cfg.Port);
         _cfg.RequireToken = RequireTokenSwitch.IsOn;
+        _cfg.McpEnabled = McpEnabledSwitch.IsOn;
         _cfg.LogBodies = LogBodiesSwitch.IsOn;
         _cfg.BindScope = (ScopeBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "local";
 
@@ -210,7 +219,8 @@ public sealed partial class MainWindow : Window
         _cfg.Save();
 
         return oldPort != _cfg.Port ||
-               !string.Equals(oldScope, _cfg.BindScope, StringComparison.Ordinal);
+               !string.Equals(oldScope, _cfg.BindScope, StringComparison.Ordinal) ||
+               oldMcp != _cfg.McpEnabled;
     }
 
     private static int ToInt(double v, int fallback) =>
@@ -324,6 +334,12 @@ public sealed partial class MainWindow : Window
             ? $"http://127.0.0.1:{_cfg.Port}/v1"
             : _server.BaseUrl;
 
+        // MCP 地址与服务状态无关地显示：代理停着的时候用户照样要把地址抄进
+        // 客户端配置里，而"没运行就不显示"会让他以为这个功能不存在。
+        McpUrlText.Text = _server is null
+            ? $"http://127.0.0.1:{_cfg.Port}/mcp"
+            : _server.McpUrl;
+
         if (running)
         {
             HintText.Text = _cfg.BindScope switch
@@ -367,6 +383,22 @@ public sealed partial class MainWindow : Window
     {
         await Task.Delay(1200);
         CopyBaseUrlButton.Content = "复制";
+    }
+
+    private void CopyMcpUrl_Click(object sender, RoutedEventArgs e)
+    {
+        var dp = new Windows.ApplicationModel.DataTransfer.DataPackage();
+        dp.SetText(McpUrlText.Text);
+        Windows.ApplicationModel.DataTransfer.Clipboard.SetContent(dp);
+
+        CopyMcpUrlButton.Content = "已复制";
+        _ = RestoreMcpCopyButtonAsync();
+    }
+
+    private async Task RestoreMcpCopyButtonAsync()
+    {
+        await Task.Delay(1200);
+        CopyMcpUrlButton.Content = "复制";
     }
 
     // ---------------- 模型提供商 ----------------

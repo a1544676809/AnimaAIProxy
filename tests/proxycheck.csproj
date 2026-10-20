@@ -60,6 +60,8 @@
     <Compile Include="PageRead.cs" />
     <Compile Include="LogCheck.cs" />
     <Compile Include="Server.cs" />
+    <!-- MCP：协议层 + 真的起一次 Kestrel 走一遍完整的 JSON-RPC 链路。 -->
+    <Compile Include="Mcp.cs" />
     <Compile Include="E2E.cs" />
     <!-- 要联网、要真密钥、花真 token，所以不进 all；见 Program.cs 的说明。 -->
     <Compile Include="Live.cs" />

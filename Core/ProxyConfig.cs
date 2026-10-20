@@ -521,6 +521,20 @@ public sealed class ProxyConfig
     /// </summary>
     public bool RequireToken { get; set; } = true;
 
+    // ---------------- MCP ----------------
+
+    /// <summary>
+    /// 是否在**同一个端口**上把工具暴露给 MCP 客户端（<c>POST /mcp</c>）。
+    ///
+    /// **默认开**：它暴露的就是代理本来已经通过工具注入提供的那几个工具，没有新增
+    /// 任何能力，而且走同一套令牌鉴权、来源过滤与内网拦截。关掉它的理由通常是
+    /// "我不想这个端口多一个入口"，而不是"它有危险"。
+    ///
+    /// 改动这个开关要重启代理才生效（路由是在 StartAsync 里注册的），
+    /// 与改端口/监听范围同一条纪律。
+    /// </summary>
+    public bool McpEnabled { get; set; } = true;
+
     // ---------------- 日志 ----------------
 
     /// <summary>

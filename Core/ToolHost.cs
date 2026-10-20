@@ -36,8 +36,13 @@ public sealed class ToolHost
     /// （<c>web_search</c> 要发 HTTP），而 C# 不允许 async 方法带 out 参数。
     /// <paramref name="Text"/> 是回灌给模型的文本，<paramref name="Summary"/>
     /// 是给人看的一行摘要（日志与界面）。
+    ///
+    /// <paramref name="Ok"/> 是"这次调用本身成没成功"，只有 MCP 那条路用得上
+    /// （它要回 <c>isError</c>）。**注入给模型的那条路刻意不看它**：模型读的是
+    /// Text，「查不到这个标签」和「这次查不了」的区别写在 Text 里，比一个布尔位
+    /// 表达得更清楚。
     /// </summary>
-    public sealed record ToolResult(string Text, string Summary);
+    public sealed record ToolResult(string Text, string Summary, bool Ok = true);
 
     /// <summary>
     /// 工具执行摘要的前缀，**Core 与回归共用的契约**。
@@ -73,7 +78,7 @@ public sealed class ToolHost
                 case ToolKind.Scan: return Scan(cfg, arguments);
                 case ToolKind.WebSearch: return await WebSearchAsync(cfg, arguments, ct).ConfigureAwait(false);
                 case ToolKind.WebFetch: return await WebFetchAsync(cfg, arguments, ct).ConfigureAwait(false);
-                default: return new ToolResult("Unknown tool.", "未知工具。");
+                default: return new ToolResult("Unknown tool.", "未知工具。", false);
             }
         }
         catch (Exception ex)
@@ -81,11 +86,11 @@ public sealed class ToolHost
             // 词库那边理论上不抛，但 113 MB 的数据 + 任意用户输入 + 一次外部 HTTP，
             // 兜底一层比让上游收到 500 强。
             ProxyLog.Write($"工具执行异常（{kind}）：{ex}");
-            return new ToolResult("工具执行失败：" + ex.Message, "工具执行失败：" + ex.Message);
+            return new ToolResult("工具执行失败：" + ex.Message, "工具执行失败：" + ex.Message, false);
         }
     }
 
-    private static ToolResult Fail(string text) => new(text, text);
+    private static ToolResult Fail(string text) => new(text, text, false);
 
     /// <summary>
     /// 取出并解析词库。不可用时返回 null，并且**把原因交给调用方**——

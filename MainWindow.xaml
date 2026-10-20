@@ -431,6 +431,30 @@
                     </StackPanel>
                 </Expander>
 
+                <!-- ===== MCP ===== -->
+                <Expander Header="MCP 服务" HorizontalAlignment="Stretch"
+                          HorizontalContentAlignment="Stretch">
+                    <StackPanel Spacing="10" Padding="4,10,4,4">
+                        <ToggleSwitch x:Name="McpEnabledSwitch"
+                                      Header="把工具通过 MCP 暴露出去（POST /mcp）"
+                                      OnContent="MCP 客户端连这个地址就能直接调工具"
+                                      OffContent="关闭：这个端点不存在" />
+                        <Grid ColumnSpacing="10">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0" x:Name="McpUrlText" Text=""
+                                       IsTextSelectionEnabled="True" VerticalAlignment="Center"
+                                       Opacity="0.85" />
+                            <Button Grid.Column="1" x:Name="CopyMcpUrlButton" Content="复制"
+                                    Click="CopyMcpUrl_Click" />
+                        </Grid>
+                        <TextBlock TextWrapping="Wrap" Opacity="0.7"
+                                   Text="客户端里填上面的地址；鉴权用代理令牌（Authorization: Bearer aip-…），没有令牌时这个端点和其他端点一样拒绝一切。工具与注入给模型的是同一套：词库三个，配好联网搜索 / 抓取后还会多出 web_search / web_fetch。改这个开关要重启代理才生效。" />
+                    </StackPanel>
+                </Expander>
+
                 <!-- ===== 令牌 ===== -->
                 <Expander Header="代理令牌" IsExpanded="True"
                           HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">

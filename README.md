@@ -73,6 +73,7 @@
 | `POST /v1/chat/completions` | 主端点。`stream=false` 与 `stream=true` **都**透明注入工具并本地执行；流式下正文增量实时转发（见下） |
 | `GET /v1/models` | **只列"启用站点的启用模型"**，另加模型名映射的键。站点若开了自动拉取且还没拉过，这一次会按需拉一次并记下时间。平台启动时拿它校验"我配的模型名存在吗"，所以少报一个会让平台判定配置非法、多报一个会让它选到用不了的模型 |
 | `/v1/**` 其它 | 原样透传（embeddings、completions……）。**刻意不逐个列端点**：OpenAI 兼容服务的端点集合一直在变，逐个列等于把自己焊死在一个快照上 |
+| `POST /mcp` | MCP 客户端入口：同一批工具走 JSON-RPC 2.0，同一套令牌。见「MCP 服务」。`GET`/`DELETE` 回 405；开关关掉时整个端点不存在（404） |
 
 ### 流式也注入工具（怎么做到不损首字延迟）
 
@@ -312,6 +313,63 @@ AnimaCaptioner 里 shim 的密钥是"可选"（有就发、没有就不发）。
   这一整套行为只有在真起了浏览器、真写了几百个文件的用户数据目录之后才成立 ——
   离线回归里的假浏览器没有目录、没有进程，一条都覆盖不到。
 
+## MCP 服务（`POST /mcp`）
+
+工具不只能"注入给模型"，还能**直接暴露给支持 MCP 的客户端**。同一个端口，
+同一批工具，同一套令牌。
+
+| 项 | 做法 |
+| --- | --- |
+| 端点 | `POST /mcp`（Streamable HTTP 的 JSON-RPC 子集） |
+| 为什么是 HTTP 不是 stdio | 这个程序本来就常驻托盘后台。stdio 要客户端每次拉起一个进程，于是每个客户端里都要写一条带词库路径的命令行，换词库要改五处，113 MB 的库还要在每个客户端进程里各载一份。HTTP 还白捡了已经做好的三件事：令牌鉴权、来源过滤、监听范围 |
+| 会话 | **无会话**（不发 `Mcp-Session-Id`）。工具调用本来无状态，硬造会话只会多一条"会话过期"的失败路径 |
+| 推送 | **不开 SSE**。`GET /mcp` 回 405。工具型服务器没有服务端主动消息，所以也不校验 `Accept` 里的 `text/event-stream`——多回一个 406 只会制造一种"看起来像我们坏了"的失败 |
+| 协议版本 | 客户端报的那个我们认得就**原样回**（它据此确认能按这个版本说话），认不得就回我们最新的 `2025-06-18` |
+| 鉴权 | 复用代理令牌（`Authorization: Bearer aip-…`）。没有令牌时与其他端点一样**拒绝一切** |
+| Origin | 带了 `Origin` 就必须是本机地址，否则 403；不带（本地客户端的常态）放行。这条挡的是 DNS rebinding 与网页 CSRF |
+| 工具集合 | 与注入给模型的**完全一致**，也就绪判据一致：词库三个常在，`web_search` 要配好后端、`web_fetch` 要抓取没关。**不做重名让路**（MCP 里没有"接入方自己的工具"这回事）|
+| 关掉开关 | 不注册路由，于是 `POST /mcp` 是 **404**——"没有这个端点"比"注册了但回 403"诚实 |
+
+客户端配置（Claude Desktop / Cursor / DSH 一类）：
+
+```json
+{
+  "mcpServers": {
+    "anima-tags": {
+      "type": "http",
+      "url": "http://127.0.0.1:8188/mcp",
+      "headers": { "Authorization": "Bearer aip-你签发的令牌" }
+    }
+  }
+}
+```
+
+### 三个只在真客户端下才暴露的细节
+
+1. **`initialize` 的 `instructions` 是唯一能保证模型读到的说明。** 工具自己的
+   description 也会下发，但客户端未必把它们全塞进上下文；"绝不凭记忆写标签名"
+   这条一旦没传到位，模型就会自信地编一个不存在的标签——比查不到更难发现。
+   所以它同时写在 `instructions` 和三个词库工具的 description 里。
+2. **通知不能有响应体。** `notifications/initialized` 回 `202` + 空体；写了 body，
+   客户端会把它当成一个"id 对不上的响应"而报错。同样地，`id` 的类型（数字/字符串）
+   必须原样回，客户端是按自己的 id 做匹配表的。
+3. **`isError` 只表示"这次调用失败"，不表示"没内容"。** 词库查不到某个标签是一次
+   **成功**的调用（结果里写着 `NOT FOUND`），与"词库不可用/搜索后端挂了"必须分开：
+   混成一个 `isError`，调用方会去重试一个本来就没有答案的查询。这条与注入路径上
+   "故障与空结果分开说"是同一个决定。
+
+### 怎么验
+
+- `proxycheck mcp`：**协议层**直接调 `McpEndpoint`（版本协商、封套错误码、id 类型、
+  通知无体、工具清单过滤、未知工具与缺参数），**传输层**真起一次 Kestrel
+  （401 / 405 + `Allow` / 403（Origin）/ 关掉开关后 404）。
+- **真实客户端实测**：用官方 `ModelContextProtocol` C# SDK（2.2.0）的
+  `HttpClientTransport` 连上来，`initialize` → `tools/list`（5 个工具）→
+  `tools/call danbooru_resolve_tag("白色连衣裙")` 返回
+  `FOUND / tag=white dress / cn=白色连衣裙 / category=general`。这一条验的正是
+  手写封套与真实客户端的兼容性——只对着自己的断言写协议，很容易写出一份
+  "自己能过、别人连不上"的实现。
+
 ## 多站点与模型路由
 
 配置里不再只有"一个上游"，而是**一组模型提供商站点**。只有**启用**的站点会被
@@ -369,6 +427,7 @@ AnimaCaptioner 里 shim 的密钥是"可选"（有就发、没有就不发）。
   - `ToolCallAssembler`（流式分片的 `tool_calls` 拼装） / `UpstreamClient`（按站点发请求）
   - `ProviderProfile` / `CustomHeaders` / `ModelCatalog`（多站点配置、请求头解析、模型聚合与路由）
   - `ProxyServer`（Kestrel 端点、令牌鉴权、来源过滤、SSE 出口）
+  - `McpEndpoint`（MCP 服务端：JSON-RPC 2.0 子集、版本协商、工具映射 —— 不含任何 HTTP 类型，所以回归能直接调协议层）
 - `Vendor/AnimaCaptioner/` —— 从 [AnimaCaptioner] 搬入的词库内核（零 WinUI / Windows API 引用）
 - `tests/` —— `net10.0` 纯 .NET 回归工程。它同时是一道**守卫**：Core/ 或 Vendor/ 一旦混进 WinUI 类型就编译不过（TFM 代际必须与应用的 `net10.0-windows…` 保持一致，见文末「构建取舍」）
 - `docs/` —— 上游复用面的技术勘察报告（LlmClient、VocabDb）
@@ -379,7 +438,7 @@ AnimaCaptioner 里 shim 的密钥是"可选"（有就发、没有就不发）。
 dotnet run --project tests\proxycheck.csproj all
 ```
 
-分段：`vocab` | `tools` | `loop` | `stream` | `merge` | `providers` | `search` | `pageread` | `tokens` | `log` | `server` | `e2e` | `all`
+分段：`vocab` | `tools` | `loop` | `stream` | `merge` | `providers` | `search` | `pageread` | `tokens` | `log` | `server` | `mcp` | `e2e` | `all`
 
 另有一条 `live`，**刻意不进 `all`**：它要联网、要一把真密钥、还会花掉真实 token。
 以及一条 `livepage`（真实网页抓取，两个引擎各跑一遍）：**要联网、要本机有 Edge，但不需要密钥**。
@@ -494,11 +553,13 @@ TFM 必须一起看：`tests/proxycheck.csproj` 是 `net10.0`（不带 `-windows
 **已完成**：词库内核 vendored、配置/密钥/日志/令牌、工具层、透明工具循环、上游客户端、
 Kestrel 端点与鉴权、**多模型提供商站点（增删改 / 切换默认 / 每站点自定义请求头）与
 按模型名的路由**、**联网搜索（`web_search`，五种后端）**、**网页获取（`web_fetch`，
-HTTP + Edge 双引擎自动降级 + 代理 + 可配的临时目录清理时间）**、WinUI 外壳（启停 /
-模型提供商 / 模型 / 工具注入 / 联网搜索 / 联网抓取 / 监听 / 令牌 / 词库 / 实时日志）、
+HTTP + Edge 双引擎自动降级 + 代理 + 可配的临时目录清理时间）**、**MCP 服务
+（`POST /mcp`，官方 C# SDK 实测连通）**、WinUI 外壳（启停 /
+模型提供商 / 模型 / 工具注入 / 联网搜索 / 联网抓取 / MCP / 监听 / 令牌 / 词库 / 实时日志）、
 托盘（菜单 + 左键 + 收托盘）、离线回归、端到端联调。
 
-回归现状：**809 项断言全过 / 0 失败**（含 113 MB 真实词库、一次真实 Kestrel 起停、
+回归现状：**872 项断言全过 / 0 失败**（其中 63 项来自新增的 `mcp` 段；
+含 113 MB 真实词库、两次真实 Kestrel 起停（`server` / `mcp` 各一次）、
 以及一次完整的「客户端 → 代理 → 桩上游」链路，非流式注入与流式分块透传都在内；
 多站点路由那一节用**两个桩站点**验证"请求真的只发到了该去的那个站点、
 另一个站点一个字节都没收到"；联网搜索那一节用**桩搜索后端**验证

@@ -16,6 +16,7 @@ namespace AnimaAIProxy.Tests;
 ///     proxycheck tokens     # 代理令牌与鉴权
 ///     proxycheck log        # 日志：摘要进界面面板，异常栈只进文件
 ///     proxycheck server     # HTTP 端点：真的起一次 Kestrel，走一遍路由与鉴权
+///     proxycheck mcp        # MCP：协议封套、工具清单过滤、鉴权/405/Origin，真起一次 Kestrel
 ///     proxycheck e2e        # 端到端：客户端 → 代理 → 桩上游，含流式分块到达
 ///     proxycheck all        # 上面全部（默认）
 ///
@@ -48,6 +49,7 @@ public static class Program
             case "tokens": Tokens.Run(); break;
             case "log": LogCheck.Run(); break;
             case "server": Server.Run(); break;
+            case "mcp": Mcp.Run(); break;
             case "e2e": E2E.Run(args); break;
             case "live": Live.Run(args); break;
             case "livepage": LivePage.Run(args); break;
@@ -63,11 +65,12 @@ public static class Program
                 Tokens.Run();
                 LogCheck.Run();
                 Server.Run();
+                Mcp.Run();
                 E2E.Run(args);
                 break;
             default:
                 Console.WriteLine("未知的检查项：" + which);
-                Console.WriteLine("可用：vocab | tools | loop | stream | merge | providers | search | pageread | tokens | log | server | e2e | all | live | livepage");
+                Console.WriteLine("可用：vocab | tools | loop | stream | merge | providers | search | pageread | tokens | log | server | mcp | e2e | all | live | livepage");
                 return 2;
         }
 
