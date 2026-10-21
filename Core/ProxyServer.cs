@@ -126,7 +126,10 @@ public sealed class ProxyServer : IAsyncDisposable
 
         builder.WebHost.ConfigureKestrel(o =>
         {
-            o.Listen(_cfg.ListenAddress, _cfg.Port);
+            // Any ⇒ 双栈监听（v4 + v6）。只绑 IPAddress.Any 的话 IPv6 客户端
+            // 根本连不上，名单里的 v6 条目就成了摆设。
+            if (_cfg.ListenAddress.Equals(System.Net.IPAddress.Any)) o.ListenAnyIP(_cfg.Port);
+            else o.Listen(_cfg.ListenAddress, _cfg.Port);
 
             // 带图请求的 base64 能轻松超过默认的 30 MB。agent 平台常常
             // 一次塞好几张图，卡在这里的表现是"上游说请求格式不对"，
@@ -162,6 +165,7 @@ public sealed class ProxyServer : IAsyncDisposable
     {
         "lan" => "局域网",
         "wan" => "任意来源",
+        "list" => "按 IP 名单",
         _ => "仅本机"
     };
 
@@ -208,9 +212,15 @@ public sealed class ProxyServer : IAsyncDisposable
     private bool Authorize(HttpContext ctx, out string token, out string reject)
         => HttpSecurity.Authorize(_cfg.RequireToken, _tokens, ctx, out token, out reject);
 
-    private async Task RejectAsync(HttpContext ctx, string message)
+    /// <summary>
+    /// 拒绝请求。**状态码由调用方给**：来源不在允许范围内是 403，令牌不对才是 401。
+    /// 早先两者都回 401，症状是"被名单/范围拦下来的请求，客户端以为是自己令牌错了"，
+    /// 于是它去重新认证、再撞一次墙。
+    /// </summary>
+    private async Task RejectAsync(HttpContext ctx, string message,
+                                   int status = StatusCodes.Status401Unauthorized)
     {
-        ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
+        ctx.Response.StatusCode = status;
         ctx.Response.ContentType = "application/json; charset=utf-8";
         var payload = new JsonObject
         {
@@ -229,7 +239,7 @@ public sealed class ProxyServer : IAsyncDisposable
     /// 只有 lan/wan 才需要它（local 时 Kestrel 只绑回环，外面根本连不上）。
     /// </summary>
     private bool RemoteAllowed(HttpContext ctx)
-        => HttpSecurity.RemoteAllowed(_cfg.BindScope, ctx);
+        => HttpSecurity.RemoteAllowed(_cfg, ctx);
 
     // ---------------- GET /health ----------------
 
@@ -284,7 +294,7 @@ public sealed class ProxyServer : IAsyncDisposable
         if (!RemoteAllowed(ctx))
         {
             ProxyLog.Write($"拒绝来自 {ctx.Connection.RemoteIpAddress} 的连接（监听 {ScopeText(_cfg.BindScope)}）");
-            await RejectAsync(ctx, "来源地址不在允许的范围内。").ConfigureAwait(false);
+            await RejectAsync(ctx, "来源地址不在允许的范围内。", StatusCodes.Status403Forbidden).ConfigureAwait(false);
             return;
         }
 
@@ -620,7 +630,7 @@ public sealed class ProxyServer : IAsyncDisposable
     {
         if (!RemoteAllowed(ctx))
         {
-            await RejectAsync(ctx, "来源地址不在允许的范围内。").ConfigureAwait(false);
+            await RejectAsync(ctx, "来源地址不在允许的范围内。", StatusCodes.Status403Forbidden).ConfigureAwait(false);
             return;
         }
 

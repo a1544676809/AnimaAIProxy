@@ -129,6 +129,10 @@ public sealed partial class MainWindow : Window
             LogBodiesSwitch.IsOn = _cfg.LogBodies;
             SelectScope(_cfg.BindScope);
 
+            IpListModeBox.SelectedIndex = _cfg.IpListMode == "allow" ? 1 : 0;
+            IpListBox.Text = string.Join(Environment.NewLine, _cfg.IpList);
+            RefreshIpListUi();
+
             McpEnabledSwitch.IsOn = _cfg.McpEnabled;
             McpPortBox.Value = _cfg.McpPort;
             McpRequireTokenSwitch.IsOn = _cfg.McpRequireToken;
@@ -193,6 +197,44 @@ public sealed partial class MainWindow : Window
     private static string SelectedScope(ComboBox box)
         => (box.SelectedItem as ComboBoxItem)?.Tag as string ?? "local";
 
+    // ---------------- IP 名单 ----------------
+
+    private void Scope_Changed(object sender, SelectionChangedEventArgs e) => RefreshIpListUi();
+
+    private void IpListMode_Changed(object sender, SelectionChangedEventArgs e)
+    {
+        if (_loading) return;
+        SaveFromUi();
+        RefreshIpListUi();
+    }
+
+    private void IpListText_Changed(object sender, TextChangedEventArgs e)
+    {
+        if (_loading) return;
+        SaveFromUi();
+        RefreshIpListUi();
+    }
+
+    /// <summary>
+    /// 名单面板只在"按 IP 名单"时露出来。一直可见的话，选了"仅本机"的人会以为名单
+    /// 在生效——而它压根没被读过。状态行也必须跟着刷新：空名单在黑/白两种模式下含义
+    /// 完全相反（不拦任何人 / 拒绝所有人），不说出来就会变成"代理莫名其妙坏了"。
+    /// </summary>
+    private void RefreshIpListUi()
+    {
+        if (IpListPanel is null) return;
+
+        var isList = SelectedScope(ScopeBox) == "list";
+        IpListPanel.Visibility = isList ? Visibility.Visible : Visibility.Collapsed;
+        if (!isList) return;
+
+        var mode = (IpListModeBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "deny";
+        var lines = (IpListBox.Text ?? "").Split('\n')
+                                          .Select(l => l.Trim())
+                                          .Where(l => l.Length > 0);
+        IpListStatusText.Text = ProxyConfig.IpListStatusFor(mode, lines);
+    }
+
     /// <summary>
     /// 把界面上的值收回配置对象。返回"需要重启服务才生效的东西变了没有"。
     ///
@@ -223,6 +265,11 @@ public sealed partial class MainWindow : Window
         _cfg.ApiEnabled = ApiEnabledSwitch.IsOn;
         _cfg.LogBodies = LogBodiesSwitch.IsOn;
         _cfg.BindScope = SelectedScope(ScopeBox);
+        _cfg.IpListMode = (IpListModeBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "deny";
+        _cfg.IpList = (IpListBox.Text ?? "").Split('\n')
+                                            .Select(l => l.Trim())
+                                            .Where(l => l.Length > 0)
+                                            .ToList();
 
         _cfg.McpEnabled = McpEnabledSwitch.IsOn;
         _cfg.McpPort = ToInt(McpPortBox.Value, _cfg.McpPort);

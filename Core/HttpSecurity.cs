@@ -14,8 +14,29 @@ namespace AnimaAIProxy.Core;
 internal static class HttpSecurity
 {
     /// <summary>
-    /// 来源过滤。只有 lan/wan 才需要它（local 时 Kestrel 只绑回环，
-    /// 外面根本连不上）。
+    /// 来源过滤（带 IP 名单）。转发 API 用它：<see cref="ProxyConfig.BindScope"/> 为
+    /// <c>list</c> 时按黑名单/白名单判定，其余情况落到下面那个按范围判定的重载。
+    /// </summary>
+    public static bool RemoteAllowed(ProxyConfig cfg, HttpContext ctx)
+    {
+        if (cfg.BindScope != "list") return RemoteAllowed(cfg.BindScope, ctx);
+
+        var ip = ctx.Connection.RemoteIpAddress;
+        if (ip is null) return false;
+
+        // 名单只在内存里解析一次也行，但配置很小（几十条），每次请求解析
+        // 换来的是"改了名单立刻生效"——不用重启、不用清缓存。
+        var list = cfg.ParseIpList(out _);
+        var hit = list.Contains(ip);
+
+        // 白名单空着 = 拒绝所有人（而不是"没配置就放行"）。这条语义与
+        // "没有令牌就拒绝一切"是同一条纪律：安全相关的空值一律取**更严**的那边。
+        return cfg.IpListMode == "allow" ? hit : !hit;
+    }
+
+    /// <summary>
+    /// 来源过滤（按范围）。只有 lan 才需要它（local 时 Kestrel 只绑回环，
+    /// 外面根本连不上；list 走上面那个重载）。
     ///
     /// lan 只放行私有网段：`BindScope=lan` 的语义是"给同一个局域网里的设备用"，
     /// 而不是"给任何能路由到本机的人用"。把公网地址也放进来，用户以为只是开了内网

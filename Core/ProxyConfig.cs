@@ -110,8 +110,57 @@ public sealed class ProxyConfig
     {
         "lan" => "lan",
         "wan" => "wan",
+        "list" => "list",
         _ => "local"
     };
+
+    // ---------------- IP 名单（BindScope = list 时生效） ----------------
+
+    /// <summary>
+    /// 名单模式：<c>deny</c> 黑名单（命中就拒绝）或 <c>allow</c> 白名单（只放行命中的）。
+    /// 只在 <see cref="BindScope"/> 为 <c>list</c> 时有意义。
+    /// </summary>
+    public string IpListMode { get; set; } = "deny";
+
+    public static string NormalizeIpListMode(string? value)
+        => string.Equals(value?.Trim(), "allow", StringComparison.OrdinalIgnoreCase) ? "allow" : "deny";
+
+    /// <summary>
+    /// 名单条目：一行一条，单地址或 CIDR 网段，v4/v6 都行；空行与 <c>#</c> 注释跳过。
+    /// 存**原文**而不是解析结果：解析规则将来还会长（比如加端口），而用户写的东西
+    /// 一旦被我们改写就再也看不懂自己当初写了什么。
+    /// </summary>
+    public List<string> IpList { get; set; } = new();
+
+    /// <summary>把名单解析成可匹配的对象，顺带取回写错的那些行。</summary>
+    public IpAccessList ParseIpList(out List<string> errors)
+        => IpAccessList.Parse(IpList, out errors);
+
+    /// <summary>
+    /// 名单状态的一句话，界面直接用。
+    ///
+    /// 空名单在两种模式下含义**完全不同**，必须说出来：黑名单空着等于不拦任何人，
+    /// 白名单空着等于拒绝所有人——后者会让人以为"代理坏了"。
+    /// </summary>
+    public string IpListStatus() => IpListStatusFor(IpListMode, IpList);
+
+    /// <summary>
+    /// 名单状态的一句话（界面与配置共用同一份措辞，免得界面上说"空名单会拒绝所有人"
+    /// 而实际行为相反——这种自相矛盾比不说话更糟）。
+    /// </summary>
+    public static string IpListStatusFor(string mode, IEnumerable<string>? entries)
+    {
+        var list = IpAccessList.Parse(entries, out var errors);
+        var allow = NormalizeIpListMode(mode) == "allow";
+
+        var head = list.Count == 0
+            ? (allow ? "白名单是空的：所有连接都会被拒绝。" : "黑名单是空的：不拦任何地址。")
+            : $"{(allow ? "白名单" : "黑名单")}共 {list.Count} 条";
+
+        return errors.Count == 0
+            ? head + "。"
+            : head + $"；有 {errors.Count} 条写错了，已忽略：" + string.Join("、", errors.Take(5));
+    }
 
     /// <summary>启动后是否立刻开始监听。关掉之后要用界面上的开关手动开。</summary>
     public bool AutoStart { get; set; } = true;
@@ -671,11 +720,16 @@ public sealed class ProxyConfig
     {
         if (Port is < 1024 or > 65535) Port = DefaultPort;
         BindScope = NormalizeScope(BindScope);
+        IpListMode = NormalizeIpListMode(IpListMode);
+        IpList ??= new List<string>();
 
         // MCP 是独立服务，端口自己也要合法；两个端口撞上会变成"先起的那个成功、
         // 后起的那个 bind 失败"，而日志里只有一行，很难和"手抖改错"区分开。
         if (McpPort is < 1024 or > 65535) McpPort = DefaultMcpPort;
-        McpBindScope = NormalizeScope(McpBindScope);
+        // MCP 页上没有"按名单"这个选项，所以手改配置写成 list 时收回 local：
+        // 否则界面上选中的是"仅本机"、实际行为却是按名单，而名单还看不到。
+        var mcpScope = NormalizeScope(McpBindScope);
+        McpBindScope = mcpScope == "list" ? "local" : mcpScope;
         McpTools ??= new Dictionary<string, bool>(StringComparer.Ordinal);
         if (McpPort == Port) McpPort = Port < 65535 ? Port + 1 : Port - 1;
 

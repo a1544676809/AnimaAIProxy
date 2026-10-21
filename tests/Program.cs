@@ -50,6 +50,7 @@ public static class Program
             case "log": LogCheck.Run(); break;
             case "server": Server.Run(); break;
             case "mcp": Mcp.Run(); break;
+            case "iplist": IpList.Run(); break;
             case "e2e": E2E.Run(args); break;
             case "live": Live.Run(args); break;
             case "livepage": LivePage.Run(args); break;
@@ -66,11 +67,12 @@ public static class Program
                 LogCheck.Run();
                 Server.Run();
                 Mcp.Run();
+                IpList.Run();
                 E2E.Run(args);
                 break;
             default:
                 Console.WriteLine("未知的检查项：" + which);
-                Console.WriteLine("可用：vocab | tools | loop | stream | merge | providers | search | pageread | tokens | log | server | mcp | e2e | all | live | livepage");
+                Console.WriteLine("可用：vocab | tools | loop | stream | merge | providers | search | pageread | tokens | log | server | mcp | iplist | e2e | all | live | livepage");
                 return 2;
         }
 

@@ -95,7 +95,8 @@ public sealed class McpServer : IAsyncDisposable
 
         builder.WebHost.ConfigureKestrel(o =>
         {
-            o.Listen(_cfg.McpListenAddress, _cfg.McpPort);
+            if (_cfg.McpListenAddress.Equals(System.Net.IPAddress.Any)) o.ListenAnyIP(_cfg.McpPort);
+            else o.Listen(_cfg.McpListenAddress, _cfg.McpPort);
             // MCP 的报文都很小，但 tools/call 的参数里可能带整段中文描述。
             o.Limits.MaxRequestBodySize = 8L * 1024 * 1024;
             o.Limits.KeepAliveTimeout = TimeSpan.FromMinutes(2);

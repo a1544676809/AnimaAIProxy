@@ -62,6 +62,8 @@
     <Compile Include="Server.cs" />
     <!-- MCP：协议层 + 真的起一次 Kestrel 走一遍完整的 JSON-RPC 链路。 -->
     <Compile Include="Mcp.cs" />
+    <!-- IP 名单：解析/匹配 + 真起 Kestrel 验黑/白两种模式。 -->
+    <Compile Include="IpList.cs" />
     <Compile Include="E2E.cs" />
     <!-- 要联网、要真密钥、花真 token，所以不进 all；见 Program.cs 的说明。 -->
     <Compile Include="Live.cs" />
