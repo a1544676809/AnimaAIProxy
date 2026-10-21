@@ -78,6 +78,17 @@ public sealed class ProxyConfig
         return null;
     }
 
+    // ---------------- 转发 API ----------------
+
+    /// <summary>
+    /// 是否启动**转发 API**（OpenAI 兼容那套端点）。
+    ///
+    /// 与 <see cref="McpEnabled"/> 是**两个独立的服务**：只做 MCP 的人可以把这里关掉，
+    /// 于是这个程序不占任何对外端口/也不碰上游；只想当纯代理的人可以把 MCP 关掉。
+    /// 关掉之后「启动」只起 MCP，界面上那个地址也就没有意义了。
+    /// </summary>
+    public bool ApiEnabled { get; set; } = true;
+
     // ---------------- 监听 ----------------
 
     /// <summary>
@@ -521,19 +532,47 @@ public sealed class ProxyConfig
     /// </summary>
     public bool RequireToken { get; set; } = true;
 
-    // ---------------- MCP ----------------
+    // ---------------- MCP（独立服务） ----------------
 
     /// <summary>
-    /// 是否在**同一个端口**上把工具暴露给 MCP 客户端（<c>POST /mcp</c>）。
+    /// 是否把工具作为 **MCP 服务**对外提供。
     ///
-    /// **默认开**：它暴露的就是代理本来已经通过工具注入提供的那几个工具，没有新增
-    /// 任何能力，而且走同一套令牌鉴权、来源过滤与内网拦截。关掉它的理由通常是
-    /// "我不想这个端口多一个入口"，而不是"它有危险"。
-    ///
-    /// 改动这个开关要重启代理才生效（路由是在 StartAsync 里注册的），
-    /// 与改端口/监听范围同一条纪律。
+    /// 与转发 API 彻底分开：**自己的端口、自己的绑定范围、自己的令牌要求、自己的启停**。
+    /// 不复用转发端口是刻意的 —— 两者面向的对象不同（一个面向 agent 平台，一个面向
+    /// MCP 客户端），把 MCP 表达成"转发 API 端口上的一个额外路径"会让"只想开其中
+    /// 一个"变成一连串的例外（关掉 /v1 但留着 /mcp，或者反过来）。分成两个服务之后，
+    /// 每个开关只影响它自己那一半。
     /// </summary>
     public bool McpEnabled { get; set; } = true;
+
+    /// <summary>MCP 监听端口。默认 48621，紧跟转发端口的 48620。</summary>
+    public int McpPort { get; set; } = DefaultMcpPort;
+
+    public const int DefaultMcpPort = DefaultPort + 1;
+
+    /// <summary>
+    /// MCP 的绑定范围，**独立于转发 API**。默认 local：工具是本地能力，
+    /// 没有理由跟着转发端口一起开放到网络。
+    /// </summary>
+    public string McpBindScope { get; set; } = "local";
+
+    /// <summary>MCP 是否要求令牌。默认要（与转发 API 同一套令牌库、同一枚令牌都认）。</summary>
+    public bool McpRequireToken { get; set; } = true;
+
+    /// <summary>
+    /// 逐工具的开关（键是工具名，值 false 表示不暴露）。
+    /// **缺省 = 暴露**：新加工具时不用改配置也不会静默消失；用户关掉哪个才写哪个。
+    /// 与"就绪判据"是乘的关系：搜索没配好时，即使这里勾着也不会出现。
+    /// </summary>
+    public Dictionary<string, bool> McpTools { get; set; } = new(StringComparer.Ordinal);
+
+    /// <summary>这个工具在配置里是不是允许暴露（没写过 = 允许）。</summary>
+    public bool McpToolAllowed(string name)
+        => !McpTools.TryGetValue(name, out var on) || on;
+
+    [JsonIgnore]
+    public System.Net.IPAddress McpListenAddress =>
+        McpBindScope == "local" ? System.Net.IPAddress.Loopback : System.Net.IPAddress.Any;
 
     // ---------------- 日志 ----------------
 
@@ -632,6 +671,14 @@ public sealed class ProxyConfig
     {
         if (Port is < 1024 or > 65535) Port = DefaultPort;
         BindScope = NormalizeScope(BindScope);
+
+        // MCP 是独立服务，端口自己也要合法；两个端口撞上会变成"先起的那个成功、
+        // 后起的那个 bind 失败"，而日志里只有一行，很难和"手抖改错"区分开。
+        if (McpPort is < 1024 or > 65535) McpPort = DefaultMcpPort;
+        McpBindScope = NormalizeScope(McpBindScope);
+        McpTools ??= new Dictionary<string, bool>(StringComparer.Ordinal);
+        if (McpPort == Port) McpPort = Port < 65535 ? Port + 1 : Port - 1;
+
         if (TimeoutSeconds < 5) TimeoutSeconds = 5;
         if (MaxToolRounds is < 1 or > 12) MaxToolRounds = 4;
         if (MaxToolCallsPerRequest is < 1 or > 64) MaxToolCallsPerRequest = 12;

@@ -90,12 +90,148 @@
         </Border>
 
         <!-- ================= 下面几块 ================= -->
-        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
-            <StackPanel Spacing="10">
+        <!-- ================= 左导航 + 右详情 =================
+             整个窗口就是设置，所以第一页是总览：先看"现在什么在跑、地址是什么"，
+             再往下才是各自的细节。 -->
+        <Grid Grid.Row="1" ColumnSpacing="12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="188" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+
+            <!-- 类别用 ListView 而不是 NavigationView：后者自带汉堡按钮、默认面板宽
+                 320 DIP，要收窄得跟它的模板较劲，而这里需要的只是"点一下换一页"。
+                 每项的 Tag 就是页面的键，和 code-behind 里 _pages 的键一一对应；
+                 对不上会被 MapPages 的自检抓出来写进日志。 -->
+            <Border Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                    BorderThickness="1" CornerRadius="8" Padding="4">
+                <ListView x:Name="PageList" SelectionMode="Single"
+                          SelectionChanged="PageList_SelectionChanged"
+                          Background="Transparent">
+                    <ListViewItem Tag="overview" AutomationProperties.Name="总览">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <FontIcon Glyph="&#xE80F;" FontSize="14" />
+                            <TextBlock Text="总览" />
+                        </StackPanel>
+                    </ListViewItem>
+                    <ListViewItem Tag="api" AutomationProperties.Name="转发 API">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <FontIcon Glyph="&#xE968;" FontSize="14" />
+                            <TextBlock Text="转发 API" />
+                        </StackPanel>
+                    </ListViewItem>
+                    <ListViewItem Tag="providers" AutomationProperties.Name="模型提供商">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <FontIcon Glyph="&#xE753;" FontSize="14" />
+                            <TextBlock Text="模型提供商" />
+                        </StackPanel>
+                    </ListViewItem>
+                    <ListViewItem Tag="models" AutomationProperties.Name="模型">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <FontIcon Glyph="&#xE8A9;" FontSize="14" />
+                            <TextBlock Text="模型" />
+                        </StackPanel>
+                    </ListViewItem>
+                    <ListViewItem Tag="tools" AutomationProperties.Name="工具注入">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <FontIcon Glyph="&#xE90F;" FontSize="14" />
+                            <TextBlock Text="工具注入" />
+                        </StackPanel>
+                    </ListViewItem>
+                    <ListViewItem Tag="mcp" AutomationProperties.Name="MCP 服务">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <FontIcon Glyph="&#xE943;" FontSize="14" />
+                            <TextBlock Text="MCP 服务" />
+                        </StackPanel>
+                    </ListViewItem>
+                    <ListViewItem Tag="search" AutomationProperties.Name="联网搜索">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <FontIcon Glyph="&#xE774;" FontSize="14" />
+                            <TextBlock Text="联网搜索" />
+                        </StackPanel>
+                    </ListViewItem>
+                    <ListViewItem Tag="fetch" AutomationProperties.Name="联网抓取">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <FontIcon Glyph="&#xE703;" FontSize="14" />
+                            <TextBlock Text="联网抓取" />
+                        </StackPanel>
+                    </ListViewItem>
+                    <ListViewItem Tag="tokens" AutomationProperties.Name="代理令牌">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <FontIcon Glyph="&#xE72E;" FontSize="14" />
+                            <TextBlock Text="代理令牌" />
+                        </StackPanel>
+                    </ListViewItem>
+                    <ListViewItem Tag="vocab" AutomationProperties.Name="词库">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <FontIcon Glyph="&#xE8F1;" FontSize="14" />
+                            <TextBlock Text="词库" />
+                        </StackPanel>
+                    </ListViewItem>
+                    <ListViewItem Tag="log" AutomationProperties.Name="实时日志">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <FontIcon Glyph="&#xE7C3;" FontSize="14" />
+                            <TextBlock Text="实时日志" />
+                        </StackPanel>
+                    </ListViewItem>
+                </ListView>
+            </Border>
+
+            <!-- 右栏。所有页常驻在这棵树里，切换只翻 Visibility——**不是**重建，
+                 这样各页控件的值在切来切去之间不会丢。
+
+                 PageHost 必须是 StackPanel，不能是 Grid：Grid 的单行是星号行，
+                 星号行会把自身高度钳到可用高度，于是父滚动器永远看不到"内容比视口高"，
+                 超出的部分既不滚动也不报错，直接裁掉。 -->
+            <ScrollViewer x:Name="ContentScroll" Grid.Column="1"
+                          VerticalScrollBarVisibility="Auto" VerticalScrollMode="Auto"
+                          HorizontalScrollBarVisibility="Disabled" HorizontalScrollMode="Disabled">
+                <StackPanel x:Name="PageHost" Spacing="10">
+
+                    <!-- ============ 总览 ============ -->
+                    <StackPanel x:Name="PageOverview" Spacing="12">
+                        <TextBlock Text="总览" FontSize="20" FontWeight="SemiBold" Margin="0,0,0,2"/>
+
+                        <Border Background="{ThemeResource CardBackgroundFillColorSecondaryBrush}"
+                                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                                BorderThickness="1" CornerRadius="8" Padding="14">
+                            <StackPanel Spacing="8">
+                                <TextBlock x:Name="OverviewStateText" Text="尚未启动"
+                                           FontSize="15" FontWeight="SemiBold"/>
+                                <TextBlock x:Name="OverviewDetailText" Opacity="0.7"
+                                           TextWrapping="Wrap" Text=""/>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- 两个服务并列显示，免得看起来像"MCP 是 Base URL 上的一个路径"。 -->
+                        <StackPanel Spacing="6">
+                            <TextBlock Text="转发 API（OpenAI 兼容）" FontWeight="SemiBold"/>
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <TextBlock x:Name="OverviewApiUrl" Text="—" IsTextSelectionEnabled="True"
+                                           FontFamily="Consolas" VerticalAlignment="Center"/>
+                                <Button Content="复制" Click="CopyOverviewApi_Click" Padding="8,2"/>
+                            </StackPanel>
+                            <TextBlock x:Name="OverviewApiState" Opacity="0.7" TextWrapping="Wrap" Text=""/>
+                        </StackPanel>
+
+                        <StackPanel Spacing="6">
+                            <TextBlock Text="MCP 服务" FontWeight="SemiBold"/>
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <TextBlock x:Name="OverviewMcpUrl" Text="—" IsTextSelectionEnabled="True"
+                                           FontFamily="Consolas" VerticalAlignment="Center"/>
+                                <Button Content="复制" Click="CopyOverviewMcp_Click" Padding="8,2"/>
+                            </StackPanel>
+                            <TextBlock x:Name="OverviewMcpState" Opacity="0.7" TextWrapping="Wrap" Text=""/>
+                        </StackPanel>
+
+                        <TextBlock Opacity="0.6" TextWrapping="Wrap" FontSize="12"
+                                   Text="两者各自有开关与端口（「转发 API」页与「MCP 服务」页），可以只开其中一个：只做 MCP 时把转发 API 关掉，这个程序就完全不碰上游。"/>
+                    </StackPanel>
 
                 <!-- ===== 模型提供商 ===== -->
-                <Expander Header="模型提供商" IsExpanded="True"
-                          HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                <StackPanel x:Name="PageProviders" Spacing="12">
+                    <TextBlock Text="模型提供商" FontSize="20" FontWeight="SemiBold" Margin="0,0,0,2"/>
                     <StackPanel Spacing="10" Padding="4,10,4,4">
                         <TextBlock x:Name="ProviderSummaryText" Opacity="0.7" TextWrapping="Wrap" Text="" />
 
@@ -161,11 +297,11 @@
                         <NumberBox x:Name="TimeoutBox" Header="请求超时（秒）"
                                    Minimum="5" Maximum="3600" SpinButtonPlacementMode="Compact" />
                     </StackPanel>
-                </Expander>
+                </StackPanel>
 
                 <!-- ===== 模型 ===== -->
-                <Expander Header="模型" IsExpanded="True"
-                          HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                <StackPanel x:Name="PageModels" Spacing="12">
+                    <TextBlock Text="模型" FontSize="20" FontWeight="SemiBold" Margin="0,0,0,2"/>
                     <StackPanel Spacing="10" Padding="4,10,4,4">
                         <TextBlock x:Name="ModelSummaryText" Opacity="0.7" TextWrapping="Wrap" Text="" />
 
@@ -225,11 +361,11 @@
                         <TextBox x:Name="ModelMapBox" AcceptsReturn="True" Height="80"
                                  FontFamily="Consolas" PlaceholderText="gpt-4o=deepseek-chat" />
                     </StackPanel>
-                </Expander>
+                </StackPanel>
 
                 <!-- ===== 工具注入 ===== -->
-                <Expander Header="工具注入" IsExpanded="True"
-                          HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                <StackPanel x:Name="PageTools" Spacing="12">
+                    <TextBlock Text="工具注入" FontSize="20" FontWeight="SemiBold" Margin="0,0,0,2"/>
                     <StackPanel Spacing="10" Padding="4,10,4,4">
                         <ToggleSwitch x:Name="ToolsEnabledSwitch"
                                       Header="启用工具注入"
@@ -256,11 +392,11 @@
                                        Minimum="1" Maximum="64" SpinButtonPlacementMode="Compact" />
                         </Grid>
                     </StackPanel>
-                </Expander>
+                </StackPanel>
 
                 <!-- ===== 联网搜索 ===== -->
-                <Expander Header="联网搜索" HorizontalAlignment="Stretch"
-                          HorizontalContentAlignment="Stretch">
+                <StackPanel x:Name="PageSearch" Spacing="12">
+                    <TextBlock Text="联网搜索" FontSize="20" FontWeight="SemiBold" Margin="0,0,0,2"/>
                     <StackPanel Spacing="10" Padding="4,10,4,4">
                         <ToggleSwitch x:Name="SearchEnabledSwitch"
                                       Header="给模型 web_search 工具"
@@ -314,11 +450,11 @@
                                     Click="TestSearch_Click" VerticalAlignment="Bottom" />
                         </Grid>
                     </StackPanel>
-                </Expander>
+                </StackPanel>
 
                 <!-- ===== 联网抓取 ===== -->
-                <Expander Header="联网抓取" HorizontalAlignment="Stretch"
-                          HorizontalContentAlignment="Stretch">
+                <StackPanel x:Name="PageFetch" Spacing="12">
+                    <TextBlock Text="联网抓取" FontSize="20" FontWeight="SemiBold" Margin="0,0,0,2"/>
                     <StackPanel Spacing="10" Padding="4,10,4,4">
                         <ToggleSwitch x:Name="FetchEnabledSwitch"
                                       Header="给模型 web_fetch 工具"
@@ -406,11 +542,17 @@
                                     Click="TestFetch_Click" VerticalAlignment="Bottom" />
                         </Grid>
                     </StackPanel>
-                </Expander>
+                </StackPanel>
 
                 <!-- ===== 监听 ===== -->
-                <Expander Header="监听" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                <StackPanel x:Name="PageApi" Spacing="12">
+                    <TextBlock Text="转发 API" FontSize="20" FontWeight="SemiBold" Margin="0,0,0,2"/>
                     <StackPanel Spacing="10" Padding="4,10,4,4">
+                        <ToggleSwitch x:Name="ApiEnabledSwitch"
+                                      Header="启用转发 API"
+                                      OnContent="对外提供 /v1/chat/completions 与 /v1/models"
+                                      OffContent="不启动这个服务（只做 MCP 时就这样）" />
+                        <TextBlock x:Name="ApiStatusText" Opacity="0.8" TextWrapping="Wrap" Text="" />
                         <NumberBox x:Name="PortBox" Header="端口（1024-65535）"
                                    Minimum="1024" Maximum="65535" SpinButtonPlacementMode="Compact" />
                         <ComboBox x:Name="ScopeBox" Header="允许连接的范围" HorizontalAlignment="Stretch">
@@ -429,16 +571,41 @@
                                       OnContent="对话内容会落盘"
                                       OffContent="只记摘要" />
                     </StackPanel>
-                </Expander>
+                </StackPanel>
 
                 <!-- ===== MCP ===== -->
-                <Expander Header="MCP 服务" HorizontalAlignment="Stretch"
-                          HorizontalContentAlignment="Stretch">
-                    <StackPanel Spacing="10" Padding="4,10,4,4">
+                                    <StackPanel x:Name="PageMcp" Spacing="12">
+                        <TextBlock Text="MCP 服务" FontSize="20" FontWeight="SemiBold" Margin="0,0,0,2"/>
+
+                        <TextBlock TextWrapping="Wrap" Opacity="0.7"
+                                   Text="MCP 是**独立服务**：自己的端口、自己的绑定范围、自己的令牌要求，与转发 API 分开启停。只做 MCP 时可以把转发 API 关掉。" />
+
                         <ToggleSwitch x:Name="McpEnabledSwitch"
-                                      Header="把工具通过 MCP 暴露出去（POST /mcp）"
-                                      OnContent="MCP 客户端连这个地址就能直接调工具"
-                                      OffContent="关闭：这个端点不存在" />
+                                      Header="启用 MCP 服务"
+                                      OnContent="启动时把工具通过 POST /mcp 提供出去"
+                                      OffContent="不启动这个服务" />
+                        <TextBlock x:Name="McpStatusText" Opacity="0.8" TextWrapping="Wrap" Text="" />
+
+                        <Grid ColumnSpacing="10">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <NumberBox Grid.Column="0" x:Name="McpPortBox" Header="端口（1024-65535）"
+                                       Minimum="1024" Maximum="65535" SpinButtonPlacementMode="Compact" />
+                            <ComboBox Grid.Column="1" x:Name="McpScopeBox" Header="允许连接的范围"
+                                      HorizontalAlignment="Stretch">
+                                <ComboBoxItem Content="仅本机（推荐）" Tag="local" />
+                                <ComboBoxItem Content="仅局域网（私有网段）" Tag="lan" />
+                                <ComboBoxItem Content="任意来源（不安全）" Tag="wan" />
+                            </ComboBox>
+                        </Grid>
+
+                        <ToggleSwitch x:Name="McpRequireTokenSwitch"
+                                      Header="要求客户端携带令牌"
+                                      OnContent="与转发 API 共用同一份令牌库、同一枚令牌都认"
+                                      OffContent="不鉴权（本机任何程序都能用这些工具）" />
+
                         <Grid ColumnSpacing="10">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*" />
@@ -446,18 +613,23 @@
                             </Grid.ColumnDefinitions>
                             <TextBlock Grid.Column="0" x:Name="McpUrlText" Text=""
                                        IsTextSelectionEnabled="True" VerticalAlignment="Center"
-                                       Opacity="0.85" />
+                                       FontFamily="Consolas" Opacity="0.85" />
                             <Button Grid.Column="1" x:Name="CopyMcpUrlButton" Content="复制"
                                     Click="CopyMcpUrl_Click" />
                         </Grid>
-                        <TextBlock TextWrapping="Wrap" Opacity="0.7"
-                                   Text="客户端里填上面的地址；鉴权用代理令牌（Authorization: Bearer aip-…），没有令牌时这个端点和其他端点一样拒绝一切。工具与注入给模型的是同一套：词库三个，配好联网搜索 / 抓取后还会多出 web_search / web_fetch。改这个开关要重启代理才生效。" />
-                    </StackPanel>
-                </Expander>
 
-                <!-- ===== 令牌 ===== -->
-                <Expander Header="代理令牌" IsExpanded="True"
-                          HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                        <TextBlock Text="对外暴露哪些工具" FontWeight="SemiBold" Margin="0,8,0,0" />
+                        <TextBlock TextWrapping="Wrap" Opacity="0.7" FontSize="12"
+                                   Text="只有勾选的工具会出现在 tools/list 里；没配好的（比如联网搜索还没选后端）即使勾着也不会出现——列表里会写明原因。" />
+                        <StackPanel x:Name="McpToolList" Spacing="6" />
+
+                        <TextBlock TextWrapping="Wrap" Opacity="0.6" FontSize="12" Margin="0,6,0,0"
+                                   Text="MCP 客户端里填上面的地址，鉴权用代理令牌（Authorization: Bearer aip-…）。关掉令牌要求时本机任何程序都能调这些工具，用完记得开回来。" />
+                    </StackPanel>
+
+<!-- ===== 令牌 ===== -->
+                <StackPanel x:Name="PageTokens" Spacing="12">
+                    <TextBlock Text="代理令牌" FontSize="20" FontWeight="SemiBold" Margin="0,0,0,2"/>
                     <StackPanel Spacing="10" Padding="4,10,4,4">
                         <Grid ColumnSpacing="10">
                             <Grid.ColumnDefinitions>
@@ -503,11 +675,11 @@
                             </ListView.ItemTemplate>
                         </ListView>
                     </StackPanel>
-                </Expander>
+                </StackPanel>
 
                 <!-- ===== 词库 ===== -->
-                <Expander Header="词库" IsExpanded="True"
-                          HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                <StackPanel x:Name="PageVocab" Spacing="12">
+                    <TextBlock Text="词库" FontSize="20" FontWeight="SemiBold" Margin="0,0,0,2"/>
                     <StackPanel Spacing="10" Padding="4,10,4,4">
                         <TextBlock x:Name="VocabStatusText" TextWrapping="Wrap" />
                         <TextBox x:Name="VocabPathBox" Header="vocab.sqlite 路径" />
@@ -523,11 +695,11 @@
                                        TextWrapping="Wrap" Opacity="0.7" VerticalAlignment="Center" />
                         </Grid>
                     </StackPanel>
-                </Expander>
+                </StackPanel>
 
                 <!-- ===== 日志 ===== -->
-                <Expander Header="实时日志" IsExpanded="True"
-                          HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                <StackPanel x:Name="PageLog" Spacing="12">
+                    <TextBlock Text="实时日志" FontSize="20" FontWeight="SemiBold" Margin="0,0,0,2"/>
                     <StackPanel Spacing="10" Padding="4,10,4,4">
                         <Grid ColumnSpacing="10">
                             <Grid.ColumnDefinitions>
@@ -545,9 +717,10 @@
                         <ListView x:Name="LogList" SelectionMode="None" MaxHeight="320"
                                   FontFamily="Consolas" FontSize="12" />
                     </StackPanel>
-                </Expander>
+                </StackPanel>
 
-            </StackPanel>
-        </ScrollViewer>
+                </StackPanel>
+            </ScrollViewer>
+        </Grid>
     </Grid>
 </Window>

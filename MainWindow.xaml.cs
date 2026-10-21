@@ -20,7 +20,25 @@ public sealed partial class MainWindow : Window
     private readonly ProxyConfig _cfg;
     private readonly TokenStore _tokens;
     private readonly VocabService _vocab = new();
+
+    /// <summary>转发 API 服务（OpenAI 兼容）。与 MCP 各自独立启停。</summary>
     private ProxyServer? _server;
+
+    /// <summary>MCP 服务：自己的端口、绑定范围、令牌要求，与转发 API 互不影响。</summary>
+    private McpServer? _mcp;
+
+    /// <summary>
+    /// 两个服务共用的搜索客户端与浏览器引擎。
+    ///
+    /// 分开各建一份的话，同时开着两个服务时会各起一个 headless Edge
+    /// （16–18 进程 / 420–530 MB），"跨请求复用 + 空闲自动关"就白设计了。
+    /// 注入进服务的那一份由这里持有，服务只关不释放（见两者的 DisposeAsync）。
+    /// </summary>
+    private readonly SearchClient _search = new();
+    private readonly PageReader _reader = new();
+
+    /// <summary>MCP 页上每个工具的勾选框（键是工具名）。</summary>
+    private readonly Dictionary<string, CheckBox> _mcpToolChecks = new(StringComparer.Ordinal);
 
     private readonly ObservableCollection<string> _logLines = new();
     private readonly ObservableCollection<TokenRow> _tokenRows = new();
@@ -65,6 +83,8 @@ public sealed partial class MainWindow : Window
         // 下拉框的选项从 Core 的档位表填进来（**单一来源**：界面不自己列一遍秒数）。
         InitCleanupOptions();
         LoadIntoUi();
+        MapPages();
+        SelectPage("overview");
         RefreshStatus();
 
         // 关窗口 = 收进托盘，**不是退出**。
@@ -80,7 +100,7 @@ public sealed partial class MainWindow : Window
             _ = WarmUpVocabAsync();
 
         if (_cfg.AutoStart)
-            _ = StartServerAsync();
+            _ = StartServersAsync();
     }
 
     /// <summary>用户明确点了托盘里的"退出"才会置位。</summary>
@@ -105,9 +125,15 @@ public sealed partial class MainWindow : Window
 
             PortBox.Value = _cfg.Port;
             RequireTokenSwitch.IsOn = _cfg.RequireToken;
-            McpEnabledSwitch.IsOn = _cfg.McpEnabled;
+            ApiEnabledSwitch.IsOn = _cfg.ApiEnabled;
             LogBodiesSwitch.IsOn = _cfg.LogBodies;
             SelectScope(_cfg.BindScope);
+
+            McpEnabledSwitch.IsOn = _cfg.McpEnabled;
+            McpPortBox.Value = _cfg.McpPort;
+            McpRequireTokenSwitch.IsOn = _cfg.McpRequireToken;
+            SelectMcpScope(_cfg.McpBindScope);
+            BuildMcpToolRows();
 
             VocabPathBox.Text = _cfg.VocabDbPath;
             SeedPathBox.Text = _cfg.SeedPath;
@@ -145,32 +171,43 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private void SelectScope(string scope)
+    private void SelectScope(string scope) => SelectScopeIn(ScopeBox, scope);
+
+    private void SelectMcpScope(string scope) => SelectScopeIn(McpScopeBox, scope);
+
+    /// <summary>按 Tag 选中下拉项（两个服务各有一个"允许连接的范围"）。</summary>
+    private static void SelectScopeIn(ComboBox box, string scope)
     {
-        for (var i = 0; i < ScopeBox.Items.Count; i++)
+        for (var i = 0; i < box.Items.Count; i++)
         {
-            if (ScopeBox.Items[i] is ComboBoxItem item &&
+            if (box.Items[i] is ComboBoxItem item &&
                 string.Equals(item.Tag as string, scope, StringComparison.Ordinal))
             {
-                ScopeBox.SelectedIndex = i;
+                box.SelectedIndex = i;
                 return;
             }
         }
-        ScopeBox.SelectedIndex = 0;
+        box.SelectedIndex = 0;
     }
 
+    private static string SelectedScope(ComboBox box)
+        => (box.SelectedItem as ComboBoxItem)?.Tag as string ?? "local";
+
     /// <summary>
-    /// 把界面上的值收回配置对象。返回"需要重启代理才生效的东西变了没有"。
+    /// 把界面上的值收回配置对象。返回"需要重启服务才生效的东西变了没有"。
     ///
-    /// 端口与监听范围要重启是因为 Kestrel 的监听在建服务时定死；MCP 开关同样，
-    /// 因为它的路由也是在 StartAsync 里注册的 —— 关掉之后那个端点**就不存在了**，
-    /// 而不是留一个永远回 403 的壳。
+    /// 端口、监听范围、以及两个服务的**启用开关**都要重启才生效：Kestrel 的监听在建
+    /// 服务时定死，而"关掉一个服务"是干脆不建它——不是留一个永远回 403 的壳。
     /// </summary>
     private bool SaveFromUi()
     {
         var oldPort = _cfg.Port;
         var oldScope = _cfg.BindScope;
-        var oldMcp = _cfg.McpEnabled;
+        var oldApiOn = _cfg.ApiEnabled;
+        var oldMcpOn = _cfg.McpEnabled;
+        var oldMcpPort = _cfg.McpPort;
+        var oldMcpScope = _cfg.McpBindScope;
+        var oldMcpToken = _cfg.McpRequireToken;
 
         _cfg.TimeoutSeconds = ToInt(TimeoutBox.Value, _cfg.TimeoutSeconds);
         _cfg.ModelMap = ParseModelMap(ModelMapBox.Text);
@@ -183,9 +220,16 @@ public sealed partial class MainWindow : Window
 
         _cfg.Port = ToInt(PortBox.Value, _cfg.Port);
         _cfg.RequireToken = RequireTokenSwitch.IsOn;
-        _cfg.McpEnabled = McpEnabledSwitch.IsOn;
+        _cfg.ApiEnabled = ApiEnabledSwitch.IsOn;
         _cfg.LogBodies = LogBodiesSwitch.IsOn;
-        _cfg.BindScope = (ScopeBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "local";
+        _cfg.BindScope = SelectedScope(ScopeBox);
+
+        _cfg.McpEnabled = McpEnabledSwitch.IsOn;
+        _cfg.McpPort = ToInt(McpPortBox.Value, _cfg.McpPort);
+        _cfg.McpBindScope = SelectedScope(McpScopeBox);
+        _cfg.McpRequireToken = McpRequireTokenSwitch.IsOn;
+        foreach (var (name, box) in _mcpToolChecks)
+            _cfg.McpTools[name] = box.IsChecked == true;
 
         _cfg.VocabDbPath = (VocabPathBox.Text ?? "").Trim();
         _cfg.SeedPath = (SeedPathBox.Text ?? "").Trim();
@@ -220,7 +264,11 @@ public sealed partial class MainWindow : Window
 
         return oldPort != _cfg.Port ||
                !string.Equals(oldScope, _cfg.BindScope, StringComparison.Ordinal) ||
-               oldMcp != _cfg.McpEnabled;
+               oldApiOn != _cfg.ApiEnabled ||
+               oldMcpOn != _cfg.McpEnabled ||
+               oldMcpPort != _cfg.McpPort ||
+               !string.Equals(oldMcpScope, _cfg.McpBindScope, StringComparison.Ordinal) ||
+               oldMcpToken != _cfg.McpRequireToken;
     }
 
     private static int ToInt(double v, int fallback) =>
@@ -251,24 +299,46 @@ public sealed partial class MainWindow : Window
         return map;
     }
 
-    // ---------------- 启停 ----------------
+    // ---------------- 启停（两个服务各自独立） ----------------
 
-    private async Task StartServerAsync()
+    private bool ApiRunning => _server?.IsRunning == true;
+
+    private bool McpRunning => _mcp?.IsRunning == true;
+
+    private bool AnyRunning => ApiRunning || McpRunning;
+
+    /// <summary>
+    /// 启动**已启用**的服务。两个开关是各自独立的：只做 MCP 时把转发 API 关掉，
+    /// 这个进程就完全不监听 /v1、也不碰上游。
+    /// </summary>
+    private async Task StartServersAsync()
     {
         SaveFromUi();
         RefreshStatus();
 
-        _server ??= new ProxyServer(_cfg, _tokens, _vocab);
+        ToggleButton.IsEnabled = false;
         try
         {
-            ToggleButton.IsEnabled = false;
-            await _server.StartAsync(CancellationToken.None);
+            if (_cfg.ApiEnabled)
+            {
+                _server ??= new ProxyServer(_cfg, _tokens, _vocab, _search, _reader);
+                await _server.StartAsync(CancellationToken.None);
+            }
+
+            if (_cfg.McpEnabled)
+            {
+                _mcp ??= new McpServer(_cfg, _tokens, _vocab, _search, _reader);
+                await _mcp.StartAsync(CancellationToken.None);
+            }
+
+            if (!_cfg.ApiEnabled && !_cfg.McpEnabled)
+                ProxyLog.Write("两个服务都被关掉了：没有可启动的东西");
         }
         catch (Exception ex)
         {
             ProxyLog.Write("启动失败：" + ex.Message);
             await ShowAsync("启动失败",
-                ex.Message + "\n\n端口被占用是最常见的原因，换一个端口再试。");
+                ex.Message + "\n\n端口被占用是最常见的原因（两个服务不能共用同一个端口），换一个端口再试。");
         }
         finally
         {
@@ -277,15 +347,13 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private async Task StopServerAsync()
+    private async Task StopServersAsync()
     {
-        var s = _server;
-        if (s is null) return;
-
+        ToggleButton.IsEnabled = false;
         try
         {
-            ToggleButton.IsEnabled = false;
-            await s.StopAsync();
+            if (ApiRunning) await _server!.StopAsync();
+            if (McpRunning) await _mcp!.StopAsync();
         }
         catch (Exception ex)
         {
@@ -300,8 +368,8 @@ public sealed partial class MainWindow : Window
 
     private async void Toggle_Click(object sender, RoutedEventArgs e)
     {
-        if (_server?.IsRunning == true) await StopServerAsync();
-        else await StartServerAsync();
+        if (AnyRunning) await StopServersAsync();
+        else await StartServersAsync();
     }
 
     private async void Save_Click(object sender, RoutedEventArgs e)
@@ -314,58 +382,76 @@ public sealed partial class MainWindow : Window
         RefreshStatus();
         RefreshVocabStatus();
 
-        if (needsRestart && _server?.IsRunning == true)
+        if (needsRestart && AnyRunning)
         {
-            ProxyLog.Write("监听参数变了，重启代理以生效");
-            await StopServerAsync();
-            await StartServerAsync();
+            ProxyLog.Write("服务参数变了，重启以生效");
+            await StopServersAsync();
+            await StartServersAsync();
         }
     }
 
     private void RefreshStatus()
     {
-        var running = _server?.IsRunning == true;
+        var apiOn = ApiRunning;
+        var mcpOn = McpRunning;
+        var any = apiOn || mcpOn;
 
         StatusDot.Fill = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources[
-            running ? "SystemFillColorSuccessBrush" : "SystemFillColorCriticalBrush"];
-        StatusText.Text = running ? "运行中" : "已停止";
+            any ? "SystemFillColorSuccessBrush" : "SystemFillColorCriticalBrush"];
+        StatusText.Text = any ? "运行中" : "已停止";
 
-        BaseUrlText.Text = _server is null
-            ? $"http://127.0.0.1:{_cfg.Port}/v1"
-            : _server.BaseUrl;
+        // 地址与运行状态无关地显示：服务停着的时候用户照样要把地址抄进客户端配置，
+        // 而"没运行就不显示"会让他以为这个功能不存在。
+        var apiUrl = _server?.BaseUrl ?? $"http://127.0.0.1:{_cfg.Port}/v1";
+        var mcpUrl = _mcp?.ClientUrl ?? $"http://127.0.0.1:{_cfg.McpPort}/mcp";
+        BaseUrlText.Text = apiUrl;
+        McpUrlText.Text = mcpUrl;
+        OverviewApiUrl.Text = apiUrl;
+        OverviewMcpUrl.Text = mcpUrl;
 
-        // MCP 地址与服务状态无关地显示：代理停着的时候用户照样要把地址抄进
-        // 客户端配置里，而"没运行就不显示"会让他以为这个功能不存在。
-        McpUrlText.Text = _server is null
-            ? $"http://127.0.0.1:{_cfg.Port}/mcp"
-            : _server.McpUrl;
+        var apiState = !_cfg.ApiEnabled ? "已关闭（不监听端口，也不碰上游）"
+            : apiOn ? "运行中 · 监听 " + ScopeWord(_cfg.BindScope)
+            : "已启用，尚未启动";
+        var mcpState = !_cfg.McpEnabled ? "已关闭"
+            : mcpOn ? $"运行中 · 监听 {ScopeWord(_cfg.McpBindScope)} · 对外 {(_mcp?.ToolNames.Count ?? 0)} 个工具"
+            : "已启用，尚未启动";
+        ApiStatusText.Text = apiState;
+        OverviewApiState.Text = apiState;
+        McpStatusText.Text = mcpState;
+        OverviewMcpState.Text = mcpState;
 
-        if (running)
-        {
-            HintText.Text = _cfg.BindScope switch
-            {
-                "local" => "把平台的 OpenAI Base URL 填成上面这个地址，API Key 填代理令牌。仅本机可访问。",
-                "lan" => "把平台的 OpenAI Base URL 填成上面这个地址（127.0.0.1 换成本机 IP），API Key 填代理令牌。",
-                _ => "把平台的 OpenAI Base URL 填成上面这个地址，API Key 填代理令牌。当前允许任意来源连接。"
-            };
-        }
-        else
-        {
-            HintText.Text = "启动后把上面这个地址填进 agent 平台的 OpenAI Base URL。";
-        }
+        OverviewStateText.Text = any
+            ? $"转发 API：{(apiOn ? "运行中" : "未运行")}　·　MCP：{(mcpOn ? "运行中" : "未运行")}"
+            : "已停止";
+        OverviewDetailText.Text = $"令牌 {_tokens.EnabledCount} 枚 · " +
+                                 $"词库{(_vocab.IsLoaded ? "已载入" : "未载入")} · " +
+                                 $"端口 {_cfg.Port}（转发）/ {_cfg.McpPort}（MCP）";
 
-        UptimeText.Text = running && _server is not null && _server.StartedAtText.Length > 0
+        HintText.Text = any
+            ? "两个服务互不影响：只做 MCP 时可以关掉转发 API。"
+            : "启动后可用「总览」页里的两个地址分别接平台与 MCP 客户端。";
+
+        UptimeText.Text = apiOn && _server is not null && _server.StartedAtText.Length > 0
             ? "启动于 " + _server.StartedAtText
-            : "";
+            : mcpOn && _mcp is not null && _mcp.StartedAtText.Length > 0
+                ? "启动于 " + _mcp.StartedAtText
+                : "";
 
-        ToggleButton.Content = running ? "停止代理" : "启动代理";
+        ToggleButton.Content = any ? "停止服务" : "启动服务";
         PortBox.IsEnabled = true;
 
         // 托盘提示：用户把窗口收起来之后，唯一能看到状态的地方就是这里。
-        Tray.ToolTipText = running
-            ? $"AnimaAIProxy 运行中 — {_server!.BaseUrl}"
+        Tray.ToolTipText = any
+            ? "AnimaAIProxy 运行中" + (apiOn ? " — " + apiUrl : "") + (mcpOn ? " — " + mcpUrl : "")
             : "AnimaAIProxy 已停止（右键启动）";
     }
+
+    private static string ScopeWord(string scope) => scope switch
+    {
+        "lan" => "局域网",
+        "wan" => "任意来源",
+        _ => "仅本机"
+    };
 
     private void CopyBaseUrl_Click(object sender, RoutedEventArgs e)
     {
@@ -1444,12 +1530,12 @@ public sealed partial class MainWindow : Window
 
     private void TrayStart()
     {
-        if (!IsRunning) _ = StartServerAsync();   // 已有的判断放在动作里，不用 CanExecute（见 RelayCommand）
+        if (!AnyRunning) _ = StartServersAsync();   // 已有的判断放在动作里，不用 CanExecute（见 RelayCommand）
     }
 
     private void TrayStop()
     {
-        if (IsRunning) _ = StopServerAsync();
+        if (AnyRunning) _ = StopServersAsync();
     }
 
     /// <summary>
@@ -1467,6 +1553,11 @@ public sealed partial class MainWindow : Window
         try
         {
             if (_server is not null) await _server.DisposeAsync();
+            if (_mcp is not null) await _mcp.DisposeAsync();
+            // 两个服务都是"注入型"的（不持有搜索客户端与浏览器引擎），
+            // 那两个资源要在这里收尾。
+            _search.Dispose();
+            _reader.Dispose();
         }
         catch { /* 退出路径上不抛 */ }
 
@@ -1489,7 +1580,7 @@ public sealed partial class MainWindow : Window
             $"代理{(IsRunning ? "仍在" : "未")}运行。要彻底退出，右键托盘图标选「退出」。");
     }
 
-    private bool IsRunning => _server?.IsRunning == true;
+    private bool IsRunning => AnyRunning;
 
     /// <summary>
     /// 把窗口叫回来。
@@ -1513,6 +1604,180 @@ public sealed partial class MainWindow : Window
     }
 
     // ---------------- 收尾 ----------------
+
+    // ---------------- 左导航（整窗就是设置） ----------------
+
+    /// <summary>左栏类别键 → 右栏页面。</summary>
+    private readonly Dictionary<string, FrameworkElement> _pages = new(StringComparer.Ordinal);
+
+    /// <summary>离开某页时的滚动位置，回来时恢复：切类别不该把我滚回页首。</summary>
+    private readonly Dictionary<string, double> _pageOffsets = new(StringComparer.Ordinal);
+
+    private string? _currentPage;
+
+    /// <summary>
+    /// 把左栏的类别项和右栏页面配起来，并自检两边一致。
+    ///
+    /// 自检不是装饰：漏挂一页的后果是那一整页设置在界面上**永远打不开**——控件还在、
+    /// 值照样会被保存，但用户看不见也改不了。这属于不会崩、只会静默少东西的那类错。
+    /// </summary>
+    private void MapPages()
+    {
+        _pages["overview"] = PageOverview;
+        _pages["api"] = PageApi;
+        _pages["providers"] = PageProviders;
+        _pages["models"] = PageModels;
+        _pages["tools"] = PageTools;
+        _pages["mcp"] = PageMcp;
+        _pages["search"] = PageSearch;
+        _pages["fetch"] = PageFetch;
+        _pages["tokens"] = PageTokens;
+        _pages["vocab"] = PageVocab;
+        _pages["log"] = PageLog;
+
+        var items = PageList.Items.OfType<ListViewItem>().ToList();
+        foreach (var item in items)
+            if (!_pages.ContainsKey((item.Tag as string) ?? ""))
+                ProxyLog.Write("!! 左栏有一项没配页面：" + item.Tag);
+
+        foreach (var key in _pages.Keys)
+            if (!items.Any(i => (i.Tag as string) == key))
+                ProxyLog.Write("!! 页面没有左栏入口：" + key);
+
+        var notPages = PageHost.Children.OfType<FrameworkElement>()
+            .Where(c => !_pages.ContainsValue(c)).ToList();
+        if (notPages.Count > 0)
+            ProxyLog.Write("!! PageHost 里有非页面元素：" +
+                string.Join("、", notPages.Select(c => c.GetType().Name)));
+    }
+
+    private void PageList_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (PageList.SelectedItem is ListViewItem item && item.Tag is string key) ShowPage(key);
+    }
+
+    private void SelectPage(string key)
+    {
+        foreach (var item in PageList.Items.OfType<ListViewItem>())
+            if (string.Equals(item.Tag as string, key, StringComparison.Ordinal))
+            {
+                PageList.SelectedItem = item;
+                return;
+            }
+        PageList.SelectedIndex = 0;
+    }
+
+    private void ShowPage(string key)
+    {
+        if (!_pages.TryGetValue(key, out var panel)) return;
+
+        if (_currentPage is not null) _pageOffsets[_currentPage] = ContentScroll.VerticalOffset;
+
+        foreach (var kv in _pages)
+            kv.Value.Visibility = kv.Key == key ? Visibility.Visible : Visibility.Collapsed;
+        _currentPage = key;
+
+        // 自检：任何时刻有且只有一页可见。两页同时可见在 StackPanel 里会**堆叠**
+        // （不像 Grid 那样重叠），眼睛看得见；一页都不显示则是整片空白。
+        var visible = _pages.Count(kv => kv.Value.Visibility == Visibility.Visible);
+        if (visible != 1)
+            ProxyLog.Write($"!! 同时显示了 {visible} 页（应为 1）");
+
+        // 还原滚动位置必须等这一页重新布局完：折叠的面板宽度是 0，紧接着调
+        // ChangeView 会被夹到 0（extent 还没长出来）。推后一拍才是最终状态。
+        var want = _pageOffsets.TryGetValue(key, out var off) ? off : 0;
+        DispatcherQueue.TryEnqueue(() => ContentScroll.ChangeView(null, want, null, true));
+    }
+
+    // ---------------- MCP：逐工具勾选 ----------------
+
+    private TextBlock? _mcpToolSummary;
+
+    /// <summary>
+    /// MCP 页的工具清单。用**五个工具的全集**而不是当前就绪的集合：用户需要看到
+    /// "web_search 在这儿，但还没配后端"，否则他只会看到一个莫名少了一项的列表，
+    /// 而"为什么少了"要翻三个文件才能答上来。
+    /// </summary>
+    private void BuildMcpToolRows()
+    {
+        if (McpToolList is null) return;
+
+        McpToolList.Children.Clear();
+        _mcpToolChecks.Clear();
+
+        var all = ToolCatalog.Plan(Array.Empty<string>(), withWebSearch: true, withWebFetch: true);
+        foreach (var decl in all.Tools)
+        {
+            var why = decl.Name switch
+            {
+                ToolCatalog.WebSearchName when !_cfg.SearchReady => "未就绪：" + _cfg.SearchProblem,
+                ToolCatalog.WebFetchName when !_cfg.FetchReady => "未就绪：" + _cfg.FetchProblem,
+                _ => ""
+            };
+
+            var row = new StackPanel { Spacing = 0 };
+            var box = new CheckBox
+            {
+                Content = decl.Name,
+                IsChecked = _cfg.McpToolAllowed(decl.Name),
+                Margin = new Thickness(0, 2, 0, 0)
+            };
+            // 又一条"Click 而不是 Checked/Unchecked"：重建列表时程序化改值不该被当成用户操作。
+            box.Click += McpTool_Changed;
+            _mcpToolChecks[decl.Name] = box;
+            row.Children.Add(box);
+
+            if (why.Length > 0)
+                row.Children.Add(new TextBlock
+                {
+                    Text = why,
+                    Opacity = 0.6,
+                    FontSize = 12,
+                    TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(28, 0, 0, 4)
+                });
+
+            McpToolList.Children.Add(row);
+        }
+
+        _mcpToolSummary = new TextBlock
+        {
+            Opacity = 0.7,
+            FontSize = 12,
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(0, 6, 0, 0),
+            Text = McpToolSummaryText()
+        };
+        McpToolList.Children.Add(_mcpToolSummary);
+    }
+
+    private string McpToolSummaryText()
+    {
+        var shown = McpEndpoint.PlanFor(_cfg).Tools.Count;
+        var ticked = _mcpToolChecks.Count(kv => kv.Value.IsChecked == true);
+        return $"当前对外 {shown} 个工具（勾选 {ticked} 个，其中未就绪的不会出现）。";
+    }
+
+    private void McpTool_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_loading) return;
+        SaveFromUi();
+        if (_mcpToolSummary is not null) _mcpToolSummary.Text = McpToolSummaryText();
+        RefreshStatus();
+    }
+
+    // ---------------- 总览页的复制 ----------------
+
+    private void CopyOverviewApi_Click(object sender, RoutedEventArgs e) => CopyToClipboard(OverviewApiUrl.Text);
+
+    private void CopyOverviewMcp_Click(object sender, RoutedEventArgs e) => CopyToClipboard(OverviewMcpUrl.Text);
+
+    private static void CopyToClipboard(string text)
+    {
+        var dp = new Windows.ApplicationModel.DataTransfer.DataPackage();
+        dp.SetText(text ?? "");
+        Windows.ApplicationModel.DataTransfer.Clipboard.SetContent(dp);
+    }
 
     private async Task ShowAsync(string title, string message)
     {

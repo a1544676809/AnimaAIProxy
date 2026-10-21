@@ -206,9 +206,29 @@ public sealed class McpEndpoint
     /// <summary>
     /// 本次对外提供的工具集。**不传 taken**：MCP 里不存在"接入方自己的工具"，
     /// 所以重名让路这条规则在这里没有意义（让路只会把名字搞难看）。
+    ///
+    /// 两个过滤条件**相乘**：
+    ///   * 就绪判据（<see cref="ProxyConfig.SearchReady"/> / <see cref="ProxyConfig.FetchReady"/>）——
+    ///     没配好后端就不列，列一个必然失败的工具有害；
+    ///   * 逐工具开关（<see cref="ProxyConfig.McpToolAllowed"/>）——用户在 MCP 页上勾掉的。
     /// </summary>
     public static InjectionPlan PlanFor(ProxyConfig cfg)
-        => ToolCatalog.Plan(Array.Empty<string>(), cfg.SearchReady, cfg.FetchReady);
+    {
+        var plan = ToolCatalog.Plan(Array.Empty<string>(), cfg.SearchReady, cfg.FetchReady);
+
+        var decls = new List<ToolDecl>(plan.Tools.Count);
+        var kinds = new Dictionary<string, ToolKind>(StringComparer.Ordinal);
+        foreach (var decl in plan.Tools)
+        {
+            if (!cfg.McpToolAllowed(decl.Name)) continue;
+            decls.Add(decl);
+            // Kinds 必须一起过滤：tools/call 靠它派发。留着被关掉的工具名会让
+            // "已经关掉的工具"仍然可调（只是不出现在清单里）——那是最糟的一种不一致。
+            if (plan.KindOf(decl.Name) is { } kind) kinds[decl.Name] = kind;
+        }
+
+        return decls.Count == plan.Tools.Count ? plan : new InjectionPlan(decls, kinds);
+    }
 
     /// <summary>MCP 的 <c>tools[]</c>：名字、说明、JSON Schema 三件套。</summary>
     public static JsonArray ToolList(ProxyConfig cfg)

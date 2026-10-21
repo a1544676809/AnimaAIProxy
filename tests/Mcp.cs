@@ -26,7 +26,7 @@ public static class Mcp
         Harness.Section("MCP 协议层（不起 HTTP）");
         Protocol();
 
-        Harness.Section("MCP 传输层（真的起一次 Kestrel）");
+        Harness.Section("MCP 传输层：独立服务（与转发 API 分开）");
         Http();
     }
 
@@ -231,7 +231,7 @@ public static class Mcp
         }
     }
 
-    // ---------------- 传输层 ----------------
+    // ---------------- 传输层：独立服务（不依赖转发 API） ----------------
 
     private static int FreePort()
     {
@@ -261,12 +261,28 @@ public static class Mcp
                               resp.Content.Headers.ContentType?.MediaType ?? "");
     }
 
+    private static int GetStatus(HttpClient http, string url)
+    {
+        using var resp = http.GetAsync(url).GetAwaiter().GetResult();
+        return (int)resp.StatusCode;
+    }
+
     private const string InitializeBody =
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{" +
         "\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"回归\"}}}";
 
     private const string ListToolsBody = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}";
 
+    private static int ToolCount(HttpClient http, string url, string token)
+    {
+        var r = Post(http, url, ListToolsBody, token);
+        return (ChatWire.TryParseObject(r.Text)?["result"]?["tools"] as JsonArray)?.Count ?? -1;
+    }
+
+    /// <summary>
+    /// 传输层：真的起一次 MCP 服务，验鉴权、方法限制、Origin、逐工具开关，
+    /// 以及**它和转发 API 是两个服务**这件事——互相的路径都不认识。
+    /// </summary>
     private static void Http()
     {
         var tmpDir = Path.Combine(Path.GetTempPath(), "aip-mcpcheck-" + Guid.NewGuid().ToString("N")[..8]);
@@ -280,125 +296,138 @@ public static class Mcp
         var cfg = new ProxyConfig
         {
             Port = FreePort(),
+            McpPort = FreePort(),
             BindScope = "local",
+            McpBindScope = "local",
             RequireToken = true,
-            ToolsEnabled = true,
+            McpRequireToken = true,
             McpEnabled = true,
+            ToolsEnabled = true,
             TimeoutSeconds = 5,
             VocabDbPath = Path.Combine(tmpDir, "no-such-vocab.sqlite"),
             SeedPath = Path.Combine(tmpDir, "no-such-seed.json")
         };
         cfg.Normalize();
 
+        Harness.True("两个服务默认用不同端口（撞了 Normalize 会让开）", cfg.Port != cfg.McpPort);
+
         var tokens = new TokenStore();
         tokens.Tokens.Add(TokenStore.Create("回归用", "mcp", out var good));
-        var server = new ProxyServer(cfg, tokens, new VocabService());
-        var baseUrl = $"http://127.0.0.1:{cfg.Port}";
+
+        // 同一个 TokenStore 注入两个服务：一枚令牌两边都认，这是刻意的
+        // （用户只需要管一份令牌），但端口/绑定/启停是各自独立的。
+        var mcp = new McpServer(cfg, tokens, new VocabService());
+        var api = new ProxyServer(cfg, tokens, new VocabService());
+
+        var mcpBase = $"http://127.0.0.1:{cfg.McpPort}";
+        var apiBase = $"http://127.0.0.1:{cfg.Port}";
         using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
 
         try
         {
-            server.StartAsync(CancellationToken.None).GetAwaiter().GetResult();
-
-            Harness.Eq("McpUrl 指向 /mcp", server.McpUrl, baseUrl + "/mcp");
+            // ---------- MCP 单独起来（转发 API 还停着） ----------
+            mcp.StartAsync(CancellationToken.None).GetAwaiter().GetResult();
+            Harness.True("MCP 单独就能起来（转发 API 没起）", mcp.IsRunning);
+            Harness.Eq("客户端地址用的是 MCP 自己的端口",
+                       mcp.ClientUrl, mcpBase + "/mcp");
 
             // ---------- 鉴权 ----------
-            var noToken = Post(http, baseUrl + "/mcp", InitializeBody, null);
+            var noToken = Post(http, mcpBase + "/mcp", InitializeBody, null);
             Harness.Eq("没有令牌 → 401", noToken.Status, 401);
-            Harness.True("401 体是 JSON-RPC 形状（给 MCP 客户端看的东西）",
+            Harness.True("401 体是 JSON-RPC 形状（MCP 客户端按它解析）",
                          ChatWire.TryParseObject(noToken.Text)?["error"] is JsonObject);
 
-            var badToken = Post(http, baseUrl + "/mcp", InitializeBody, "aip-wrong");
+            var badToken = Post(http, mcpBase + "/mcp", InitializeBody, "aip-wrong");
             Harness.Eq("错令牌 → 401", badToken.Status, 401);
 
             // ---------- 正常链路 ----------
-            var ok = Post(http, baseUrl + "/mcp", InitializeBody, good);
+            var ok = Post(http, mcpBase + "/mcp", InitializeBody, good);
             Harness.Eq("带令牌 initialize → 200", ok.Status, 200);
-            var json = ChatWire.TryParseObject(ok.Text);
             Harness.Eq("initialize 回的是协商后的版本",
-                       ChatWire.GetString(json?["result"] as JsonObject, "protocolVersion"), "2025-06-18");
-            Harness.True("响应 content-type 是 application/json",
+                       ChatWire.GetString(ChatWire.TryParseObject(ok.Text)?["result"] as JsonObject,
+                                          "protocolVersion"), "2025-06-18");
+            Harness.True("content-type 是 application/json",
                          ok.ContentType.StartsWith("application/json", StringComparison.OrdinalIgnoreCase));
 
-            var list = Post(http, baseUrl + "/mcp", ListToolsBody, good);
-            var tools = ChatWire.TryParseObject(list.Text)?["result"]?["tools"] as JsonArray;
-            Harness.Eq("tools/list 真的回来了 4 个工具", tools?.Count, 4);
+            Harness.Eq("tools/list 4 个工具（词库三个 + web_fetch）",
+                       ToolCount(http, mcpBase + "/mcp", good), 4);
 
-            var call = Post(http, baseUrl + "/mcp",
+            var call = Post(http, mcpBase + "/mcp",
                 "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{" +
                 "\"name\":\"danbooru_scan_text\",\"arguments\":{\"text\":\"一个女孩在笑\"}}}", good);
-            var callJson = ChatWire.TryParseObject(call.Text)?["result"] as JsonObject;
-            Harness.True("tools/call 有 content 数组", callJson?["content"] is JsonArray);
+            Harness.True("tools/call 有 content 数组",
+                         (ChatWire.TryParseObject(call.Text)?["result"] as JsonObject)?["content"] is JsonArray);
 
             // ---------- 通知：202 且没有体 ----------
-            var note = Post(http, baseUrl + "/mcp",
+            var note = Post(http, mcpBase + "/mcp",
                 "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}", good);
             Harness.Eq("通知 → 202", note.Status, 202);
             Harness.Eq("通知没有响应体", note.Text.Length, 0);
 
             // ---------- 方法限制 ----------
-            using (var get = http.SendAsync(new HttpRequestMessage(HttpMethod.Get, baseUrl + "/mcp"))
+            using (var get = http.SendAsync(new HttpRequestMessage(HttpMethod.Get, mcpBase + "/mcp"))
                                .GetAwaiter().GetResult())
             {
-                Harness.Eq("GET /mcp → 405（我们没有 SSE 流）", (int)get.StatusCode, 405);
-                Harness.True("405 带 Allow: POST（告诉客户端这里有别的什么）",
-                             string.Join(",", get.Content.Headers.Allow).Contains("POST",
-                                 StringComparison.OrdinalIgnoreCase));
+                Harness.Eq("GET /mcp → 405（没有 SSE 流）", (int)get.StatusCode, 405);
+                Harness.True("405 带 Allow: POST",
+                             string.Join(",", get.Content.Headers.Allow)
+                                   .Contains("POST", StringComparison.OrdinalIgnoreCase));
             }
-
-            using (var del = http.SendAsync(new HttpRequestMessage(HttpMethod.Delete, baseUrl + "/mcp"))
+            using (var del = http.SendAsync(new HttpRequestMessage(HttpMethod.Delete, mcpBase + "/mcp"))
                                .GetAwaiter().GetResult())
                 Harness.Eq("DELETE /mcp → 405（无状态，没有会话可结束）", (int)del.StatusCode, 405);
 
-            // ---------- Origin：挡网页，不挡本地程序 ----------
-            var evil = Post(http, baseUrl + "/mcp", InitializeBody, good, "https://evil.example.com");
+            // ---------- Origin ----------
+            var evil = Post(http, mcpBase + "/mcp", InitializeBody, good, "https://evil.example.com");
             Harness.Eq("Origin 是外站 → 403（DNS rebinding / 网页 CSRF）", evil.Status, 403);
+            var self = Post(http, mcpBase + "/mcp", InitializeBody, good, mcpBase);
+            Harness.Eq("Origin 是本机自己 → 200", self.Status, 200);
+            var noOrigin = Post(http, mcpBase + "/mcp", InitializeBody, good);
+            Harness.Eq("不带 Origin（本地客户端常态）→ 200", noOrigin.Status, 200);
 
-            var self = Post(http, baseUrl + "/mcp", InitializeBody, good, baseUrl);
-            Harness.Eq("Origin 是本机自己 → 200（浏览器里自测不会被误伤）", self.Status, 200);
+            // ---------- /health ----------
+            var health = ChatWire.TryParseObject(
+                http.GetStringAsync(mcpBase + "/health").GetAwaiter().GetResult());
+            Harness.Eq("MCP /health 报 ok", ChatWire.GetString(health, "status"), "ok");
+            Harness.Eq("MCP /health 报工具数", health?["toolCount"]?.ToJsonString(), "4");
+            Harness.True("MCP /health 不列工具名（那是给有令牌的人看的）",
+                         ChatWire.GetString(health, "service") == "AnimaAIProxy-MCP");
 
-            var noOrigin = Post(http, baseUrl + "/mcp", InitializeBody, good);
-            Harness.Eq("不带 Origin（本地 MCP 客户端的常态）→ 200", noOrigin.Status, 200);
+            // ---------- 逐工具开关（传输层再确认一次） ----------
+            cfg.McpTools[ToolCatalog.ScanName] = false;
+            Harness.Eq("关掉 danbooru_scan_text 后清单只剩 3 个",
+                       ToolCount(http, mcpBase + "/mcp", good), 3);
+            var blocked = Post(http, mcpBase + "/mcp",
+                "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{" +
+                "\"name\":\"danbooru_scan_text\",\"arguments\":{\"text\":\"测试\"}}}", good);
+            Harness.Eq("关掉的工具调不动（-32602，不是\"能调但看不见\"）",
+                       (blocked.Text.Contains("-32602") ? "-32602" : blocked.Text[..0]), "-32602");
+            cfg.McpTools.Clear();
 
-            // ---------- /health 报出 MCP 状态 ----------
-            {
-                var health = ChatWire.TryParseObject(
-                    http.GetStringAsync(baseUrl + "/health").GetAwaiter().GetResult());
-                Harness.Eq("health 里有 mcp=true", health?["mcp"]?.ToJsonString(), "true");
-            }
+            // ---------- 分离性：两个服务互不认识对方的路径 ----------
+            api.StartAsync(CancellationToken.None).GetAwaiter().GetResult();
+            Harness.True("转发 API 也能起来（两个服务可以同时运行）", api.IsRunning);
+
+            var mcpOnApi = Post(http, apiBase + "/mcp", InitializeBody, good);
+            Harness.Eq("转发端口上没有 /mcp → 404", mcpOnApi.Status, 404);
+            Harness.Eq("MCP 端口上没有 /v1/models → 404",
+                       GetStatus(http, mcpBase + "/v1/models"), 404);
+            Harness.Eq("转发端口上的 /health 仍然在", GetStatus(http, apiBase + "/health"), 200);
+
+            // ---------- 停 MCP：转发 API 不受影响 ----------
+            mcp.StopAsync().GetAwaiter().GetResult();
+            Harness.True("MCP 停了", !mcp.IsRunning);
+            Harness.Eq("MCP 停掉后转发 API 照样在", GetStatus(http, apiBase + "/health"), 200);
         }
         finally
         {
-            server.StopAsync().GetAwaiter().GetResult();
+            api.StopAsync().GetAwaiter().GetResult();
+            mcp.StopAsync().GetAwaiter().GetResult();
+            Harness.True("两个服务都停了", !api.IsRunning && !mcp.IsRunning);
 
-            // ---------- 关掉开关：端点必须**真的不存在** ----------
-            var offCfg = new ProxyConfig
-            {
-                Port = FreePort(),
-                BindScope = "local",
-                RequireToken = true,
-                McpEnabled = false,
-                VocabDbPath = cfg.VocabDbPath,
-                SeedPath = cfg.SeedPath
-            };
-            offCfg.Normalize();
-            var off = new ProxyServer(offCfg, tokens, new VocabService());
-            try
-            {
-                off.StartAsync(CancellationToken.None).GetAwaiter().GetResult();
-                var port = offCfg.Port;
-                var r = Post(http, $"http://127.0.0.1:{port}/mcp", InitializeBody, good);
-                Harness.Eq("关掉开关后 /mcp → 404（不是回 403 的空壳）", r.Status, 404);
-                Harness.Eq("关掉后 McpUrl 只是个展示用的地址",
-                           off.McpUrl, $"http://127.0.0.1:{port}/mcp");
-            }
-            finally
-            {
-                off.StopAsync().GetAwaiter().GetResult();
-                TokenStore.FilePathOverride = oldTokenPath;
-                ProxyConfig.FilePathOverride = oldCfgPath;
-                try { Directory.Delete(tmpDir, recursive: true); } catch { /* 删不掉不影响结论 */ }
-            }
+            TokenStore.FilePathOverride = oldTokenPath;
+            ProxyConfig.FilePathOverride = oldCfgPath;
+            try { Directory.Delete(tmpDir, recursive: true); } catch { /* 删不掉不影响结论 */ }
         }
     }
 }

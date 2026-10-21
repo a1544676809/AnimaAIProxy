@@ -42,37 +42,38 @@ public sealed class ProxyServer : IAsyncDisposable
 
     /// <summary>
     /// 搜索客户端。**在服务端持有一个而不是每次请求新建**：它内部有 HttpClient，
-    /// 每请求一个的话会不断开新连接、把 TIME_WAIT 攒起来。dispose 归这里。
+    /// 每请求一个的话会不断开新连接、把 TIME_WAIT 攒起来。dispose 归创建者。
+    ///
+    /// 可从外部注入（<see cref="McpServer"/> 同时开着时两边共用一份）；
+    /// 注入进来的**不归我们 dispose**。
     /// </summary>
-    private readonly SearchClient _search = new();
+    private readonly SearchClient _search;
+    private readonly bool _ownsSearch;
 
     /// <summary>
     /// 网页获取器。同样在服务端持有一个：它内部有 HttpClient，而且**持有浏览器引擎** ——
     /// 每次请求新建一个的话，那个 headless Edge（16–18 个进程、420–530 MB）
     /// 会被反复启动又丢弃，"跨请求复用 + 空闲自动关"这套设计就全废了。
+    ///
+    /// 与搜索客户端同一条规则：注入进来的不 dispose。
     /// </summary>
     private readonly PageReader _reader;
-
-    /// <summary>
-    /// MCP 服务端。与注入那条路共用同一批工具实现（<see cref="ToolCatalog"/> +
-    /// <see cref="ToolHost"/>），区别只在封套：那边是 OpenAI 的 <c>tool_calls</c>，
-    /// 这边是 JSON-RPC 2.0。
-    /// </summary>
-    private readonly McpEndpoint _mcp;
+    private readonly bool _ownsReader;
 
     private WebApplication? _app;
     private DateTimeOffset _startedAt;
 
-    public ProxyServer(ProxyConfig cfg, TokenStore tokens, VocabService vocab)
+    public ProxyServer(ProxyConfig cfg, TokenStore tokens, VocabService vocab,
+                       SearchClient? search = null, PageReader? reader = null)
     {
         _cfg = cfg;
         _tokens = tokens;
         _vocab = vocab;
         _upstream = new UpstreamClient(cfg);
-        _reader = new PageReader();
-        // 工厂而不是实例：与 RunToolLoop / RunStreamLoop 同一条寿命纪律
-        // （一次请求一个 ToolHost）。
-        _mcp = new McpEndpoint(cfg, () => new ToolHost(_vocab, _search, _reader));
+        _ownsSearch = search is null;
+        _ownsReader = reader is null;
+        _search = search ?? new SearchClient();
+        _reader = reader ?? new PageReader();
 
         // 把"本机有没有浏览器"这个**机器事实**交给配置对象，因为 web_fetch 要不要下发
         // 由 ProxyConfig.FetchReady 决定，而配置对象是 ToolLoop / StreamLoop 唯一拿得到的东西。
@@ -95,8 +96,8 @@ public sealed class ProxyServer : IAsyncDisposable
     /// <summary>实际监听的地址，供界面显示与用户复制到平台配置里。</summary>
     public string BaseUrl => $"http://{HostText}:{_cfg.Port}/v1";
 
-    /// <summary>MCP 端点地址，供界面显示与客户端配置里填。</summary>
-    public string McpUrl => $"http://{HostText}:{_cfg.Port}{McpEndpoint.Path}";
+    /// <summary>给客户端配置用的地址（绑定范围不是 local 时也照样给回环）。</summary>
+    public string ClientUrl => $"http://127.0.0.1:{_cfg.Port}/v1";
 
     public string StartedAtText => _startedAt == default
         ? ""
@@ -147,25 +148,13 @@ public sealed class ProxyServer : IAsyncDisposable
         // 端点交给上游去回答"404 还是 400"才是对的。
         app.Map("/v1/{**rest}", HandlePassthrough);
 
-        // MCP：同一个端口上的 POST /mcp。关掉时**不注册路由**，于是它就是一个
-        // 普通的 404 —— 这比"注册了但回 403"更诚实：没有这个端点就是没有。
-        if (_cfg.McpEnabled)
-        {
-            app.MapPost(McpEndpoint.Path, HandleMcp);
-            // GET/DELETE 按 spec 回 405 并带上 Allow：说明"这里只有 POST"，
-            // 而不是让客户端对着一个 404 去猜自己是不是地址写错了。
-            app.MapMethods(McpEndpoint.Path, new[] { "GET", "DELETE", "PUT", "PATCH" },
-                           HandleMcpNotAllowed);
-        }
-
         await app.StartAsync(ct).ConfigureAwait(false);
 
         _app = app;
         _startedAt = DateTimeOffset.Now;
-        ProxyLog.Write($"代理已启动：{BaseUrl}（监听 {ScopeText(_cfg.BindScope)}，" +
+        ProxyLog.Write($"转发 API 已启动：{BaseUrl}（监听 {ScopeText(_cfg.BindScope)}，" +
                        $"工具注入 {(_cfg.ToolsEnabled ? "开" : "关")}，" +
-                       $"令牌 {_tokens.EnabledCount} 枚，" +
-                       $"MCP {(_cfg.McpEnabled ? McpUrl : "关")}）");
+                       $"令牌 {_tokens.EnabledCount} 枚）");
     }
 
     /// <summary>把内部的 BindScope 值翻成界面上看得懂的说法。</summary>
@@ -199,8 +188,11 @@ public sealed class ProxyServer : IAsyncDisposable
     {
         await StopAsync().ConfigureAwait(false);
         _upstream.Dispose();
-        _search.Dispose();
-        _reader.Dispose();
+        // 只 dispose 自己创建的：MCP 服务同时开着时两边共用同一个浏览器引擎与
+        // 搜索客户端，这里顺手关掉会让另一边在下一次 web_fetch 时对着一个
+        // 已释放的 HttpClient / 浏览器说话。
+        if (_ownsSearch) _search.Dispose();
+        if (_ownsReader) _reader.Dispose();
     }
 
     // ---------------- 鉴权 ----------------
@@ -209,42 +201,12 @@ public sealed class ProxyServer : IAsyncDisposable
     /// 校验请求携带的代理令牌。通过返回 true 并给出令牌明文（只用于日志）。
     ///
     /// 拒绝时**已经把响应写完了**，调用方直接 return 即可。
+    ///
+    /// 实现在 <see cref="HttpSecurity.Authorize"/>：MCP 服务用的是同一个实现，
+    /// 安全边界的代码只留一份。
     /// </summary>
     private bool Authorize(HttpContext ctx, out string token, out string reject)
-    {
-        token = "";
-        reject = "";
-
-        ctx.Request.Headers.TryGetValue("Authorization", out var auth);
-        ctx.Request.Headers.TryGetValue("x-api-key", out var xKey);
-        var presented = TokenStore.ExtractToken(auth.ToString(), xKey.ToString());
-
-        if (!_cfg.RequireToken)
-        {
-            token = presented ?? "";
-            return true;
-        }
-
-        // "根本没配令牌"和"带了错令牌"要分开说。合成一句的话，用户第一次
-        // 装好代理、平台报"令牌无效"，会去反复检查平台配置——而真正该做的
-        // 是先在代理里生成一枚令牌。
-        if (!_tokens.HasEnabled)
-        {
-            reject = "代理尚未签发任何令牌，已拒绝所有请求。请在代理界面签发一枚令牌，" +
-                     "再填进 agent 平台的 API Key。";
-            return false;
-        }
-
-        var hit = _tokens.Authenticate(presented);
-        if (hit is null)
-        {
-            reject = "令牌无效或已停用。";
-            return false;
-        }
-
-        token = presented!;
-        return true;
-    }
+        => HttpSecurity.Authorize(_cfg.RequireToken, _tokens, ctx, out token, out reject);
 
     private async Task RejectAsync(HttpContext ctx, string message)
     {
@@ -263,43 +225,11 @@ public sealed class ProxyServer : IAsyncDisposable
     }
 
     /// <summary>
-    /// 来源过滤。只有 lan/wan 才需要它（local 时 Kestrel 只绑回环，
-    /// 外面根本连不上）。
-    ///
-    /// lan 只放行私有网段：`BindScope=lan` 的语义是"给同一个局域网里的
-    /// 设备用"，而不是"给任何能路由到本机的人用"。把公网地址也放进来，
-    /// 用户以为只是开了内网共享，实际把上游额度暴露到了互联网上——
-    /// 而这个错误不会有任何症状，直到账单出来。
+    /// 来源过滤。实现在 <see cref="HttpSecurity.RemoteAllowed"/>，与 MCP 服务共用。
+    /// 只有 lan/wan 才需要它（local 时 Kestrel 只绑回环，外面根本连不上）。
     /// </summary>
     private bool RemoteAllowed(HttpContext ctx)
-    {
-        if (_cfg.BindScope != "lan") return true;
-
-        var ip = ctx.Connection.RemoteIpAddress;
-        if (ip is null) return false;
-        if (IPAddress.IsLoopback(ip)) return true;
-
-        if (ip.IsIPv4MappedToIPv6) ip = ip.MapToIPv4();
-
-        if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
-        {
-            var b = ip.GetAddressBytes();
-            if (b[0] == 10) return true;                              // 10/8
-            if (b[0] == 172 && b[1] >= 16 && b[1] <= 31) return true; // 172.16/12
-            if (b[0] == 192 && b[1] == 168) return true;              // 192.168/16
-            if (b[0] == 169 && b[1] == 254) return true;              // 169.254/16 链路本地
-            return false;
-        }
-
-        // IPv6：fc00::/7 唯一本地、fe80::/10 链路本地
-        var bytes = ip.GetAddressBytes();
-        if (bytes.Length == 16)
-        {
-            if ((bytes[0] & 0xFE) == 0xFC) return true;
-            if (bytes[0] == 0xFE && (bytes[1] & 0xC0) == 0x80) return true;
-        }
-        return false;
-    }
+        => HttpSecurity.RemoteAllowed(_cfg.BindScope, ctx);
 
     // ---------------- GET /health ----------------
 
@@ -326,10 +256,7 @@ public sealed class ProxyServer : IAsyncDisposable
             // browser 是"自动降级有没有后手"。两者不同：browser 缺失时
             // auto 模式照样下发工具（HTTP 引擎能用），只是读不了前端渲染的页面。
             ["webFetch"] = _cfg.FetchReady,
-            ["webFetchBrowser"] = _reader.BrowserAvailable,
-            // MCP 是"这个端口上还有一个入口"，属于用户需要知道的事实；
-            // 具体有哪些工具不在这里报——那要看搜索/抓取配好没有。
-            ["mcp"] = _cfg.McpEnabled
+            ["webFetchBrowser"] = _reader.BrowserAvailable
         };
         return ctx.Response.WriteAsync(ChatWire.ToJson(payload), ctx.RequestAborted);
     }
@@ -339,120 +266,15 @@ public sealed class ProxyServer : IAsyncDisposable
     {
         ctx.Response.ContentType = "application/json; charset=utf-8";
 
-        var endpoints = new JsonArray { "/health", "/v1/chat/completions", "/v1/models" };
-        if (_cfg.McpEnabled) endpoints.Add(McpEndpoint.Path);
-
         var payload = new JsonObject
         {
             ["service"] = "AnimaAIProxy",
             ["hint"] = "将 agent 平台的 OpenAI Base URL 指向 " + BaseUrl +
-                       "，API Key 填代理签发的令牌。MCP 客户端填 " + McpUrl + "。",
-            ["endpoints"] = endpoints
+                       "，API Key 填代理签发的令牌。MCP 是**另一个服务**，" +
+                       "地址见界面「MCP」页。",
+            ["endpoints"] = new JsonArray { "/health", "/v1/chat/completions", "/v1/models" }
         };
         return ctx.Response.WriteAsync(ChatWire.ToJson(payload), ctx.RequestAborted);
-    }
-
-    // ---------------- POST /mcp（MCP 客户端） ----------------
-
-    /// <summary>
-    /// MCP 的入口。传输层只做四件事：来源过滤、Origin 校验、鉴权、把 JSON-RPC
-    /// 封套交给 <see cref="McpEndpoint"/>。协议细节全部在那边，于是回归可以直接
-    /// 调协议层，不必为了验一个字段去起一次 HTTP。
-    /// </summary>
-    private async Task HandleMcp(HttpContext ctx)
-    {
-        if (!RemoteAllowed(ctx))
-        {
-            ProxyLog.Write($"拒绝来自 {ctx.Connection.RemoteIpAddress} 的 MCP 连接" +
-                           $"（监听 {ScopeText(_cfg.BindScope)}）");
-            await RejectMcpAsync(ctx, StatusCodes.Status403Forbidden,
-                                 "来源地址不在允许的范围内。").ConfigureAwait(false);
-            return;
-        }
-
-        if (!OriginAllowed(ctx))
-        {
-            // 浏览器发的跨源请求一定带 Origin，MCP 客户端（本地程序）通常不带。
-            // 这条挡的是 DNS rebinding 与网页 CSRF：它们能向 127.0.0.1 发请求，
-            // 但改不了 Origin。令牌本来就是一道墙，两堵墙分开立着才叫纵深。
-            ProxyLog.Write("拒绝 MCP 请求：Origin 不是本机自己（" +
-                           ctx.Request.Headers["Origin"].ToString() + "）");
-            await RejectMcpAsync(ctx, StatusCodes.Status403Forbidden,
-                                 "Origin 不在允许范围内（只接受本机地址）。").ConfigureAwait(false);
-            return;
-        }
-
-        if (!Authorize(ctx, out _, out var reject))
-        {
-            ProxyLog.Write("拒绝 MCP 请求：" + reject);
-            await RejectMcpAsync(ctx, StatusCodes.Status401Unauthorized, reject).ConfigureAwait(false);
-            return;
-        }
-
-        var raw = await ReadBodyAsync(ctx).ConfigureAwait(false);
-        var result = await _mcp.HandleAsync(Encoding.UTF8.GetString(raw), ctx.RequestAborted)
-                                .ConfigureAwait(false);
-
-        ctx.Response.StatusCode = result.Status;
-        // 通知的响应**不能有响应体**（spec：202 + 空体）。写了 body 的客户端
-        // 会把它当成一个"id 对不上的响应"而报错。
-        if (result.Body is null) return;
-
-        ctx.Response.ContentType = "application/json; charset=utf-8";
-        await ctx.Response.WriteAsync(ChatWire.ToJson(result.Body), ctx.RequestAborted)
-                  .ConfigureAwait(false);
-    }
-
-    /// <summary>GET/DELETE /mcp：这里既没有 SSE 流，也没有会话可结束。</summary>
-    private Task HandleMcpNotAllowed(HttpContext ctx)
-    {
-        ctx.Response.StatusCode = StatusCodes.Status405MethodNotAllowed;
-        ctx.Response.Headers.Allow = "POST";
-        ctx.Response.ContentType = "application/json; charset=utf-8";
-        return ctx.Response.WriteAsync(ChatWire.ToJson(new JsonObject
-        {
-            ["jsonrpc"] = "2.0",
-            ["id"] = null,
-            ["error"] = new JsonObject
-            {
-                ["code"] = -32600,
-                ["message"] = "本服务器的 MCP 只有 POST /mcp（无状态、不提供服务端推送）。" +
-                              "GET（SSE 流）与 DELETE（结束会话）都不支持。"
-            }
-        }), ctx.RequestAborted);
-    }
-
-    /// <summary>
-    /// Origin 校验。**只在请求带了 Origin 时才校验**：MCP 客户端是本地程序，
-    /// 普遍不带这个头；浏览器发跨源 POST 则一定带。不带就放行、带了就必须是
-    /// 本机自己——既不会误伤客户端，又挡住了网页。
-    /// </summary>
-    private bool OriginAllowed(HttpContext ctx)
-    {
-        var origin = ctx.Request.Headers["Origin"].ToString();
-        if (string.IsNullOrWhiteSpace(origin)) return true;
-
-        var o = origin.TrimEnd('/').ToLowerInvariant();
-        return o == $"http://127.0.0.1:{_cfg.Port}" ||
-               o == $"http://localhost:{_cfg.Port}" ||
-               o == $"http://[::1]:{_cfg.Port}";
-    }
-
-    /// <summary>
-    /// MCP 的拒绝要回 **JSON-RPC 形状**，不是 OpenAI 的 error 形状。
-    /// MCP 客户端按 JSON-RPC 解析响应体；给它一个 OpenAI 错误对象，它只会报
-    /// "服务器返回了无法解析的响应"，把真正的 401/403 埋掉。
-    /// </summary>
-    private async Task RejectMcpAsync(HttpContext ctx, int status, string message)
-    {
-        ctx.Response.StatusCode = status;
-        ctx.Response.ContentType = "application/json; charset=utf-8";
-        await ctx.Response.WriteAsync(ChatWire.ToJson(new JsonObject
-        {
-            ["jsonrpc"] = "2.0",
-            ["id"] = null,
-            ["error"] = new JsonObject { ["code"] = -32001, ["message"] = message }
-        }), ctx.RequestAborted).ConfigureAwait(false);
     }
 
     // ---------------- POST /v1/chat/completions ----------------
