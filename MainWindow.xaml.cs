@@ -216,23 +216,34 @@ public sealed partial class MainWindow : Window
     }
 
     /// <summary>
-    /// 名单面板只在"按 IP 名单"时露出来。一直可见的话，选了"仅本机"的人会以为名单
-    /// 在生效——而它压根没被读过。状态行也必须跟着刷新：空名单在黑/白两种模式下含义
-    /// 完全相反（不拦任何人 / 拒绝所有人），不说出来就会变成"代理莫名其妙坏了"。
+    /// 名单是**所有范围之上的一层叠加**，所以面板一直可见，状态行要说清"当前这种组合
+    /// 到底是什么意思"：同样是白名单，在「仅局域网」下是额外放行、在「按 IP 名单」下
+    /// 才是唯一依据。不说的话，同一份名单在两种范围下的行为差异只能靠猜。
     /// </summary>
     private void RefreshIpListUi()
     {
         if (IpListPanel is null) return;
 
-        var isList = SelectedScope(ScopeBox) == "list";
-        IpListPanel.Visibility = isList ? Visibility.Visible : Visibility.Collapsed;
-        if (!isList) return;
-
+        var scope = SelectedScope(ScopeBox);
         var mode = (IpListModeBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "deny";
         var lines = (IpListBox.Text ?? "").Split('\n')
                                           .Select(l => l.Trim())
-                                          .Where(l => l.Length > 0);
-        IpListStatusText.Text = ProxyConfig.IpListStatusFor(mode, lines);
+                                          .Where(l => l.Length > 0)
+                                          .ToList();
+
+        var effect = (scope, mode) switch
+        {
+            ("list", "allow") => "只放行名单里的地址",
+            ("list", _) => "放行名单之外的地址",
+            ("wan", "allow") => "任意来源本来就全放行，白名单不会改变结果",
+            ("wan", _) => "在任意来源的基础上额外屏蔽名单",
+            ("lan", "allow") => "在局域网范围之上额外放行名单",
+            ("lan", _) => "在局域网范围之上额外屏蔽名单",
+            (_, "allow") => "在本机范围之上额外放行名单（一般用不上）",
+            _ => "在本机范围之上额外屏蔽名单"
+        };
+
+        IpListStatusText.Text = effect + "；" + ProxyConfig.IpListStatusFor(mode, lines);
     }
 
     /// <summary>

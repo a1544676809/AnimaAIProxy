@@ -18,20 +18,52 @@ internal static class HttpSecurity
     /// <c>list</c> 时按黑名单/白名单判定，其余情况落到下面那个按范围判定的重载。
     /// </summary>
     public static bool RemoteAllowed(ProxyConfig cfg, HttpContext ctx)
+        => AllowedByPolicy(cfg, ctx.Connection.RemoteIpAddress);
+
+    /// <summary>
+    /// 一次请求到底放不放行——**纯函数**，能离线穷举（起 HTTP 只能从回环验）。
+    ///
+    /// 规则是"范围给基线，名单做叠加"：
+    ///
+    /// | 范围 | 基线放行 | 黑名单（额外屏蔽） | 白名单（额外放行） |
+    /// | --- | --- | --- | --- |
+    /// | 仅本机 | 回环 | 回环 − 名单 | 回环 ∪ 名单 |
+    /// | 仅局域网 | 私有网段 | 私有 − 名单 | 私有 ∪ 名单 |
+    /// | 任意来源 | 全部 | 全部 − 名单 | 全部（名单没有意义） |
+    /// | 按 IP 名单 | 黑名单模式下"全放行"／白名单模式下"不放行" | 全部 − 名单 | **只**放行名单 |
+    ///
+    /// 「按 IP 名单」之所以还是单独一档：它表达的是"基线不要看了，只看名单"，
+    /// 与"在局域网基础上再额外拦/放几条"是不同的意图。两者用同一个公式算，
+    /// 区别只在基线取什么。
+    ///
+    /// 两条与安全有关的死规矩：
+    ///   * **空白名单 = 不改动基线**（额外屏蔽/放行都不做）。只有「按 IP 名单 + 白名单
+    ///     且名单为空」才等于拒绝所有人——那是明确的"只看名单"语义。
+    ///   * **黑名单优先于白名单**：名单非空时按所选模式算，不存在"同一模式两种解释"。
+    /// </summary>
+    public static bool AllowedByPolicy(ProxyConfig cfg, IPAddress? ip)
     {
-        if (cfg.BindScope != "list") return RemoteAllowed(cfg.BindScope, ctx);
-
-        var ip = ctx.Connection.RemoteIpAddress;
         if (ip is null) return false;
+        var addr = IpAccessList.Normalize(ip);
 
-        // 名单只在内存里解析一次也行，但配置很小（几十条），每次请求解析
-        // 换来的是"改了名单立刻生效"——不用重启、不用清缓存。
+        var allowMode = cfg.IpListMode == "allow";
+
+        // 基线：范围本身放不放行（不看名单）
+        var baseAllowed = cfg.BindScope switch
+        {
+            "wan" => true,
+            // 自定义：白名单模式的基线是"谁都不放"（名单是唯一来源），
+            // 黑名单模式的基线是"全放"（名单只负责扣掉几条）。
+            "list" => !allowMode,
+            "lan" => LanAddressAllowed(addr),
+            _ => IPAddress.IsLoopback(addr)
+        };
+
         var list = cfg.ParseIpList(out _);
-        var hit = list.Contains(ip);
+        if (list.Count == 0) return baseAllowed;
 
-        // 白名单空着 = 拒绝所有人（而不是"没配置就放行"）。这条语义与
-        // "没有令牌就拒绝一切"是同一条纪律：安全相关的空值一律取**更严**的那边。
-        return cfg.IpListMode == "allow" ? hit : !hit;
+        var hit = list.Contains(addr);
+        return allowMode ? (baseAllowed || hit) : (baseAllowed && !hit);
     }
 
     /// <summary>
@@ -52,24 +84,18 @@ internal static class HttpSecurity
 
     /// <summary>
     /// lan 模式放行哪些地址。**纯函数**，所以能离线回归穷举（起 HTTP 只能从回环验，
-    /// 验不到 100.64/10 这种"客户端在 Tailscale 网里"的情况）。
-    ///
-    /// 放行集合刻意只涵盖"确实是内网/虚拟内网"的段：
+    /// 验不到"一台机器在 172.20 网段"这类情况）。
     ///
     /// | 段 | 是什么 |
     /// | --- | --- |
     /// | 10/8、172.16/12、192.168/16 | RFC1918 私有网段 |
     /// | 169.254/16 | 链路本地（Windows 上没拿到 DHCP 时也在这） |
-    /// | **100.64.0.0/10** | **RFC6598 共享地址段——Tailscale 默认网段** |
-    /// | fc00::/7 | IPv6 唯一本地；**Tailscale 的 fd7a:115c:a1e0::/48 落在里面** |
+    /// | fc00::/7 | IPv6 唯一本地（Tailscale 的 v6 段也在这里面） |
     /// | fe80::/10 | IPv6 链路本地 |
     ///
-    /// 100.64/10 这条是后来补的：早先漏了它，而 Tailscale 用的正是这个段，
-    /// 症状是"局域网上能连的平台，从 Tailscale 那头连不上"，且没有任何提示——
-    /// 因为 lan 模式的拒绝理由只说"来源地址不在允许的范围内"。
-    /// 代价也要说清：这个段同时是运营商级 NAT（CGNAT）用的，放行它等于
-    /// 信任"同一个 CGNAT 后面的其他用户"。本机若直接挂在运营商 NAT 后面、
-    /// 又用 lan 模式，这条是真的会放人进来的；不需要就改用「按 IP 名单」白名单。
+    /// **100.64.0.0/10（Tailscale / CGNAT）不在其中**，这是刻意的：它同时是运营商级
+    /// NAT 用的段，放进 lan 等于信任"同一 CGNAT 后面的其他用户"。要用 Tailscale，
+    /// 在白名单里写一条 100.64.0.0/10——那是显式选择，而且能随手撤掉。
     /// </summary>
     public static bool LanAddressAllowed(IPAddress ip)
     {
@@ -83,7 +109,8 @@ internal static class HttpSecurity
             if (b[0] == 172 && b[1] >= 16 && b[1] <= 31) return true;  // 172.16/12
             if (b[0] == 192 && b[1] == 168) return true;               // 192.168/16
             if (b[0] == 169 && b[1] == 254) return true;               // 169.254/16 链路本地
-            if (b[0] == 100 && b[1] >= 64 && b[1] <= 127) return true; // 100.64/10 Tailscale / CGNAT
+            // 刻意**不**放行 100.64/10（Tailscale / CGNAT）：那是运营商与虚拟局域网共用
+            // 的段，放进来等于信任"同一 CGNAT 后面的其他用户"。需要就写进白名单。
             return false;
         }
 

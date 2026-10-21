@@ -562,12 +562,12 @@
                             <ComboBoxItem Content="任意来源（不安全）" Tag="wan" />
                             <ComboBoxItem Content="按 IP 名单（黑名单 / 白名单）" Tag="list" />
                         </ComboBox>
-                        <StackPanel x:Name="IpListPanel" Spacing="8" Visibility="Collapsed">
+                        <StackPanel x:Name="IpListPanel" Spacing="8">
                             <ComboBox x:Name="IpListModeBox" Header="名单模式"
                                       HorizontalAlignment="Stretch"
                                       SelectionChanged="IpListMode_Changed">
-                                <ComboBoxItem Content="黑名单：名单里的地址禁止访问" Tag="deny" />
-                                <ComboBoxItem Content="白名单：只允许名单里的地址访问" Tag="allow" />
+                                <ComboBoxItem Content="黑名单：名单里的地址一律禁止" Tag="deny" />
+                                <ComboBoxItem Content="白名单：名单里的地址一律放行（自定义模式下即只放行这些）" Tag="allow" />
                             </ComboBox>
                             <TextBox x:Name="IpListBox" Header="IP 名单（一行一条）" AcceptsReturn="True"
                                      Height="130" FontFamily="Consolas" TextWrapping="NoWrap"
@@ -575,7 +575,7 @@
                                      TextChanged="IpListText_Changed" />
                             <TextBlock x:Name="IpListStatusText" Opacity="0.85" TextWrapping="Wrap" Text="" />
                             <TextBlock Opacity="0.6" FontSize="12" TextWrapping="Wrap"
-                                       Text="支持单个地址与 CIDR 网段（IPv4 / IPv6 都行），# 开头的行当注释。白名单模式下名单之外的地址一律拒绝，本机回环也算——真把自己锁在外面了，就在配置目录的 proxy.config.json 里把 bindScope 改回 local。" />
+                                       Text="一行一条，支持单个地址与 CIDR 网段（IPv4 / IPv6 都行），# 开头的行当注释。名单是在**当前范围之上**叠加的一层：黑名单 = 额外屏蔽，白名单 = 额外放行；只有范围选「按 IP 名单」时，名单才成为唯一的依据。真把自己锁在外面了，就在配置目录的 proxy.config.json 里把 bindScope 改回 local 再把名单清空。" />
                         </StackPanel>
                         <TextBlock Text="代理持有上游密钥，开放到网络等于交出密钥使用权。跨机请用 SSH 转发。"
                                    TextWrapping="Wrap" Opacity="0.7" />

@@ -27,16 +27,20 @@ public static class IpList
         Harness.Section("IP 名单：配置语义");
         ConfigSemantics();
 
-        Harness.Section("局域网模式放行哪些地址（含 Tailscale 网段）");
+        Harness.Section("局域网模式放行哪些地址（Tailscale 段刻意不在其中）");
         LanRanges();
+
+        Harness.Section("放行判定：范围给基线，名单做叠加");
+        Policy();
 
         Harness.Section("IP 名单：真的起一次 Kestrel 从回环发请求");
         OverHttp();
     }
 
     /// <summary>
-    /// lan 模式的放行表。100.64.0.0/10（RFC6598）是 Tailscale 的默认网段——
-    /// 早先漏了它，症状是"局域网能连、从 Tailscale 那头连不上"且没有任何提示。
+    /// lan 模式的放行表。**100.64.0.0/10（Tailscale / CGNAT）刻意不在其中**：
+    /// 它同时是运营商级 NAT 用的段，塞进 lan 预设等于信任"同一 CGNAT 后面的其他用户"。
+    /// 要用 Tailscale，就在白名单里写一条——显式、可撤。
     /// </summary>
     private static void LanRanges()
     {
@@ -50,20 +54,84 @@ public static class IpList
         Harness.True("169.254.10.20 → 放行（链路本地）", Ok("169.254.10.20"));
         Harness.True("127.0.0.1 → 放行（回环）", Ok("127.0.0.1"));
 
-        Harness.True("100.64.0.1 → 放行（Tailscale / CGNAT 下界）", Ok("100.64.0.1"));
-        Harness.True("100.101.102.103 → 放行（Tailscale 常见地址）", Ok("100.101.102.103"));
-        Harness.True("100.127.255.254 → 放行（上界）", Ok("100.127.255.254"));
-        Harness.True("100.63.255.255 → 拒绝（差一位在段外）", !Ok("100.63.255.255"));
-        Harness.True("100.128.0.1 → 拒绝（段外）", !Ok("100.128.0.1"));
-        Harness.True("100.64.0.1 的 IPv4-mapped 写法 → 放行", Ok("::ffff:100.64.0.1"));
+        Harness.True("100.64.0.1 → 拒绝（Tailscale 段不在 lan 预设里）", !Ok("100.64.0.1"));
+        Harness.True("100.101.102.103 → 拒绝（同上）", !Ok("100.101.102.103"));
+        Harness.True("100.127.255.254 → 拒绝（同上）", !Ok("100.127.255.254"));
+        Harness.True("100.63.255.255 → 拒绝", !Ok("100.63.255.255"));
+        Harness.True("100.128.0.1 → 拒绝", !Ok("100.128.0.1"));
+        Harness.True("100.64.0.1 的 IPv4-mapped 写法 → 同样拒绝（归一后一致）",
+                     !Ok("::ffff:100.64.0.1"));
 
         Harness.True("fd00::1 → 放行（v6 ULA）", Ok("fd00::1"));
-        Harness.True("fd7a:115c:a1e0::1 → 放行（Tailscale 的 v6 段，落在 fc00::/7）",
+        Harness.True("fd7a:115c:a1e0::1 → 放行（Tailscale 的 v6 段落在 fc00::/7，这条没动）",
                      Ok("fd7a:115c:a1e0::1"));
         Harness.True("fe80::1 → 放行（v6 链路本地）", Ok("fe80::1"));
         Harness.True("2001:db8::1 → 拒绝（公网文档段）", !Ok("2001:db8::1"));
 
         Harness.True("8.8.8.8 → 拒绝（公网）", !Ok("8.8.8.8"));
+    }
+
+    /// <summary>
+    /// 放行判定：范围给基线，名单做叠加。
+    ///
+    /// 这张表是这次改动的核心——同一份名单在不同范围下含义不同（额外屏蔽 / 额外放行 /
+    /// 唯一依据），所以必须逐格钉住，否则"改了一个字，行为变了一个模式"没人发现。
+    /// </summary>
+    private static void Policy()
+    {
+        static ProxyConfig Cfg(string scope, string mode, params string[] list)
+        {
+            var c = new ProxyConfig { BindScope = scope, IpListMode = mode, IpList = list.ToList() };
+            c.Normalize();
+            return c;
+        }
+
+        bool Allow(ProxyConfig cfg, string ip) => HttpSecurity.AllowedByPolicy(cfg, IPAddress.Parse(ip));
+
+        // ---------- 仅局域网 + 黑名单 = 额外屏蔽 ----------
+        var lanDeny = Cfg("lan", "deny", "10.1.2.3");
+        Harness.True("lan+黑名单：名单里的私有地址被额外屏蔽", !Allow(lanDeny, "10.1.2.3"));
+        Harness.True("lan+黑名单：其他私有地址照常放行", Allow(lanDeny, "10.1.2.4"));
+        Harness.True("lan+黑名单：公网仍被范围挡住", !Allow(lanDeny, "8.8.8.8"));
+
+        // ---------- 仅局域网 + 白名单 = 额外放行 ----------
+        var lanAllow = Cfg("lan", "allow", "100.64.0.0/10", "8.8.8.8");
+        Harness.True("lan+白名单：名单里的 Tailscale 段被额外放行", Allow(lanAllow, "100.101.1.2"));
+        Harness.True("lan+白名单：名单里的公网地址也被额外放行", Allow(lanAllow, "8.8.8.8"));
+        Harness.True("lan+白名单：局域网本来就放行", Allow(lanAllow, "192.168.1.5"));
+        Harness.True("lan+白名单：名单外的公网仍拒绝", !Allow(lanAllow, "1.1.1.1"));
+
+        // ---------- 仅本机 ----------
+        var localDeny = Cfg("local", "deny", "127.0.0.1");
+        Harness.True("本机+黑名单：连回环都被屏蔽", !Allow(localDeny, "127.0.0.1"));
+        var localAllow = Cfg("local", "allow", "10.9.9.9");
+        Harness.True("本机+白名单：列表里的外部地址被额外放行", Allow(localAllow, "10.9.9.9"));
+        Harness.True("本机+白名单：回环仍在", Allow(localAllow, "127.0.0.1"));
+        Harness.True("本机+白名单：列表外的外部地址仍拒绝", !Allow(localAllow, "10.9.9.8"));
+
+        // ---------- 任意来源 ----------
+        var wanDeny = Cfg("wan", "deny", "8.8.8.8");
+        Harness.True("任意来源+黑名单：名单里的被屏蔽", !Allow(wanDeny, "8.8.8.8"));
+        Harness.True("任意来源+黑名单：其余照常", Allow(wanDeny, "1.1.1.1"));
+        var wanAllow = Cfg("wan", "allow", "8.8.8.8");
+        Harness.True("任意来源+白名单：本来就全放行，白名单不改变结果", Allow(wanAllow, "1.1.1.1"));
+
+        // ---------- 按 IP 名单（自定义）：名单是唯一依据 ----------
+        var listAllow = Cfg("list", "allow", "192.168.1.0/24");
+        Harness.True("自定义+白名单：只放行名单里的", Allow(listAllow, "192.168.1.9"));
+        Harness.True("自定义+白名单：回环也拒绝（没有暗门）", !Allow(listAllow, "127.0.0.1"));
+        var listDeny = Cfg("list", "deny", "192.168.1.9");
+        Harness.True("自定义+黑名单：名单外的全放行", Allow(listDeny, "8.8.8.8"));
+        Harness.True("自定义+黑名单：名单里的拒绝", !Allow(listDeny, "192.168.1.9"));
+
+        // ---------- 空白名单：不改动基线（除自定义+白名单） ----------
+        var lanDenyEmpty = Cfg("lan", "deny");
+        Harness.True("lan+黑名单+空名单 = 局域网原样", Allow(lanDenyEmpty, "10.1.2.3"));
+        var lanAllowEmpty = Cfg("lan", "allow");
+        Harness.True("lan+白名单+空名单 = 局域网原样（不是拒绝所有人）", Allow(lanAllowEmpty, "10.1.2.3"));
+        var listAllowEmpty = Cfg("list", "allow");
+        Harness.True("自定义+白名单+空名单 = 拒绝所有人", !Allow(listAllowEmpty, "10.1.2.3"));
+        Harness.True("自定义+白名单+空名单：回环也拒绝", !Allow(listAllowEmpty, "127.0.0.1"));
     }
 
     private static void Parsing()
@@ -267,6 +335,20 @@ public static class IpList
             // 写错的行被忽略（而不是把整个服务拦死）
             cfg.IpList = new List<string> { "not-an-ip", "10.0.0.0/8" };
             Harness.Eq("名单里有写错的行时，其余条目照常生效", Post(http, baseUrl, good), 502);
+
+            // ---------- 非自定义模式下的叠加：范围仍给基线，名单只做增减 ----------
+            cfg.BindScope = "lan";          // 绑定在启动时已定，改它只影响过滤
+            cfg.IpListMode = "deny";
+            cfg.IpList = new List<string> { "127.0.0.1" };
+            Harness.Eq("局域网 + 黑名单含回环 → 403（额外屏蔽）", Post(http, baseUrl, good), 403);
+
+            cfg.IpList = new List<string> { "10.0.0.0/8" };
+            Harness.Eq("局域网 + 黑名单不含回环 → 放行（基线还在）", Post(http, baseUrl, good), 502);
+
+            cfg.IpListMode = "allow";
+            cfg.IpList = new List<string> { "100.64.0.0/10" };   // 只写了 Tailscale 段
+            Harness.Eq("局域网 + 白名单（只有 Tailscale 段）→ 回环仍放行（额外放行，不是只看名单）",
+                       Post(http, baseUrl, good), 502);
         }
         finally
         {
