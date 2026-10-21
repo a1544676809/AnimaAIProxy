@@ -47,10 +47,34 @@ internal static class HttpSecurity
         if (bindScope != "lan") return true;
 
         var ip = ctx.Connection.RemoteIpAddress;
-        if (ip is null) return false;
-        if (IPAddress.IsLoopback(ip)) return true;
+        return ip is not null && LanAddressAllowed(ip);
+    }
 
-        if (ip.IsIPv4MappedToIPv6) ip = ip.MapToIPv4();
+    /// <summary>
+    /// lan 模式放行哪些地址。**纯函数**，所以能离线回归穷举（起 HTTP 只能从回环验，
+    /// 验不到 100.64/10 这种"客户端在 Tailscale 网里"的情况）。
+    ///
+    /// 放行集合刻意只涵盖"确实是内网/虚拟内网"的段：
+    ///
+    /// | 段 | 是什么 |
+    /// | --- | --- |
+    /// | 10/8、172.16/12、192.168/16 | RFC1918 私有网段 |
+    /// | 169.254/16 | 链路本地（Windows 上没拿到 DHCP 时也在这） |
+    /// | **100.64.0.0/10** | **RFC6598 共享地址段——Tailscale 默认网段** |
+    /// | fc00::/7 | IPv6 唯一本地；**Tailscale 的 fd7a:115c:a1e0::/48 落在里面** |
+    /// | fe80::/10 | IPv6 链路本地 |
+    ///
+    /// 100.64/10 这条是后来补的：早先漏了它，而 Tailscale 用的正是这个段，
+    /// 症状是"局域网上能连的平台，从 Tailscale 那头连不上"，且没有任何提示——
+    /// 因为 lan 模式的拒绝理由只说"来源地址不在允许的范围内"。
+    /// 代价也要说清：这个段同时是运营商级 NAT（CGNAT）用的，放行它等于
+    /// 信任"同一个 CGNAT 后面的其他用户"。本机若直接挂在运营商 NAT 后面、
+    /// 又用 lan 模式，这条是真的会放人进来的；不需要就改用「按 IP 名单」白名单。
+    /// </summary>
+    public static bool LanAddressAllowed(IPAddress ip)
+    {
+        ip = IpAccessList.Normalize(ip);
+        if (IPAddress.IsLoopback(ip)) return true;
 
         if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
         {
@@ -59,15 +83,15 @@ internal static class HttpSecurity
             if (b[0] == 172 && b[1] >= 16 && b[1] <= 31) return true;  // 172.16/12
             if (b[0] == 192 && b[1] == 168) return true;               // 192.168/16
             if (b[0] == 169 && b[1] == 254) return true;               // 169.254/16 链路本地
+            if (b[0] == 100 && b[1] >= 64 && b[1] <= 127) return true; // 100.64/10 Tailscale / CGNAT
             return false;
         }
 
-        // IPv6：fc00::/7 唯一本地、fe80::/10 链路本地
-        var bytes = ip.GetAddressBytes();
-        if (bytes.Length == 16)
+        if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6)
         {
-            if ((bytes[0] & 0xFE) == 0xFC) return true;
-            if (bytes[0] == 0xFE && (bytes[1] & 0xC0) == 0x80) return true;
+            var bytes = ip.GetAddressBytes();
+            if ((bytes[0] & 0xFE) == 0xFC) return true;                        // fc00::/7
+            if (bytes[0] == 0xFE && (bytes[1] & 0xC0) == 0x80) return true;     // fe80::/10
         }
         return false;
     }

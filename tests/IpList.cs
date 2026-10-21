@@ -27,8 +27,43 @@ public static class IpList
         Harness.Section("IP 名单：配置语义");
         ConfigSemantics();
 
+        Harness.Section("局域网模式放行哪些地址（含 Tailscale 网段）");
+        LanRanges();
+
         Harness.Section("IP 名单：真的起一次 Kestrel 从回环发请求");
         OverHttp();
+    }
+
+    /// <summary>
+    /// lan 模式的放行表。100.64.0.0/10（RFC6598）是 Tailscale 的默认网段——
+    /// 早先漏了它，症状是"局域网能连、从 Tailscale 那头连不上"且没有任何提示。
+    /// </summary>
+    private static void LanRanges()
+    {
+        bool Ok(string ip) => HttpSecurity.LanAddressAllowed(IPAddress.Parse(ip));
+
+        Harness.True("10.1.2.3 → 放行（RFC1918 10/8）", Ok("10.1.2.3"));
+        Harness.True("172.16.0.1 → 放行（172.16/12 下界）", Ok("172.16.0.1"));
+        Harness.True("172.31.255.254 → 放行（172.16/12 上界）", Ok("172.31.255.254"));
+        Harness.True("172.32.0.1 → 拒绝（172.16/12 之外）", !Ok("172.32.0.1"));
+        Harness.True("192.168.1.1 → 放行", Ok("192.168.1.1"));
+        Harness.True("169.254.10.20 → 放行（链路本地）", Ok("169.254.10.20"));
+        Harness.True("127.0.0.1 → 放行（回环）", Ok("127.0.0.1"));
+
+        Harness.True("100.64.0.1 → 放行（Tailscale / CGNAT 下界）", Ok("100.64.0.1"));
+        Harness.True("100.101.102.103 → 放行（Tailscale 常见地址）", Ok("100.101.102.103"));
+        Harness.True("100.127.255.254 → 放行（上界）", Ok("100.127.255.254"));
+        Harness.True("100.63.255.255 → 拒绝（差一位在段外）", !Ok("100.63.255.255"));
+        Harness.True("100.128.0.1 → 拒绝（段外）", !Ok("100.128.0.1"));
+        Harness.True("100.64.0.1 的 IPv4-mapped 写法 → 放行", Ok("::ffff:100.64.0.1"));
+
+        Harness.True("fd00::1 → 放行（v6 ULA）", Ok("fd00::1"));
+        Harness.True("fd7a:115c:a1e0::1 → 放行（Tailscale 的 v6 段，落在 fc00::/7）",
+                     Ok("fd7a:115c:a1e0::1"));
+        Harness.True("fe80::1 → 放行（v6 链路本地）", Ok("fe80::1"));
+        Harness.True("2001:db8::1 → 拒绝（公网文档段）", !Ok("2001:db8::1"));
+
+        Harness.True("8.8.8.8 → 拒绝（公网）", !Ok("8.8.8.8"));
     }
 
     private static void Parsing()
