@@ -321,9 +321,13 @@ public sealed class VocabDb
     }
 
     /// <summary>
-    /// 标签的引用数（帖子数）。**取值顺序与 <see cref="Status"/> 一致：Anima 索引优先**
-    /// ——同一个标签在两张表里帖数不同，而"Anima 常用"这个判定本来就是按 Anima 的
-    /// 口径给的，两处用不同来源会得到"状态说 anima、帖数却是 Danbooru 的"这种自相矛盾的输出。
+    /// 标签的引用数（帖子数）。**用合并表 `best` 的 Danbooru 计数**，只有合并表里
+    /// 没有的 Anima 原生标签才退回 Anima 索引：搜索窗口显示的就是 `best` 的计数，
+    /// 两处对同一个标签报两个数，人（和模型）就不知道该信哪个了 —— 实测 `内衣`
+    /// 在 `best` 里是 1,028,051、在 Anima 索引里是 1,097,182。
+    ///
+    /// 这与 <see cref="Status"/> 的"Anima 索引优先"不冲突：那是**归属判定**
+    /// （这个标签算不算 Anima 常用的），不是计数。
     ///
     /// 别名与大小写不敏感（`@dairi` / `dairi` 等价）。查不到返回 0——
     /// 0 在展示层要写成"无引用"，不能写成"0 帖"（那看起来像"这个标签没人用"）。
@@ -334,8 +338,8 @@ public sealed class VocabDb
         var low = tag.Trim().ToLowerInvariant();
         if (low.StartsWith('@')) low = low[1..];
 
-        if (_anima.TryGetValue(low, out var p) && p > 0) return p;
-        if (_byTag.TryGetValue(low, out var r)) return r.PostCount;
+        if (_byTag.TryGetValue(low, out var r) && r.PostCount > 0) return r.PostCount;
+        if (_anima.TryGetValue(low, out var p)) return p;
         return 0;
     }
 
