@@ -395,6 +395,40 @@ public static class Vocab
         Harness.Eq("search 与 resolve 的帖数一致", PostsOf(bloomSearch.Text, "white dress"),
                    PostsOf(bloomResolve.Text, "white dress"));
 
+        // ---- 第二轮评审（2026-10-26）：人数标签回归 / 控制词标注 / cn 优先级 / 别名 ----
+        Harness.Section("6c. 第二轮评审回归");
+
+        // (9) 人数类标签必须在 search 里命中自身：`solo`、`2girls` 以前被"只出现在
+        //     角色/作品名里"这条守卫误杀（它们是"数量"段，不是名字段）。
+        var peopleQueries = new[] { "1girl", "1boy", "2girls", "2boys", "3girls", "6+girls",
+                                    "multiple girls", "solo" };
+        var people = Run(ToolKind.Search,
+                         "{\"queries\":[" + string.Join(",", peopleQueries.Select(q => "\"" + q + "\"")) +
+                         "],\"limit\":3}");
+        Harness.Dump("人数类标签", people.Text);
+        foreach (var pq in peopleQueries)
+            Harness.True($"search {pq} 命中自身",
+                         people.Text.Contains("tag=" + pq + " |", StringComparison.Ordinal));
+
+        // (10) 控制词（数量段）不得被标题标成"角色/作品标签"。
+        foreach (var cq in new[] { "solo focus", "no humans", "multiple girls" })
+        {
+            var one = Run(ToolKind.Search, "{\"queries\":[\"" + cq + "\"],\"limit\":3}");
+            Harness.True($"{cq} 的标题不声称含角色/作品标签",
+                         !one.Text.Contains("are character/series/artist", StringComparison.Ordinal));
+        }
+
+        // (11) `咖啡厅` 优先 cafe（seed），不再被 `cafe (blue archive)` 抢走；
+        //      `sailor suit` 指向水手服 serafuku，而不是"水手"这个人。
+        var cafe = Run(ToolKind.Resolve, "{\"tags\":[\"咖啡厅\",\"sailor suit\"]}");
+        Harness.Dump("咖啡厅 / sailor suit", cafe.Text);
+        Harness.True("咖啡厅 → cafe", cafe.Text.Contains("1. 咖啡厅 → tag=cafe", StringComparison.Ordinal));
+        Harness.True("sailor suit → serafuku",
+                     cafe.Text.Contains("sailor suit → tag=serafuku", StringComparison.Ordinal));
+        var cafeSearch = Run(ToolKind.Search, "{\"queries\":[\"咖啡厅\"],\"limit\":3}");
+        Harness.True("search 咖啡厅 第一行是 cafe",
+                     cafeSearch.Text.Contains("1. tag=cafe |", StringComparison.Ordinal));
+
         // ---- 摘要前缀是 Core 与回归共用的契约 ----
         Harness.Section("7. 工具摘要前缀（回归靠它数「执行了几次」，新增工具必须同步）");
 

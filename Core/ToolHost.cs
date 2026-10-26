@@ -195,9 +195,12 @@ public sealed class ToolHost
             // 是按 `status=…` 到行尾取的，多一段就会把 category 读成 status 的一部分。
             // "这一行是不是角色标签"用**行数说明**给，模型照样能对上（非 general 行
             // 一律排在后面）。
-            var nonGeneral = rows.Count(x => x.Section != TagSections.General);
-            if (nonGeneral > 0)
-                sb.Append(", ").Append(nonGeneral)
+            // 只数**名字类**（角色/作品/画师）。数量/质量/安全这些控制词也属于
+            // 非 general 段，但它们不是"名字"，标成名字会让模型以为 `solo focus`
+            // 是个角色标签（2026-10-26 的回归 R19）。
+            var nameRows = rows.Count(x => IsNameSection(x.Section));
+            if (nameRows > 0)
+                sb.Append(", ").Append(nameRows)
                   .Append(" of them are character/series/artist tags (not scene tags)");
             sb.Append('\n');
 
@@ -253,10 +256,12 @@ public sealed class ToolHost
         if (res.SplitMatch)
         {
             // 先多取一些再过滤：前 25 条可能全是角色标签。
-            // 门槛收紧到"general + Anima 常用"：拆词本来就是弱匹配，再放冷门
+            // 门槛收紧到"非名字类 + Anima 常用"：拆词本来就是弱匹配，再放冷门
             // Danbooru 标签进来只会让调用方以为 `night` 之外还有别的场景词。
+            // **不能只留 general**：`1girl` / `solo` 属于"数量"段，它们是控制词，
+            // 按 general 过滤会把人数标签整片扔掉（2026-10-26 的回归）。
             var wide = TagSearch.QueryDetailed(db, query, TagSearch.ToolLimit);
-            hits = wide.Hits.Where(h => SectionOf(h.Tag, db) == TagSections.General
+            hits = wide.Hits.Where(h => !IsNameSection(SectionOf(h.Tag, db))
                                         && db.Status(h.Tag) == "anima").ToList();
         }
 
@@ -266,6 +271,25 @@ public sealed class ToolHost
             var section = SectionOf(h.Tag, db);
             rows.Add(new Row(h.Tag, h.HasCn ? h.Cn : "-", db.PostCount(h.Tag),
                              StatusOfTag(h.Tag, db, section), section));
+        }
+
+        // 整串能解析成标签时（规范写法 / 别名 / seed / 精确中文名），它必须排第一：
+        // 否则 `咖啡厅` 会被 `cafe (blue archive)`（中文名以「咖啡厅」开头）抢走，
+        // `sailor suit` 会被 `buro (sailor suit)`（一个 Muse Dash 角色）抢走。
+        if (!res.SplitMatch && rows.Count > 0)
+        {
+            var (head, headStatus) = ResolveHead(db, query);
+            if (head is not null && IsHeadStatus(headStatus))
+            {
+                if (!rows.Any(r => string.Equals(r.Tag, head, StringComparison.OrdinalIgnoreCase)))
+                {
+                    var sec = SectionOf(head, db);
+                    var cn = db.LookupCn(head);
+                    rows.Insert(0, new Row(head, cn.Length > 0 ? cn : "-", db.PostCount(head),
+                                           StatusOfTag(head, db, sec), sec));
+                    if (rows.Count > perQuery) rows.RemoveAt(rows.Count - 1);
+                }
+            }
         }
 
         // 查询本身就是控制词（`explicit`、`score_8` 在库里没有行）时，把它自己
@@ -278,11 +302,43 @@ public sealed class ToolHost
         // 单个英文词、且只命中角色/作品名时，不把这些名字当结果：调用方问的是
         // "refined 这个概念有没有标签"，给它 `refined barzam`（高达角色）只会被
         // 抄进提示词。名字搜索请给完整名字（多词，不触发这条）。
-        if (rows.Count > 0 && rows.All(r => r.Section != TagSections.General && r.Status != "control")
+        // **查询词本身是标签（`solo`、`2girls`）时不算**——那是精确命中，不是同名。
+        if (rows.Count > 0 && rows.All(r => IsNameSection(r.Section) || r.Status == "control")
+            && !rows.Any(r => string.Equals(r.Tag, query.Trim(), StringComparison.OrdinalIgnoreCase))
+            && !rows.Any(r => r.Status == "control")
             && IsSingleLatinWord(query))
             return (new List<Row>(), false, "namelike");
 
         return (rows, hits.Count > perQuery, res.SplitMatch ? "split" : "");
+    }
+
+    /// <summary>角色 / 作品 / 画师——这三类不是场景标签；数量、质量、安全、元信息是控制词，不算。</summary>
+    private static bool IsNameSection(string section) =>
+        section is TagSections.Character or TagSections.Series or TagSections.Artist;
+
+    /// <summary>`ResolveChinese` 的这几种状态算"整串就是这个概念"，模糊命中不算。</summary>
+    private static bool IsExactCnStatus(string status) =>
+        status is "seed" or "seed-unverified" or "exact" or "retired";
+
+    /// <summary>整串解析的结果"足以代表这条查询"的状态：精确中文名 / 别名 / 规范写法。</summary>
+    private static bool IsHeadStatus(string status) =>
+        IsExactCnStatus(status) || status is "alias" or "ok" or "underscore-fixed";
+
+    /// <summary>
+    /// 这条查询**整串**能不能直接解析成一个标签（先英文规范形式，再中文）。
+    /// 只用来把"它自己"提到结果第一行——不参与筛选，也不改变命中集合。
+    /// </summary>
+    private static (string? Tag, string Status) ResolveHead(VocabDb db, string query)
+    {
+        var en = db.ResolveEnglish(query);
+        if (en.Tag is not null) return (en.Tag, en.Status);
+
+        if (query.Any(VocabDb.IsCjk))
+        {
+            var cn = db.ResolveChinese(query);
+            if (cn.Tag is not null) return (cn.Tag, cn.Status);
+        }
+        return (null, "");
     }
 
     /// <summary>单个拉丁词（不含空格与 CJK）——用来区分"概念词"与"完整名字"。</summary>
@@ -302,8 +358,9 @@ public sealed class ToolHost
 
             var section = SectionOf(h.Tag, db);
             // 整句切出来的角色 / 作品名同样不该当场景标签：`银发的少女` 会切出
-            // `jeanne d'arc (girl from orleans) (fate)` 这种。
-            if (section != TagSections.General) continue;
+            // `jeanne d'arc (girl from orleans) (fate)` 这种。控制词（单人 → solo）
+            // 要留下——它们正是人数/构图信息。
+            if (IsNameSection(section)) continue;
 
             var cn = db.LookupCn(h.Tag);
             rows.Add(new Row(h.Tag, cn.Length > 0 ? cn : "-", db.PostCount(h.Tag),

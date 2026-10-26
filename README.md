@@ -177,9 +177,14 @@ resolved 1 of 2. not tags: qqzzxx. Do not use those as tags - say the concept in
 - **精确同名永远第一。** `Search` 原本给"无引用"标签加 10 分惩罚，于是 `masterpiece`
   排到 `world masterpiece theater` 后面——模型以为库里没有它。
 - **行保持四段**（tag / cn / posts / status），不加第五个字段：下游解析器是按
-  `status=` 到行尾取值的，多一段就会把额外字段读成状态。哪几行是角色/作品标签
-  由**查询标题**说明（`2 of them are character/series/artist tags`），这些行按热度
-  排在 general 之后。
+  `status=` 到行尾取值的，多一段就会把额外字段读成状态。哪几行是**名字类**
+  （角色 / 作品 / 画师）由**查询标题**说明
+  （`2 of them are character/series/artist tags`）。数量 / 质量 / 安全这些控制词
+  属于别的段，不算"名字"——`solo focus`、`no humans`、`multiple girls` 不会被这样标。
+- **整串命中排第一。** 查询本身能解析成标签时（规范写法 / 别名 / seed / 精确中文名），
+  那一行插到结果最前：否则 `咖啡厅` 会被 `cafe (blue archive)`（中文名以「咖啡厅」
+  开头）抢走，`sailor suit` 会被 `buro (sailor suit)`（一个 Muse Dash 角色）抢走。
+  排名规则本身也改成"标签名 / 主中文名 / **别名完全相等**"同属精确命中。
 - **图例只写一次**（原先每个结果重复约 150 字符），`posts` 与 `status` 进每一行；
   `resolve` 也真的给出帖数——工具说明一直承诺它，之前却没输出。
 - **不再写 `searches remaining: 0`**。那是给 AnimaCaptioner 自己的 agent 用的预算字段，
@@ -190,9 +195,12 @@ resolved 1 of 2. not tags: qqzzxx. Do not use those as tags - say the concept in
   (cap 12); 2 skipped.`——调用方往往只看第一行。
 - **中文整句走词库切分**：查询是中文短句、且整串/拆词都没给出好结果时，用 `Scan`
   按位置选最长词（`湿漉漉的街道` → `wet floor` + `street`），比逐词搜索准。
-- **拆词兜底只留 general + Anima 常用**：`rain night` 以前会给
-  `whisperain (arknights)`；单个英文词只命中角色名时直接回 none，并说明"这只出现在
-  角色/作品名里"（`refined` → 不再给 `refined barzam`）。
+- **拆词兜底只留"非名字类 + Anima 常用"**：`rain night` 以前会给
+  `whisperain (arknights)`。**不能只留 general**——`1girl` / `2girls` / `solo` 属于
+  "数量"段，按 general 过滤会把人数标签整片扔掉（2026-10-26 的回归）。
+  单个英文词只命中角色名时直接回 none，并说明"这只出现在角色/作品名里"
+  （`refined` → 不再给 `refined barzam`）；但查询词**本身就是标签**时不适用
+  （`solo`、`2girls` 是精确命中，不是同名）。
 - **`scan` 去重**：DP 逐位置输出，`雨` 在「雨中」「雨伞」里各命中一次就会给出两行
   `tag=rain`；现在同一段里同一个标签只留第一处。
 - **`scan` 报告没匹配上的片段**：写在 `text i/n:` 标题行上
@@ -827,7 +835,17 @@ WindowsAppRuntime 2.5.1 加载。
 `seed.json` 里写的是 `银发 → grey hair`——于是 `resolve`/`scan` 走 seed 给灰发、
 `search` 走词库 cn 给银发。中文语境里"银发"几乎总是 `silver hair`（亮银/冷调），
 `grey hair` 会画成灰白、显老。改的是 seed 母本（`vocab/seed.json`），
-`灰发 → grey hair` 保留。
+`灰发 → grey hair` 保留。同一份 seed 里补了 `咖啡厅 / 咖啡店 → cafe`
+（词库里 cafe 的中文名是"咖啡馆"，"咖啡厅"三个字只挂在
+`cafe (blue archive)`/`cafe maid` 这类长名上，通用词反而是查不到的那个）。
+
+### 已修：别名表错条（`sailor suit` → `serafuku`）
+
+Danbooru 的别名快照把 `sailor suit` 指向 `sailor`——那是"水手"**这个人**
+（6,759 帖），而它指的是水手服 `serafuku`（397,344 帖）。写进提示词就会画错。
+修在 `VocabDb.Load` 的加载层（`AliasFixes` 表，只放"语义写错、会直接画错图"的），
+代理与打标软件共用同一份内核，别的调用方（补全、校验、扫描）也不用各塞一张特例表；
+`sailor` 仍保留给"水手"本身，`sailor uniform`（439 帖）是真实标签，不动。
 
 ### 已知边界：人物 / 作品名整体不可用
 

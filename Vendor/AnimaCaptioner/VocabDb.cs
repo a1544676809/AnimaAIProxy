@@ -37,6 +37,15 @@ public sealed class VocabDb
     private static readonly HashSet<string> JunkCategories =
         new(StringComparer.Ordinal) { "artist", "character", "copyright", "原神角色" };
 
+    /// <summary>
+    /// 别名表里明确错的几条（见 <see cref="Load"/> 里的用法）。
+    /// 只放"语义写错、会直接画错图"的，不做同义润色——同义词走 seed。
+    /// </summary>
+    private static readonly (string From, string To)[] AliasFixes =
+    {
+        ("sailor suit", "serafuku"),
+    };
+
     private readonly Dictionary<string, VocabRow> _byTag = new(StringComparer.Ordinal);
     private readonly Dictionary<string, VocabRow> _byDanbooru = new(StringComparer.Ordinal);
     private readonly Dictionary<string, VocabRow> _cnExact = new(StringComparer.Ordinal);
@@ -172,6 +181,18 @@ public sealed class VocabDb
         {
             Log.Write("alias 缺失：" + ex.Message);
         }
+
+        // 别名表里明确错的那几条（数据源是 Danbooru 的别名快照，而它自己也有历史
+        // 遗留）：`sailor suit` 被指向 `sailor`——那是"水手"这个人（6,759 帖），
+        // 而 `sailor suit` 指的是水手服 `serafuku`（397,344 帖）。写进提示词就会
+        // 画错：模型会画一个水手，而不是穿水手服的少女。
+        //
+        // 修在**加载这一层**而不是工具层：代理与打标软件共用这份内核，别的调用方
+        // （补全、校验、扫描）也不该各塞一张特例表。`sailor` 仍保留给"水手"本身，
+        // `sailor uniform`（439 帖）是真实标签，不动。
+        foreach (var (from, to) in AliasFixes)
+            if (_byTag.ContainsKey(to) || _anima.ContainsKey(to))
+                _alias[from] = to;
 
         LoadSeed(seedPath);
         BuildCnKeys();
@@ -658,6 +679,27 @@ public sealed class VocabDb
     /// `cat smile` 这类 Anima 真正要用的标签，而程序其他地方（校验、解析）
     /// 都认它们——那种"校验说没问题、搜索却搜不到"的不一致比缺功能更难查。
     /// </summary>
+    /// <summary>
+    /// 别名列（竖线分隔）里有没有**完全等于**查询词的那一条。
+    ///
+    /// 逐条比而不是 `aliases.Contains(q)`：后者会把 `咖啡厅` 命中到别名
+    /// `咖啡厅分店` 这种前缀上，又回到"通用词输给长名字"的老问题。
+    /// </summary>
+    private static bool AliasExact(string aliases, string q)
+    {
+        if (aliases.Length == 0 || q.Length == 0) return false;
+        var at = 0;
+        while (at <= aliases.Length)
+        {
+            var end = aliases.IndexOf('|', at);
+            if (end < 0) end = aliases.Length;
+            if (end - at == q.Length && string.CompareOrdinal(aliases, at, q, 0, q.Length) == 0)
+                return true;
+            at = end + 1;
+        }
+        return false;
+    }
+
     public List<SearchHit> Search(string q, int limit = 60)
     {
         q = q.Trim();
@@ -670,7 +712,11 @@ public sealed class VocabDb
         {
             int score;
             var tl = tag.ToLowerInvariant();
-            if (tl == low || (cn.Length > 0 && cn == q)) score = 0;
+            // 精确命中三选一：标签名、主中文名、**别名里完全相同的那个**。
+            // 别名必须算精确：`咖啡厅` 是 `cafe` 的别名之一，而 `cafe (blue archive)`
+            // 的中文名以 `咖啡厅` 开头——按"前缀也算命中"排下去，通用词永远输给
+            // 一个 32 帖的作品地点。
+            if (tl == low || (cn.Length > 0 && cn == q) || AliasExact(aliases, q)) score = 0;
             else if (tl.StartsWith(low, StringComparison.Ordinal)) score = 1;
             else if (cn.Length > 0 && cn.StartsWith(q, StringComparison.Ordinal)) score = 2;
             else if (tl.Contains(low, StringComparison.Ordinal)) score = 3;
