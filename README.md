@@ -847,6 +847,27 @@ Danbooru 的别名快照把 `sailor suit` 指向 `sailor`——那是"水手"**�
 代理与打标软件共用同一份内核，别的调用方（补全、校验、扫描）也不用各塞一张特例表；
 `sailor` 仍保留给"水手"本身，`sailor uniform`（439 帖）是真实标签，不动。
 
+### 已修：seed 里反义 / 错标的词（2026-10-26 第二轮）
+
+评审逐个核对了中文映射，抓出一批"写进提示词会直接画错"的条目，已按词库实测改正：
+
+| 词 | 原映射 | 改成 | 依据 |
+| --- | --- | --- | --- |
+| `和服` | `japanese clothes`（536k，泛指日式服装） | `kimono`（347k） | kimono 的中文名就是"和服" |
+| `眨眼` | `one eye closed`（629k，单眼） | `blinking`（13k） | 中文"眨眼"是双眼；单眼另有 `单眼闭`/`wink` |
+| `顶光` | `underlighting`（底光，语义相反） | `overlighting`（552） | overlighting 的中文名是"顶光" |
+| `柔和光` / `柔和光线` | `dappled sunlight`（斑驳阳光） | `soft lighting` | 中文名"柔和光线"；注意该标签帖数为 0，`status=unknown` |
+| `海` / `海面` | `beach`（海滩） | `ocean`（147k，别名"大海"） | 海 ≠ 沙滩；`海滩`/`海边` 仍给 beach |
+| `跪坐` | `sitting on own leg`（32 帖） | `seiza`（50k，别名"日式跪坐"） | 正坐/跪坐都是 seiza |
+| `高光` | `shiny skin`（油亮皮肤） | 删除；改 `反光 → glint`、`皮肤高光 → shiny skin` | "高光"单独一个词没有对应标签，硬映射只会让模型写成油亮皮肤 |
+| `吊袜带` | `frilled thigh strap`（22k，荷叶边腿带） | `garter belt`（37k） | 中文名就是"吊袜带" |
+
+顺手补的：`正坐 → seiza`、`海面/大海 → ocean`、`海边 → beach`、
+`日式传统服装 → japanese clothes`、`荷叶边腿带 → frilled thigh strap`。
+
+回归里新增一条**"seed 的每个目标标签都必须真的存在"**：一条指向不存在标签的映射
+只在用到那个中文词时才暴露，后果是教模型写一个库里没有的名字。
+
 ### 已知边界：人物 / 作品名整体不可用
 
 `Vendor/AnimaCaptioner` 的 `ResolveChinese` 对**人物 / 作品名**整体是不可用的，这是它的设计：

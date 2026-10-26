@@ -429,6 +429,34 @@ public static class Vocab
         Harness.True("search 咖啡厅 第一行是 cafe",
                      cafeSearch.Text.Contains("1. tag=cafe |", StringComparison.Ordinal));
 
+        // (12) seed 里每一个目标标签都必须真的存在。一条指向不存在标签的映射
+        //      只在用到那个中文词时才暴露（`猫嘴 → cat smile` 差点被漏掉），
+        //      而且后果是教模型写一个库里没有的名字。
+        var seedFile = new ProxyConfig().SeedPath;
+        if (File.Exists(seedFile))
+        {
+            using var seedDoc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(seedFile));
+            if (seedDoc.RootElement.TryGetProperty("map", out var map))
+            {
+                var missing = new List<string>();
+                foreach (var p in map.EnumerateObject())
+                {
+                    if (p.Name.StartsWith('_')) continue;
+                    var target = p.Value.GetString() ?? "";
+                    if (target.Length == 0) continue;
+                    // Anima 原生标签（`topless`、`cat smile`）不在合并表里，
+                    // ResolveEnglish 认得它们——所以用解析而不是查表。
+                    if (vocab.ResolveEnglish(target).Tag is null) missing.Add(p.Name + "→" + target);
+                }
+                Harness.Eq("seed 的每个目标标签都真的存在", missing.Count, 0);
+                if (missing.Count > 0) Harness.Info("缺失：" + string.Join("；", missing));
+            }
+        }
+        else
+        {
+            Harness.Info("没有 seed 文件，跳过「目标存在」这条");
+        }
+
         // ---- 摘要前缀是 Core 与回归共用的契约 ----
         Harness.Section("7. 工具摘要前缀（回归靠它数「执行了几次」，新增工具必须同步）");
 
