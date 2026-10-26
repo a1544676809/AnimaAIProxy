@@ -362,11 +362,21 @@ public static class Vocab
         Harness.True("search 超 12 条的说明在**第一行**（调用方只看第一行）",
                      overSearch.Text.StartsWith("note: only 12 of 14", StringComparison.Ordinal));
 
-        // (7) scan 必须在标题行报告没匹配上的片段。
-        var unmatched = Run(ToolKind.Scan, "{\"texts\":[\"霓虹街道，雨夜\"]}");
+        // (7) scan 必须在标题行报告没匹配上的片段；已经匹配上的（复合词）不许误报。
+        var unmatched = Run(ToolKind.Scan, "{\"texts\":[\"霓虹街道，雨夜，贵族气质\"]}");
         Harness.Dump("未匹配片段", unmatched.Text);
         Harness.True("scan 标题行里有 unmatched",
                      unmatched.Text.Contains("tag(s); unmatched:", StringComparison.Ordinal));
+        // 只看 unmatched 里列出的那一段：整条输出里当然还回显着输入原文与 from 字段。
+        var uAt = unmatched.Text.IndexOf("unmatched: ", StringComparison.Ordinal);
+        var uTail = uAt >= 0
+            ? unmatched.Text[(uAt + "unmatched: ".Length)..].Split('\n')[0]
+            : "";
+        Harness.True("未匹配的是「贵族气质」", uTail.Contains("贵族", StringComparison.Ordinal));
+        Harness.True("已匹配的「霓虹」「雨夜」不会被报成 unmatched",
+                     uTail.Length > 0 &&
+                     !uTail.Contains("霓虹", StringComparison.Ordinal) &&
+                     !uTail.Contains("雨夜", StringComparison.Ordinal));
 
         // (8) 同一个标签 search 与 resolve 的帖数必须一致（以前 silver hair 一处 0、
         //     一处 336,802：search 读合并表、resolve 回落到 Anima 索引）。

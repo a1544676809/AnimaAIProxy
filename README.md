@@ -196,7 +196,7 @@ resolved 1 of 2. not tags: qqzzxx. Do not use those as tags - say the concept in
 - **`scan` 去重**：DP 逐位置输出，`雨` 在「雨中」「雨伞」里各命中一次就会给出两行
   `tag=rain`；现在同一段里同一个标签只留第一处。
 - **`scan` 报告没匹配上的片段**：写在 `text i/n:` 标题行上
-  （`... → 6 tag(s); unmatched: 少女、霓虹`）。长句里"夜"、"霓虹"悄悄丢掉时，
+  （`... → 8 tag(s); unmatched: 少女、要有贵族气质`）。长句里"夜"、"霓虹"悄悄丢掉时，
   模型会以为已经覆盖完整，于是不再补写——场景氛围就这么从提示词里消失了。
 
 ## 联网搜索（`web_search`）

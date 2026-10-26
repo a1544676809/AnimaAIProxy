@@ -537,14 +537,19 @@ public sealed class ToolHost
     private static string UnmatchedSuffix(string text, IReadOnlyList<ScanHit> hits)
     {
         var covered = new bool[text.Length];
-        var cursor = 0;
+        // 每个 Key 的**全部出现位置**都要算覆盖：复合词补充出来的 hit 顺序排在
+        // 后面，它对应的词却出现在原文更早的位置（`雨夜` 在 `rain` 之前就被扫过），
+        // 用单游标推进会漏掉，于是明明匹配上的「霓虹」仍被报成 unmatched。
         foreach (var h in hits)
         {
             if (string.IsNullOrEmpty(h.Key)) continue;
-            var at = text.IndexOf(h.Key, cursor, StringComparison.Ordinal);
-            if (at < 0) continue;
-            for (var k = at; k < at + h.Key.Length; k++) covered[k] = true;
-            cursor = at + h.Key.Length;
+            var at = 0;
+            while (at < text.Length &&
+                   (at = text.IndexOf(h.Key, at, StringComparison.Ordinal)) >= 0)
+            {
+                for (var k = at; k < at + h.Key.Length; k++) covered[k] = true;
+                at += h.Key.Length;
+            }
         }
 
         var parts = new List<string>();
