@@ -79,6 +79,27 @@
   </ItemGroup>
 
   <!--
+    Vendored 的 seed 母本（从 AnimaCaptioner 的 vocab/seed.json 原样搬入，
+    来源 commit 见 Vendor/AnimaCaptioner/VENDOR.md）。
+
+    **为什么它必须在输出目录里**：seed 是人工整理的"中文概念 → 标签"补充映射，
+    词库里本来就查不到的那些词全靠它（`银发 → silver hair`、`咖啡厅 → cafe`
+    这类）。而 `ProxyConfig.DefaultSeedPath()` 在借不到 AnimaCaptioner 的配置时
+    会回落到这一份 —— 从此"只装代理、没装上游软件"的机器也能拿到同一套映射，
+    而不是静默地没有 seed（症状是中文查询质量悄悄变差，且没有任何报错）。
+
+    放到 vocab\ 子目录、与应用自己的 `%LOCALAPPDATA%\AnimaAIProxy\vocab\seed.json`
+    保持同一形状，两个路径不会混。
+  -->
+  <ItemGroup>
+    <Content Include="Vendor\AnimaCaptioner\seed.json">
+      <Link>vocab\seed.json</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+  </ItemGroup>
+
+  <!--
     tests/ 是**另一个工程**（tests/proxycheck.csproj），它自己用相对路径把
     Core/ 与 Vendor/ 的真实源文件 Compile Include 进去。默认的通配会把
     tests/ 下的源文件——尤其是 tests/obj/ 里那些自动生成的 AssemblyInfo——

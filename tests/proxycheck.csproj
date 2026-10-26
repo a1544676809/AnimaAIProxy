@@ -43,6 +43,19 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!--
+      Vendored 的 seed 母本，复制到输出目录的 `vocab/seed.json` ——
+      **与应用输出同形状**，因为 `ProxyConfig.DefaultSeedPath()` 找的就是那个相对路径；
+      两处形状不同的话，回归会验不到应用真正走的那条回落分支。
+      `Vocab.ResolveSeedPath()` 在借不到 AnimaCaptioner 的配置时也回落到它。
+    -->
+    <None Include="..\Vendor\AnimaCaptioner\seed.json">
+      <Link>vocab\seed.json</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- 直接编译真实源文件（不是副本），所以一改就会被测到。
          用相对路径定位，clone 到任何地方都能构建。 -->
     <Compile Include="..\Vendor\AnimaCaptioner\*.cs" />

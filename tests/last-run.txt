@@ -3,7 +3,10 @@ AnimaAIProxy 回归：all
 === 1. 词库内核（vendored：VocabDb / TagSearch / TagSections） ===
        词库：vocab.sqlite（113.0 MB）
        seed：E:\ComfyUI\anima-vocab\seed.json
-       载入耗时 1404 ms
+  ok   随程序分发的 seed 在输出目录里（clone 下来就能复现）
+  ok   借不到上游配置时回落到随程序分发的 seed                               "E:\source\repos\AnimaAIProxy\tests\bin\Debug\net10.0\vocab\seed.json"
+  ok   回落出来的那份真的存在
+       载入耗时 1309 ms
   ok   标签数 > 30 万                                           True
   ok   Anima 索引非空
 
@@ -51,29 +54,201 @@ AnimaAIProxy 回归：all
   ok   挑出来的正是编的那个                                           "totally_made_up_tag_qq"
   ok   控制词 best quality 不误报                                 0
 
-=== 6. 工具层的中文解析回落（补上内核的括号限定缺口） ===
-  ok   danbooru_resolve_tag 能解析裸形式「弓」（内核落空 → 回落 Search）
-       resolve_tag(弓) → 核对「弓」→ bow (weapon)（Anima 常用）
-  ok   「箭头」→ arrow (symbol)
-       resolve_tag(箭头) → 核对「箭头」→ arrow (symbol)（Anima 常用）
+=== 6. 工具层：批量解析 + 中文括号限定缺口 ===
+  ..   批量核对原文（会被原样回灌给模型）
+       | 1. blush → tag=blush | cn=脸红 | posts=4,144,594 | status=anima
+       | 2. white_dress → tag=white dress | cn=白色连衣裙 | posts=460,878 | status=anima (spelling normalized)
+       | 3. 弓 → tag=bow (weapon) | cn=弓（武器） | posts=31,433 | status=anima (matched cn "弓（武器）")
+       | 4. qqzzxx_not_a_tag → NOT FOUND
+       | resolved 3 of 4. not tags: qqzzxx_not_a_tag. Do not use those as tags - say the concept in prose instead, or search for a different name.
+       | 
+  ok   英文标签命中
+  ok   拼写被规范化时带一句备注
+  ok   裸形式「弓」命中（内核落空 → 回落 Search）
+  ok   中文回落带上命中的完整中文名，模型才知道匹配的是括号形式
+  ok   行里同时给出帖数——工具说明承诺了 posts，就必须真的给
+  ok   未命中的那一行是 NOT FOUND
+  ok   未命中的名字在结尾统一列一次（不再每行重复三句英文）
+  ok   摘要只列第一个 + 总数                                         "核对「blush」等 4 个 → 3 命中"
   ok   `少女` 仍是 NOT FOUND（回落让内核裁类别，不吃角色标签）
   ok   前缀相似不算命中（`初音未` 仍是 NOT FOUND）
-  ok   人物名与内核保持一致（NOT FOUND），并把模型引向 search
+  ok   人物名与内核保持一致（NOT FOUND）
   ok   没有退而求其次挑一个冷门同名变体（不许变成 hatsune miku (cosplay)）
-  ok   英文标签仍然照常解析
+  ..   常见中文词（以前全查不到）
+       | 1. 内衣 → tag=lingerie | cn=内衣 | posts=67,932 | status=anima
+       | 2. 雨伞 → tag=umbrella | cn=雨伞 | posts=121,738 | status=anima
+       | 3. 长袖 → tag=long sleeves | cn=长袖 | posts=2,383,156 | status=anima
+       | 4. 荷叶边 → tag=frills | cn=荷叶边 | posts=784,398 | status=anima
+       | 5. 虎牙 → tag=fang | cn=虎牙 | posts=459,721 | status=anima
+       | 6. 痣 → tag=mole | cn=痣 | posts=407,554 | status=anima
+       | 7. 开心 → tag=happy | cn=开心 | posts=140,934 | status=anima
+       | resolved 7 of 7
+       | 
+  ok   雨伞 → umbrella（junk 行不再顶掉真标签）
+  ok   长袖 → long sleeves（junk 行不再顶掉真标签）
+  ok   荷叶边 → frills（junk 行不再顶掉真标签）
+  ok   虎牙 → fang（junk 行不再顶掉真标签）
+  ok   痣 → mole（junk 行不再顶掉真标签）
+  ok   开心 → happy（junk 行不再顶掉真标签）
+  ok   内衣 能解析出真标签（不再被画师/作品行顶掉）
+  ok   内衣 的标签有真实用量（posts=67,932，不是 14 帖的 junk 行）
+  ok   内衣 的状态可用（status=anima）
+  ..   批量切分原文
+       | text 1/2: 黑色雨伞，站在雨里，背景模糊 → 5 tag(s); unmatched: 黑色
+       |    tag=umbrella | from "雨伞" | status=anima
+       |    tag=standing | from "站" | status=anima
+       |    tag=rain | from "雨" | status=anima
+       |    tag=simple background | from "背景" | status=anima
+       |    tag=blurry | from "模糊" | status=anima
+       | text 2/2: 银发少女站在雨中 → 3 tag(s); unmatched: 少女
+       |    tag=silver hair | from "银发" | status=anima
+       |    tag=standing | from "站" | status=anima
+       |    tag=rain | from "雨" | status=anima
+       | 
+  ok   两段描述各自成段                                             2
+  ok   雨伞 → umbrella（长词优先，不再退化成单字「雨」）
+  ok   同一段里同一个标签不重复输出（rain 只出现一次）                           1
+  ok   scan 的结果行也带状态
+  ..   批量搜索原文
+       | query 1/2: white dress → 3 tag(s), 2 of them are character/series/artist tags (not scene tags)
+       | format: N. tag=<exact tag name> | cn=<meaning> | posts=<usage> | status=<anima|valid|retired|unknown|control>
+       | 1. tag=white dress | cn=白色连衣裙 | posts=460,878 | status=anima
+       | 2. tag=higuchi kaede (white dress) | cn=樋口枫（白色礼服） | posts=14 | status=valid
+       | 3. tag=hatsune miku (white dress) | cn=初音未来（白裙） | posts=10 | status=valid
+       | query 2/2: 蕾丝 → 5+ tag(s)
+       | 4. tag=lace | cn=蕾丝 | posts=49,988 | status=anima
+       | 5. tag=lace trim | cn=蕾丝花边 | posts=71,657 | status=anima
+       | 6. tag=frilled hair tubes | cn=蕾丝发筒 | posts=23,523 | status=anima
+       | 7. tag=frilled thigh strap | cn=蕾丝腿带 | posts=22,164 | status=anima
+       | 8. tag=lace-trimmed thighhighs | cn=蕾丝边过膝袜 | posts=16,972 | status=anima
+       | 
+  ok   两个查询各自成段                                             2
+  ok   行首是 `N. tag=`（模型靠它认标签名的边界）
+  ok   行里带帖数与状态
+  ok   图例只出现一次                                              1
+  ok   摘要带上词数
+
+=== 6b. 评审回归：同义词一致 / 控制词 / 拆词过滤 / 批量反馈 ===
+  ok   search 银发 → silver hair
+  ok   resolve 银发 → silver hair
+  ok   scan 银发 → silver hair
+  ok   三处都不再给 grey hair（灰发才是它）
+  ..   控制词批量核对
+       | 1. explicit → tag=explicit | cn=- | posts=- | status=control
+       | 2. score_8 → tag=score_8 | cn=- | posts=- | status=control
+       | 3. best quality → tag=best quality | cn=最佳质量 | posts=0 | status=control
+       | 4. masterpiece → tag=masterpiece | cn=杰作 | posts=0 | status=control
+       | 5. general → tag=general | cn=- | posts=- | status=control
+       | resolved 5 of 5
+       | note: "general" is the Danbooru rating word; Anima prompts use "safe".
+       | 
+  ok   explicit → status=control（词表里有、库里的行没有）
+  ok   score_8 → status=control
+  ok   masterpiece → tag=masterpiece 且 status=control（不是 unknown）
+  ok   Danbooru 的 general 仍是控制词，并说明 Anima 写 safe
+  ok   search masterpiece 第一行就是它自己
+  ..   拆词兜底结果
+       | query 1/1: rain night → 4 tag(s) (split into words; only general tags kept)
+       | format: N. tag=<exact tag name> | cn=<meaning> | posts=<usage> | status=<anima|valid|retired|unknown|control>
+       | 1. tag=night | cn=夜晚 | posts=173,239 | status=anima
+       | 2. tag=restrained | cn=束缚 | posts=71,561 | status=anima
+       | 3. tag=rain | cn=雨 | posts=49,325 | status=anima
+       | 4. tag=film grain | cn=胶片颗粒 | posts=26,969 | status=anima
+       | 
+  ok   拆词结果里没有带括号的角色/作品标签                                   0
+  ok   拆词结果里不再出现 arknights 角色
+  ok   拆词结果只留 status=anima 的 general 标签
+  ok   拆词结果里 rain / night 都在
+  ..   中文整句搜索
+       | query 1/1: 湿漉漉的街道 → 2 tag(s) (matched by splitting the phrase into known concepts)
+       | format: N. tag=<exact tag name> | cn=<meaning> | posts=<usage> | status=<anima|valid|retired|unknown|control>
+       | 1. tag=street | cn=街道 | posts=11,771 | status=anima
+       | 2. tag=wet floor | cn=湿漉漉的地板 | posts=797 | status=anima
+       | 
+  ok   湿漉漉的街道能给出 street
+  ok   并说明是按概念切分出来的（phrase fallback）
+  ok   雨夜同时给出 rain 与 night
+  ok   夜景 → night
+  ok   12 条查询全部有标题（一条都不丢）                                   12
+  ok   超过 40 条会写明丢了几条
+  ok   search 超 12 条的说明在**第一行**（调用方只看第一行）
+  ..   未匹配片段
+       | text 1/1: 霓虹街道，雨夜，贵族气质 → 4 tag(s); unmatched: 贵族气质
+       |    tag=street | from "街道" | status=anima
+       |    tag=rain | from "雨夜" | status=anima
+       |    tag=night | from "雨夜" | status=anima
+       |    tag=neon lights | from "霓虹街道" | status=anima
+       | 
+  ok   scan 标题行里有 unmatched
+  ok   未匹配的是「贵族气质」
+  ok   已匹配的「霓虹」「雨夜」不会被报成 unmatched
+  ok   search 与 resolve 的帖数一致                               "460,878"
+
+=== 6c. 第二轮评审回归 ===
+  ..   人数类标签
+       | query 1/8: 1girl → 3 tag(s)
+       | format: N. tag=<exact tag name> | cn=<meaning> | posts=<usage> | status=<anima|valid|retired|unknown|control>
+       | 1. tag=1girl | cn=单人女性 | posts=8,500,072 | status=anima
+       | 2. tag=1boy 1girl | cn=- | posts=137 | status=anima
+       | 3. tag=1boy1girl | cn=- | posts=130 | status=anima
+       | query 2/8: 1boy → 3 tag(s)
+       | 4. tag=1boy | cn=单人男性 | posts=2,156,761 | status=anima
+       | 5. tag=1boy 1girl | cn=- | posts=137 | status=anima
+       | 6. tag=1boy1girl | cn=- | posts=130 | status=anima
+       | query 3/8: 2girls → 1 tag(s)
+       | 7. tag=2girls | cn=双人女性 | posts=1,454,644 | status=anima
+       | query 4/8: 2boys → 1 tag(s)
+       | 8. tag=2boys | cn=双人男性 | posts=475,229 | status=anima
+       | query 5/8: 3girls → 1 tag(s)
+       | 9. tag=3girls | cn=三名女性 | posts=331,011 | status=anima
+       | query 6/8: 6+girls → 1 tag(s)
+       | 10. tag=6+girls | cn=6个以上女孩 | posts=108,533 | status=anima
+       | query 7/8: multiple girls → 1 tag(s)
+       | 11. tag=multiple girls | cn=多名女性 | posts=2,135,755 | status=anima
+       | query 8/8: solo → 3+ tag(s), 1 of them are character/series/artist tags (not scene tags)
+       | 12. tag=solo | cn=单人 | posts=7,134,318 | status=anima
+       | 13. tag=solo focus | cn=单人焦点 | posts=509,536 | status=anima
+       | 14. tag=solo leveling | cn=我独自升级 | posts=920 | status=anima
+       | 
+  ok   search 1girl 命中自身
+  ok   search 1boy 命中自身
+  ok   search 2girls 命中自身
+  ok   search 2boys 命中自身
+  ok   search 3girls 命中自身
+  ok   search 6+girls 命中自身
+  ok   search multiple girls 命中自身
+  ok   search solo 命中自身
+  ok   solo focus 的标题不声称含角色/作品标签
+  ok   no humans 的标题不声称含角色/作品标签
+  ok   multiple girls 的标题不声称含角色/作品标签
+  ..   咖啡厅 / sailor suit
+       | 1. 咖啡厅 → tag=cafe | cn=咖啡馆 | posts=4,694 | status=anima
+       | 2. sailor suit → tag=serafuku | cn=水手服 | posts=396,641 | status=anima (spelling normalized)
+       | resolved 2 of 2
+       | 
+  ok   咖啡厅 → cafe
+  ok   sailor suit → serafuku
+  ok   search 咖啡厅 第一行是 cafe
+  ok   seed 的每个目标标签都真的存在                                    0
 
 === 7. 工具摘要前缀（回归靠它数「执行了几次」，新增工具必须同步） ===
   ok   摘要前缀数与工具种类数一致                                        5
-  ok   Search 的摘要被前缀表认出（查「lace」→ 25 条）
-  ok   Resolve 的摘要被前缀表认出（核对「弓」→ bow (weapon)（Anima 常用））
-  ok   Scan 的摘要被前缀表认出（切分 → 无命中）
+  ok   Search 的摘要被前缀表认出（查「lace」→ 8 条）
+  ok   Resolve 的摘要被前缀表认出（核对「弓」→ 1 命中）
+  ok   Scan 的摘要被前缀表认出（切分「1girl, lace」→ 0 个标签）
 
 === 工具声明 ===
   ok   词库工具共三个（web_search 由配置门控，不在这里）                       3
   ok   名字都带 danbooru_ 前缀，降低与平台自己的工具撞名的概率
   ok   每个工具都有 object 参数块
   ok   每个工具都写了说明（平台不会替我们介绍它）
-  ok   search 的 required 里确实有 query
+  ok   三个工具都是批量入参（数组），单个只是长度为 1
+  ok   danbooru_search_tags 的 required 里确实有 queries
+  ok   danbooru_search_tags 的 queries 是 string 数组           "array"
+  ok   danbooru_resolve_tags 的 required 里确实有 tags
+  ok   danbooru_resolve_tags 的 tags 是 string 数组             "array"
+  ok   danbooru_scan_texts 的 required 里确实有 texts
+  ok   danbooru_scan_texts 的 texts 是 string 数组              "array"
   ok   包出来是 type=function                                   "function"
   ok   函数声明在 function 字段里
   ok   函数名一致                                                "danbooru_search_tags"
@@ -92,21 +267,21 @@ AnimaAIProxy 回归：all
   ok   三个工具一个不少                                             3
 
 === 工具参数读取（模型的手抖都要接住） ===
-  ok   标准对象                                                 "white dress"
-  ok   裸字符串（整个参数就是一个值）                                      "white dress"
-  ok   没加引号的裸值                                              ""
-  ok   纯文本参数                                                "white dress"
-  ok   字段名写错但只有一个字符串值 → 认它                                  "lace"
-  ok   数组包一层 → 取第一个                                         "lace"
-  ok   数字字段也认                                               "123"
-  ok   中文引号也剥掉                                              "lace"
-  ok   空参数                                                  ""
-  ok   空对象                                                  ""
-  ok   两个字符串字段时不敢猜（宁可为空）                                    ""
+  ok   标准数组                                                 "white dress,lace"
+  ok   数组里的空串与非字符串元素被丢掉                                     "a,b"
+  ok   重复项按大小写不敏感去重、保留顺序                                    "Lace,dress"
+  ok   声明是数组却传裸字符串 → 当单元素                                   "white dress"
+  ok   整个参数就是裸字符串                                           "lace"
+  ok   没加引号的裸值也认（小模型常见手抖）                                   "white dress"
+  ok   字段名写错 → 对象里的字符串数组照收                                  "blush"
+  ok   旧字段名（单数）仍然可用                                         "blush"
+  ok   对象数组不猜（不认识的形状宁可空）                                    ""
+  ok   空参数                                                  0
+  ok   超上限被截到 cap                                           2
   ok   limit 数字                                             5
-  ok   query 同时取出                                           "lace"
-  ok   limit 缺省用 ToolLimit                                  25
+  ok   limit 缺省用默认值                                         8
   ok   limit 写成字符串也认                                        3
+  ok   limit 非法时回落默认值                                       8
 
 === 工具循环：客户端工具一个不许动 ===
   ok   只调客户端工具时，上游只被问了一次                                    1
@@ -316,11 +491,11 @@ AnimaAIProxy 回归：all
   ok   LoadReal 读真配置之后，重定向仍然生效（没有被「读完恢复」拆掉）
 
 === 配置路径可被测试重定向（回归不许写掉用户的真配置） ===
-  ok   重定向后 ConfigPath 指向临时文件                               "C:\Users\14947\AppData\Local\Temp\aip-cfg-1e3db2ce.json"
+  ok   重定向后 ConfigPath 指向临时文件                               "C:\Users\14947\AppData\Local\Temp\aip-cfg-81c81a76.json"
   ok   重定向后不再指向真配置
   ok   Save 写的是临时文件
   ok   读回来的就是刚写的那份                                          45999
-  ok   还原后回到进程级防线设的路径（而不是真配置）                               "C:\Users\14947\AppData\Local\Temp\aip-check-9df033e3\proxy.config.json"
+  ok   还原后回到进程级防线设的路径（而不是真配置）                               "C:\Users\14947\AppData\Local\Temp\aip-check-06c73e15\proxy.config.json"
   ok   还原后依然不指向真配置
 
 === 自定义请求头：解析 ===
@@ -351,30 +526,30 @@ AnimaAIProxy 回归：all
   ok   兜底之后实体头确实生效了                                         "text/plain"
 
 === 按模型名路由到站点 ===
-  ok   模型表命中站点A                                             "03b10799956c"
-  ok   模型名大小写不敏感                                            "42434324e302"
+  ok   模型表命中站点A                                             "6301c6ef7e56"
+  ok   模型名大小写不敏感                                            "e8848d26bbff"
   ok   命中的是模型表里的那个名字（发往上游的就是它）                              "a1"
   ok   客户端报的名字原样记着（响应里回写用它）                                 "a1"
   ok   命中的判定值得进日志
-  ok   不在模型表里 → 默认站点                                        "03b10799956c"
+  ok   不在模型表里 → 默认站点                                        "6301c6ef7e56"
   ok   不在模型表里 → 模型名原样透传（上游自己会回准确的错）                         "local-llama"
   ok   这种判定不写日志（否则每个请求都刷一行）                                 False
-  ok   关掉的模型不再路由到它的站点                                       "42434324e302"
+  ok   关掉的模型不再路由到它的站点                                       "e8848d26bbff"
   ok   模型名仍然原样发出（不猜、不改）                                     "a2"
   ok   这是回落，不值得每个请求都写一行日志                                   False
-  ok   停用的站点不再接受路由                                          "03b10799956c"
+  ok   停用的站点不再接受路由                                          "6301c6ef7e56"
   ok   模型名仍然原样发出                                            "b1"
 
 === 模型名映射优先于模型表 ===
   ok   映射先换名字                                               "b1"
-  ok   再按换过的名字路由到站点B                                        "42434324e302"
+  ok   再按换过的名字路由到站点B                                        "e8848d26bbff"
   ok   映射的判定进日志（用户配了它就想看到生效）
   ok   日志里说清了换成了什么
 
 === 默认站点的选取与失效 ===
-  ok   指针指到谁就是谁                                             "42434324e302"
-  ok   指针失效 → 回落到第一个启用的站点（而不是让请求全废）                         "03b10799956c"
-  ok   指针指向一个已停用的站点 → 回落到启用的那个                              "03b10799956c"
+  ok   指针指到谁就是谁                                             "e8848d26bbff"
+  ok   指针失效 → 回落到第一个启用的站点（而不是让请求全废）                         "6301c6ef7e56"
+  ok   指针指向一个已停用的站点 → 回落到启用的那个                              "6301c6ef7e56"
   ok   全部停用 → 没有可用站点（如实报错，而不是偷偷发给一个停用的站点）                   null
   ok   此时路由也拿不到站点                                           null
   ok   一个站点都没有时给 null（调用方据此报「没有可用的模型提供商」）                   null
@@ -429,8 +604,8 @@ AnimaAIProxy 回归：all
   ok   迁移出一个站点                                              1
   ok   地址原样搬过去                                              "https://api.deepseek.com/v1"
   ok   名字从主机名派生（旧配置没有名字）                                    "api.deepseek.com"
-  ok   密文**原样**搬走（不解密再加密，少一次经手）                             "AQAAANCMnd8BFdERjHoAwE/Cl+sBAAAAOGt2ynk9wEmzfYBGqIqeCgAAAAACAAAAAAAQZgAAAAEAACAAAAAAm6XHYc…"
-  ok   默认站点指向它                                              "86a4b39f9dad"
+  ok   密文**原样**搬走（不解密再加密，少一次经手）                             "AQAAANCMnd8BFdERjHoAwE/Cl+sBAAAAWvQo03l4ykGAkNXmo7gdRgAAAAACAAAAAAAQZgAAAAEAACAAAAATK3cvbD…"
+  ok   默认站点指向它                                              "2cb86743f332"
   ok   旧字段被置空（不留两份真值来源）
   ok   旧密钥字段也置空
   ok   迁移后密钥能正常读出来（缓存没挡住）                                   "sk-old-key-123456"
@@ -686,6 +861,99 @@ AnimaAIProxy 回归：all
   ok   回环目标也走代理（不被 BypassProxyOnLocal 绕过）                   True
   ok   代理收到了那个回环目标的请求
 
+=== 网页获取：瞬时失败重试 ===
+  ok   瞬时失败后重试了一次                                           2
+  ok   重试成功即视为成功                                            True
+  ok   成功的是 HTTP 引擎（没有白起浏览器）                                "http"
+  ok   重试成功后不启动浏览器                                          0
+  ok   拿到的是重试那次的正文                                          "重试后拿到的"
+  ok   一直失败也只试两次                                            2
+  ok   两次都失败则如实报错                                           False
+  ok   仍然按降级判据启动了浏览器                                        1
+  ok   错误里保留了传输失败的原因
+  ok   超时不重试                                                1
+  ok   超时如实报成超时，不报成传输失败
+  ok   TLS EOF → 重试                                         True
+  ok   连接被重置 → 重试                                           True
+  ok   连接被中止 → 重试                                           True
+  ok   域名不存在 → 不重试（重试必然一样）                                  False
+  ok   域名无数据 → 不重试                                          False
+  ok   目标拒绝连接 → 不重试（立即重试没有意义）                               False
+  ok   超时异常 → 不重试                                           False
+
+=== 网页获取：临时目录清理时间 ===
+  ok   档位个数                                                 8
+  ok   第一个是立即清理                                             0
+  ok   第二个是 5 分钟（默认）                                        300
+  ok   默认值就是 5 分钟                                           300
+  ok   最后一个是永不清理                                            -1
+  ok   档位里有 1 天                                             True
+  ok   档位里有 1 个月                                            True
+  ok   自定义单位个数                                              5
+  ok   自定义单位第一个是年                                           "年"
+  ok   自定义单位最后一个是分                                          "分"
+  ok   一年按 365 天算                                           31536000
+  ok   一个月按 30 天算                                           2592000
+  ok   立即清理的标签                                              "立即清理"
+  ok   永不清理的标签                                              "永不清理"
+  ok   300 秒说成 5 分钟                                         "5 分钟"
+  ok   2592000 秒说成 1 个月                                     "1 个月"
+  ok   5400 秒说成 1 小时 30 分钟                                  "1 小时 30 分钟"
+  ok   45 秒                                                 "45 秒"
+  ok   2 时 = 7200 秒                                         7200
+  ok   3 日 = 259200 秒                                       259200
+  ok   手填 0 也当成 1（否则会变成'立即清理'这个完全不同的意思）                     3600
+  ok   填超大数被钳到上限，而不是溢出成负数                                   315360000
+  ok   7200 秒显示成 2                                          2
+  ok   7200 秒用最大的整除单位（时）                                    3600
+  ok   600 秒显示成 10                                          10
+  ok   600 秒用分                                              60
+  ok   往返一致：60 秒                                            60
+  ok   往返一致：600 秒                                           600
+  ok   往返一致：3600 秒                                          3600
+  ok   往返一致：7200 秒                                          7200
+  ok   往返一致：86400 秒                                         86400
+  ok   往返一致：259200 秒                                        259200
+  ok   往返一致：2592000 秒                                       2592000
+  ok   往返一致：31536000 秒                                      31536000
+  ok   -1（永不）合法                                             -1
+  ok   0（立即）合法                                              0
+  ok   300 合法                                               300
+  ok   -5 认不出 → 默认                                          300
+  ok   超过上限 → 默认                                            300
+  ok   永不清理的状态行点明内存代价
+  ok   立即清理的状态行点明没有复用
+  ok   普通档位的状态行说明会复用
+  ok   旧版 0 秒（抓完就关）→ 立即清理                                   0
+  ok   迁移后旧字段被清空（新配置里不再出现这个键）                               null
+  ok   旧版 1800 秒 → 1800 秒                                   1800
+  ok   旧值 == 新默认值时保持新字段不变                                   300
+  ok   手改的非法值被拉回默认                                          300
+
+=== 网页获取：浏览器与临时目录的回收 ===
+  ok   启动参数含 --headless=new（否则会弹出可见窗口）
+  ok   用户数据目录指向我们自己的临时目录
+  ok   代理透传给浏览器
+  ok   不给代理时不加 --proxy-server                               False
+  ok   用随机调试端口（固定端口会撞上用户自己开着的 Edge）
+  ok   新建目录带统一前缀
+  ok   目录建在 %TEMP% 下
+  ok   没有锁文件的目录算'没人在用'                                      False
+  ok   被锁着的目录算'在用'                                          True
+  ok   立即清理只清掉没人在用的那个                                       1
+  ok   在用中的目录还在（绝不误删活着的实例）                                  True
+  ok   没人在用的目录立刻没了                                          False
+  ok   不匹配前缀的目录一概不碰                                         True
+  ok   锁一释放，同一个目录就变成可清理                                     False
+  ok   释放锁后立即清理清掉了它                                         1
+  ok   报告了释放的字节数（界面要显示释放了多少）
+  ok   已清理的目录确实没了                                           False
+  ok   阈值大于零时新目录被保留                                         0
+  ok   新目录确实还在                                              True
+  ok   删不存在的目录算成功                                           True
+  ok   空路径不抛                                                True
+  ok   null 不抛                                              True
+
 === 令牌：生成与校验 ===
   ok   明文带 aip- 前缀（一眼看出是代理签发的）
   ok   明文足够长
@@ -727,7 +995,7 @@ AnimaAIProxy 回归：all
   ok   大小写不敏感                                               "deepseek-v4-pro"
   ok   没配映射的原样透传（不猜）                                        "some-local-model"
   ok   空模型名原样                                               ""
-  ok   映射后按换过的名字路由到那个站点                                     "44a4c43b1204"
+  ok   映射后按换过的名字路由到那个站点                                     "ef97b0bc157b"
   ok   开了兜底时未映射的走兜底                                         "backup-model"
   ok   默认不开兜底：静默换模型比报错更难查                                   False
 
@@ -767,7 +1035,7 @@ AnimaAIProxy 回归：all
   ok   上游连不上 → 502                                          502
   ok   错误体里有 error.message
   ok   错误信息说清了是连不上上游，而不是含糊的「请求失败」
-       上游不可达时的响应：{"error":{"message":"连不上上游：由于目标计算机积极拒绝，无法连接。 (127.0.0.1:55222)","type":"upstream_error"}}
+       上游不可达时的响应：{"error":{"message":"连不上上游：由于目标计算机积极拒绝，无法连接。 (127.0.0.1:51026)","type":"upstream_error"}}
   ok   坏 JSON → 400                                         400
   ok   上游连不上也照常回 200（模型表是本地勾选的结果）                           200
   ok   勾选启用的模型在表里
@@ -778,6 +1046,187 @@ AnimaAIProxy 回归：all
   ok   关掉工具注入后仍然只是转发，状态码照样如实
   ok   服务停了
   ok   停止后端口已释放
+
+=== MCP 协议层（不起 HTTP） ===
+  ok   initialize → 200                                     200
+  ok   协议版本按客户端那个回                                          "2025-06-18"
+  ok   capabilities.tools 存在（只声明我们真有的能力）
+  ok   listChanged=false（工具集合要重启才变，不发假通知）                   "false"
+  ok   serverInfo.name                                      "AnimaAIProxy"
+  ok   serverInfo.version 非空
+  ok   instructions 交代了「绝不凭记忆写标签名」
+  ok   客户端报不认识的版本 → 回我们自己最新的那个                              "2025-06-18"
+  ok   客户端没报版本 → 也回最新的                                      "2025-06-18"
+  ok   认识的老版本原样回（客户端据此确认能按它说话）                              "2024-11-05"
+  ok   坏 JSON → 400                                         400
+  ok   坏 JSON 的错误码是 -32700                                  "-32700"
+  ok   jsonrpc 不是 2.0 → 400                                 400
+  ok   jsonrpc 不是 2.0 → -32600                              "-32600"
+  ok   批量 → 400（2025-06-18 已移除批量）                           400
+  ok   批量的错误码是 -32600                                       "-32600"
+  ok   批量错误里说清了原因（不是一句含糊的 invalid request）
+  ok   不认识的方法 → -32601                                      "-32601"
+  ok   缺 method → -32600                                    "-32600"
+  ok   通知 → 202                                             202
+  ok   通知不回任何 JSON（写了客户端会当成 id 对不上的响应）
+  ok   通知的 IsNotification                                   True
+  ok   数字 id 回数字                                            "7"
+  ok   字符串 id 回字符串                                          ""abc""
+  ok   默认 4 个工具（词库三个 + web_fetch）                           4
+  ok   有 danbooru_search_tags
+  ok   有 danbooru_resolve_tags
+  ok   有 danbooru_scan_texts
+  ok   没配搜索 → 不下发 web_search（下发一个必然失败的工具更糟）
+  ok   默认带 web_fetch（抓取默认开，auto 不需要本机有浏览器）
+  ok   每个工具都有 inputSchema                                   "object"
+  ok   工具说明非空（客户端拿它决定什么时候调）
+  ok   配好之后 5 个工具                                           5
+  ok   多了 web_search
+  ok   多了 web_fetch
+  ok   词库工具排在最前（模型从上往下读，常用的是它们）
+  ok   未知工具 → -32602                                        "-32602"
+  ok   未知工具的错误里列了可用工具（排障要靠它）
+  ok   缺 name → -32602                                      "-32602"
+  ok   词库不可用时工具调用本身仍走完（200，不是 500）                          200
+  ok   isError=true（这次查不了）
+  ok   文本里写了数据库不可用（而不是「没有这个标签」）
+  ok   content[0].type == text
+
+=== MCP 传输层：独立服务（与转发 API 分开） ===
+  ok   两个服务默认用不同端口（撞了 Normalize 会让开）
+  ok   MCP 单独就能起来（转发 API 没起）
+  ok   客户端地址用的是 MCP 自己的端口                                   "http://127.0.0.1:51037/mcp"
+  ok   没有令牌 → 401                                           401
+  ok   401 体是 JSON-RPC 形状（MCP 客户端按它解析）
+  ok   错令牌 → 401                                            401
+  ok   带令牌 initialize → 200                                 200
+  ok   initialize 回的是协商后的版本                                 "2025-06-18"
+  ok   content-type 是 application/json
+  ok   tools/list 4 个工具（词库三个 + web_fetch）                   4
+  ok   tools/call 有 content 数组
+  ok   通知 → 202                                             202
+  ok   通知没有响应体                                              0
+  ok   GET /mcp → 405（没有 SSE 流）                             405
+  ok   405 带 Allow: POST
+  ok   DELETE /mcp → 405（无状态，没有会话可结束）                       405
+  ok   Origin 是外站 → 403（DNS rebinding / 网页 CSRF）            403
+  ok   Origin 是本机自己 → 200                                   200
+  ok   不带 Origin（本地客户端常态）→ 200                              200
+  ok   MCP /health 报 ok                                     "ok"
+  ok   MCP /health 报工具数                                     "4"
+  ok   MCP /health 不列工具名（那是给有令牌的人看的）
+  ok   关掉 danbooru_scan_texts 后清单只剩 3 个                     3
+  ok   关掉的工具调不动（-32602，不是"能调但看不见"）                          "-32602"
+  ok   转发 API 也能起来（两个服务可以同时运行）
+  ok   转发端口上没有 /mcp → 404                                   404
+  ok   MCP 端口上没有 /v1/models → 404                           404
+  ok   转发端口上的 /health 仍然在                                   200
+  ok   MCP 停了
+  ok   MCP 停掉后转发 API 照样在                                    200
+  ok   两个服务都停了
+
+=== IP 名单：解析 ===
+  ok   有效条目 6 条（注释与空行跳过）                                    6
+  ok   写错的 4 条被收进 errors                                    4
+  ok   errors 里保留原文（界面要能逐条指出来）
+  ok   缺省前缀按单地址算：10.0.0.7 → /32
+  ok   主机位会被清零：10.0.0.5/8 与 10.0.0.0/8 等价
+  ok   v6 单地址 /128
+  ok   空串不是合法条目
+
+=== IP 名单：匹配 ===
+  ok   192.168.1.5 命中 /24
+  ok   192.168.2.5 不在 /24 里
+  ok   10.0.0.7 精确命中
+  ok   10.0.0.8 不算命中
+  ok   fd00::1 命中 fd00::/8
+  ok   2001:db8:1::5 命中 /32
+  ok   2001:db9::1 不在 /32 里
+  ok   IPv4-mapped IPv6 也能命中 127.0.0.1
+  ok   ::1 命中 ::1
+  ok   127.0.0.1 不命中 ::1（不同地址族，不该互相折）
+  ok   空名单谁都不命中
+  ok   null 地址不命中（也不抛）
+
+=== IP 名单：配置语义 ===
+  ok   list 是合法的范围值（不会被收敛成 local）                           "list"
+  ok   list 模式下 Kestrel 必须绑所有网卡（绑回环就没人能连）
+  ok   模式大小写不敏感                                             "allow"
+  ok   认不出的模式一律当黑名单（更严的那边）                                  "deny"
+  ok   状态行说清条数                                              True
+  ok   状态行点名写错的那条
+  ok   白名单空着 = 拒绝所有人（必须说出来）
+  ok   黑名单空着 = 不拦任何人（两种空名单含义相反）
+  ok   MCP 的 list 被收回 local                                 "local"
+  ok   转发 API 的 list 保留                                     "list"
+
+=== 局域网模式放行哪些地址（Tailscale 段刻意不在其中） ===
+  ok   10.1.2.3 → 放行（RFC1918 10/8）
+  ok   172.16.0.1 → 放行（172.16/12 下界）
+  ok   172.31.255.254 → 放行（172.16/12 上界）
+  ok   172.32.0.1 → 拒绝（172.16/12 之外）
+  ok   192.168.1.1 → 放行
+  ok   169.254.10.20 → 放行（链路本地）
+  ok   127.0.0.1 → 放行（回环）
+  ok   100.64.0.1 → 拒绝（Tailscale 段不在 lan 预设里）
+  ok   100.101.102.103 → 拒绝（同上）
+  ok   100.127.255.254 → 拒绝（同上）
+  ok   100.63.255.255 → 拒绝
+  ok   100.128.0.1 → 拒绝
+  ok   100.64.0.1 的 IPv4-mapped 写法 → 同样拒绝（归一后一致）
+  ok   fd00::1 → 放行（v6 ULA）
+  ok   fd7a:115c:a1e0::1 → 放行（Tailscale 的 v6 段落在 fc00::/7，这条没动）
+  ok   fe80::1 → 放行（v6 链路本地）
+  ok   2001:db8::1 → 拒绝（公网文档段）
+  ok   8.8.8.8 → 拒绝（公网）
+
+=== 放行判定：范围给基线，名单做叠加 ===
+  ok   lan+黑名单：名单里的私有地址被额外屏蔽
+  ok   lan+黑名单：其他私有地址照常放行
+  ok   lan+黑名单：公网仍被范围挡住
+  ok   lan+白名单：名单里的 Tailscale 段被额外放行
+  ok   lan+白名单：名单里的公网地址也被额外放行
+  ok   lan+白名单：局域网本来就放行
+  ok   lan+白名单：名单外的公网仍拒绝
+  ok   本机+黑名单：连回环都被屏蔽
+  ok   本机+白名单：列表里的外部地址被额外放行
+  ok   本机+白名单：回环仍在
+  ok   本机+白名单：列表外的外部地址仍拒绝
+  ok   任意来源+黑名单：名单里的被屏蔽
+  ok   任意来源+黑名单：其余照常
+  ok   任意来源+白名单：本来就全放行，白名单不改变结果
+  ok   自定义+白名单：只放行名单里的
+  ok   自定义+白名单：回环也拒绝（没有暗门）
+  ok   自定义+黑名单：名单外的全放行
+  ok   自定义+黑名单：名单里的拒绝
+  ok   lan+黑名单+空名单 = 局域网原样
+  ok   lan+白名单+空名单 = 局域网原样（不是拒绝所有人）
+  ok   自定义+白名单+空名单 = 拒绝所有人
+  ok   自定义+白名单+空名单：回环也拒绝
+
+=== IP 名单：真的起一次 Kestrel 从回环发请求 ===
+         HTTP 502: {"error":{"message":"连不上上游：由于目标计算机积极拒绝，无法连接。 (127.0.0.1:51041)","type":"upstream_error"}}
+  ok   白名单含 127.0.0.1 → 放行（死上游给出 502，说明真的转发了）               502
+         HTTP 403: {"error":{"message":"来源地址不在允许的范围内。","type":"invalid_request_error","code":"invalid_api_key"}}
+  ok   白名单不含回环 → 403                                        403
+         HTTP 403: {"error":{"message":"来源地址不在允许的范围内。","type":"invalid_request_error","code":"invalid_api_key"}}
+  ok   白名单空着 → 403（不是「没配置就放行」）                              403
+         HTTP 403: {"error":{"message":"来源地址不在允许的范围内。","type":"invalid_request_error","code":"invalid_api_key"}}
+  ok   黑名单含回环 → 403                                         403
+         HTTP 502: {"error":{"message":"连不上上游：由于目标计算机积极拒绝，无法连接。 (127.0.0.1:51041)","type":"upstream_error"}}
+  ok   黑名单不含回环 → 放行                                         502
+         HTTP 403: {"error":{"message":"来源地址不在允许的范围内。","type":"invalid_request_error","code":"invalid_api_key"}}
+  ok   黑名单写 ::1/128 → 经 [::1] 连接被拦                          403
+         HTTP 502: {"error":{"message":"连不上上游：由于目标计算机积极拒绝，无法连接。 (127.0.0.1:51041)","type":"upstream_error"}}
+  ok   黑名单不含 ::1 → 经 [::1] 放行                               502
+         HTTP 502: {"error":{"message":"连不上上游：由于目标计算机积极拒绝，无法连接。 (127.0.0.1:51041)","type":"upstream_error"}}
+  ok   名单里有写错的行时，其余条目照常生效                                   502
+         HTTP 403: {"error":{"message":"来源地址不在允许的范围内。","type":"invalid_request_error","code":"invalid_api_key"}}
+  ok   局域网 + 黑名单含回环 → 403（额外屏蔽）                             403
+         HTTP 502: {"error":{"message":"连不上上游：由于目标计算机积极拒绝，无法连接。 (127.0.0.1:51041)","type":"upstream_error"}}
+  ok   局域网 + 黑名单不含回环 → 放行（基线还在）                             502
+         HTTP 502: {"error":{"message":"连不上上游：由于目标计算机积极拒绝，无法连接。 (127.0.0.1:51041)","type":"upstream_error"}}
+  ok   局域网 + 白名单（只有 Tailscale 段）→ 回环仍放行（额外放行，不是只看名单）        502
 
 === 端到端：客户端 → 代理 → 桩上游（全部真实 HTTP） ===
   ok   整条链路走通，200                                           200
@@ -790,7 +1239,7 @@ AnimaAIProxy 回归：all
   ok   系统提示里追加了工具说明，且接入方原有的还在
   ok   第二轮请求里带上了 role:tool 的工具结果
   ok   工具结果里是真实词库查出来的标签（弓 → bow (weapon)）
-       工具回灌给模型的内容：query: 弓 …（共 28 行）
+       工具回灌给模型的内容：query 1/1: 弓 → 8+ tag(s), 4 of them are character/series/artist tags (not scene tags) …（共 11 行）
   ok   客户端拿到的是模型的最终回答                                       "弓 对应的标签是 bow (weapon)。"
   ok   客户端看不到我们的任何 tool_call（摘干净了）                          0
   ok   finish_reason 改回 stop（否则客户端会等一个不存在的工具）               "stop"
@@ -813,8 +1262,8 @@ AnimaAIProxy 回归：all
   ok   流式路径也注入了我们的工具（旧行为是不注入）
   ok   流式路径也带了 reasoning_effort（不劫持）                        "high"
   ok   数据是分多次到达的（收到 6 次读，不是一次）
-  ok   首块远早于最后一块（首块 0ms / 总 1078ms）
-       流式时序：读次数=6，首块=0ms，总耗时=1078ms
+  ok   首块远早于最后一块（首块 0ms / 总 1090ms）
+       流式时序：读次数=6，首块=0ms，总耗时=1090ms
   ok   流式注入：上游被问了两次（工具轮 + 收尾轮）                              2
   ok   第二轮请求里带上了 role:tool 的工具结果
   ok   流式路径里工具是真的在本地执行的（弓 → bow (weapon)）

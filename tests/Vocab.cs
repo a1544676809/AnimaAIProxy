@@ -36,11 +36,27 @@ public static class Vocab
         return SettingsPathProbe.VocabDbPathFromSettings();
     }
 
+    /// <summary>
+    /// seed 的解析顺序：环境变量 &gt; AnimaCaptioner 的 settings.json &gt; **随程序
+    /// 分发的那一份**（<c>Vendor/AnimaCaptioner/seed.json</c>，构建时复制到输出目录）。
+    ///
+    /// 最后一档是给"clone 下来就跑回归、没装 AnimaCaptioner"的人准备的。少了它，
+    /// 中英映射断言的结果取决于**他手上有没有那份 seed 母本**：`银发` 在旧 seed 里
+    /// 是 `grey hair`，于是 6 条断言会红，而红的原因（seed 版本不同）在输出里完全
+    /// 看不出来——这正是这类"数据不在仓库里"的依赖最容易骗人的地方。
+    /// </summary>
     public static string? ResolveSeedPath()
     {
         var env = Environment.GetEnvironmentVariable("AIP_SEED");
         if (!string.IsNullOrWhiteSpace(env)) return env;
-        return SettingsPathProbe.SeedPathFromSettings();
+
+        var borrowed = SettingsPathProbe.SeedPathFromSettings();
+        if (!string.IsNullOrWhiteSpace(borrowed) && File.Exists(borrowed)) return borrowed;
+
+        var shipped = Path.Combine(AppContext.BaseDirectory, "vocab", "seed.json");
+        if (File.Exists(shipped)) return shipped;
+
+        return borrowed;
     }
 
     public static void Run(string[] args)
@@ -60,6 +76,30 @@ public static class Vocab
         var seed = ResolveSeedPath();
         Harness.Info("词库：" + VocabDb.Describe(db));
         Harness.Info("seed：" + (seed is not null && File.Exists(seed) ? seed : "(无)"));
+
+        // Vendored 的 seed 必须真的被复制到输出目录：这是"没装 AnimaCaptioner 的机器
+        // 也能拿到同一套中文映射"的唯一保证。少了它，下面那批中文断言会随
+        // 用户手上有没有 seed 母本而红，而红的原因在输出里看不出来。
+        var shippedSeed = Path.Combine(AppContext.BaseDirectory, "vocab", "seed.json");
+        Harness.True("随程序分发的 seed 在输出目录里（clone 下来就能复现）",
+                     File.Exists(shippedSeed));
+
+        // 借不到上游配置（= 绝大多数机器，包括所有没装打标软件的人）时，
+        // `DefaultSeedPath()` 必须回落到随程序分发的那份。这条分支本机走不到
+        // （本机装着 AnimaCaptioner），所以用一个接缝把它指到一个不存在的文件。
+        var probeBefore = ProxyConfig.CaptionerSettingsPathOverride;
+        try
+        {
+            ProxyConfig.CaptionerSettingsPathOverride =
+                Path.Combine(Path.GetTempPath(), "aip-no-such-captioner-settings.json");
+
+            var ownCopy = Path.Combine(ProxyConfig.Dir, "vocab", "seed.json");
+            var expected = File.Exists(ownCopy) ? ownCopy : shippedSeed;
+            Harness.Eq("借不到上游配置时回落到随程序分发的 seed",
+                       ProxyConfig.DefaultSeedPath(), expected);
+            Harness.True("回落出来的那份真的存在", File.Exists(ProxyConfig.DefaultSeedPath()));
+        }
+        finally { ProxyConfig.CaptionerSettingsPathOverride = probeBefore; }
 
         var vocab = new VocabDb();
         var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -226,12 +266,33 @@ public static class Vocab
         Harness.Dump("常见中文词（以前全查不到）", cnFix.Text);
         var cnExpect = new (string Input, string Tag)[]
         {
-            ("内衣", "underwear"), ("雨伞", "umbrella"), ("长袖", "long sleeves"),
+            ("雨伞", "umbrella"), ("长袖", "long sleeves"),
             ("荷叶边", "frills"), ("虎牙", "fang"), ("痣", "mole"), ("开心", "happy"),
         };
         foreach (var (input, tag) in cnExpect)
             Harness.True($"{input} → {tag}（junk 行不再顶掉真标签）",
                          cnFix.Text.Contains($"{input} → tag={tag} ", StringComparison.Ordinal));
+
+        // `内衣` 刻意**不写死**具体标签。同名三行里两行非 junk（`lingerie` 6.8 万帖、
+        // `underwear` 103 万帖），留哪一条只取决于词库快照的 rowid 顺序：
+        // 本机 10-05 的快照给 `lingerie`，较新的快照给 `underwear`——同一份代码在
+        // 两台机器上给出不同答案（实测过），两者都是真标签。
+        //
+        // 钉死其中一个会在换快照时假红，而这条断言真正要防的是原来那个 bug：
+        // **junk 行（`lingeries` 14 帖）顶掉真标签 → 模型拿到"这个词不存在"**。
+        // 所以钉意图：必须解析出一条 non-junk、有真实用量的标签。
+        var braLine = cnFix.Text.Split('\n')
+            .FirstOrDefault(l => l.Contains("内衣 → tag=", StringComparison.Ordinal));
+        Harness.True("内衣 能解析出真标签（不再被画师/作品行顶掉）", braLine is not null);
+        if (braLine is not null)
+        {
+            var postsText = Between(braLine, "posts=", " |");
+            var statusText = Between(braLine, "status=", " |").Trim();
+            Harness.True($"内衣 的标签有真实用量（posts={postsText}，不是 14 帖的 junk 行）",
+                         long.TryParse(postsText.Replace(",", ""), out var posts) && posts >= 10_000);
+            Harness.True($"内衣 的状态可用（status={statusText}）",
+                         statusText is "anima" or "valid");
+        }
 
         // ---- scan：批量 + 去重 + 长词优先 ----
         var scan = Run(ToolKind.Scan,
@@ -480,6 +541,26 @@ public static class Vocab
             Harness.True($"{kind} 的摘要被前缀表认出（{r.Summary}）",
                          ToolHost.SummaryPrefixes.Any(p => r.Summary.StartsWith(p, StringComparison.Ordinal)));
         }
+    }
+
+    /// <summary>
+    /// 取一行里 `from` 之后、`to` 之前的那一段；`to` 不在同一行时取到行尾。
+    ///
+    /// 用于按字段判断言（`posts=` / `status=`），这样换词库快照、标签名变了，
+    /// 断言仍能验"这条结果是不是可用的"，而不是只会比字符串。
+    /// </summary>
+    private static string Between(string line, string from, string to)
+    {
+        var i = line.IndexOf(from, StringComparison.Ordinal);
+        if (i < 0) return "";
+        var s = i + from.Length;
+        var e = line.IndexOf(to, s, StringComparison.Ordinal);
+        if (e < 0)
+        {
+            var nl = line.IndexOf('\n', s);
+            e = nl < 0 ? line.Length : nl;
+        }
+        return line[s..e];
     }
 
     /// <summary>

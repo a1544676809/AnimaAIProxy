@@ -542,9 +542,36 @@ AnimaCaptioner 里 shim 的密钥是"可选"（有就发、没有就不发）。
   - `HttpSecurity`（两个服务共用的三道门：来源过滤 / Origin / 令牌）
   - `McpEndpoint`（MCP 服务端：JSON-RPC 2.0 子集、版本协商、工具映射 —— 不含任何 HTTP 类型，所以回归能直接调协议层）
 - `Vendor/AnimaCaptioner/` —— 从 [AnimaCaptioner] 搬入的词库内核（零 WinUI / Windows API 引用）。
-  中文键冲突（`AddCnKey`）与 `PostCount` 两处修正**改在上游**再搬回来，两边共用同一份代码
+  中文键冲突（`AddCnKey`）与 `PostCount` 两处修正**改在上游**再搬回来，两边共用同一份代码。
+  同一目录还有 **`seed.json`（seed 母本）与 `VENDOR.md`（每个文件来自上游哪个提交）**
+  —— 见下节「seed 母本进了仓库，词库没有」
 - `tests/` —— `net10.0` 纯 .NET 回归工程。它同时是一道**守卫**：Core/ 或 Vendor/ 一旦混进 WinUI 类型就编译不过（TFM 代际必须与应用的 `net10.0-windows…` 保持一致，见文末「构建取舍」）
 - `docs/` —— 上游复用面的技术勘察报告（LlmClient、VocabDb）
+
+### seed 母本进了仓库，词库没有（两者的可分发性不同）
+
+`Vendor/AnimaCaptioner/seed.json` 是从上游**原样搬入**的 seed 母本（逐文件来源见
+[VENDOR.md](Vendor/AnimaCaptioner/VENDOR.md)），构建时复制到输出的 `vocab/seed.json`。
+
+| | seed | `vocab.sqlite` |
+| --- | --- | --- |
+| 怎么来的 | **人工整理**（273 条"中文概念 → 标签"）。上游 `VocabBuilder` 只是把它复制到库旁边，不推导 | **生成的**：由上游 `VocabBuilder` 从 Danbooru CSV 构建 |
+| 体积 | 8.7 KB | 118 MB |
+| 进 git 吗 | **进** | 不进，代理只借用它的路径 |
+
+**为什么要搬 seed**：`ProxyConfig.DefaultSeedPath()` 的回落顺序是
+「AnimaCaptioner 的 `settings.json` → 本程序数据目录 → **随程序分发的那份**」。
+少了最后一档，"只装代理、没装打标软件"的机器会**静默地没有 seed** —— `银发` 给出
+`grey hair`、`咖啡厅` 直接查不到，**而且没有任何报错**；只有把两边的输出摆在一起
+对比才看得出来。装了上游的机器则会借用它的路径，保持单一真源。
+
+**回归同理**：`Vocab.ResolveSeedPath()` 在借不到上游配置时回落到同一份，于是
+**clone 下来就能跑出同样的标签结论**，不必先装一遍打标软件。两条都有断言钉住：
+
+- `随程序分发的 seed 在输出目录里` —— 防的是 csproj 里那条复制被删掉；
+- `借不到上游配置时回落到随程序分发的 seed` —— 用一个接缝
+  `ProxyConfig.CaptionerSettingsPathOverride` 把"本机装着上游"之外的那条分支也测到。
+  它正好是**本机永远走不到、其他人却必然走到**的那条路。
 
 ## 回归测试
 
@@ -658,7 +685,8 @@ TFM 必须一起看：`tests/proxycheck.csproj` 是 `net10.0`（不带 `-windows
   （`_SuppressWindowsMLNativeCopyLocalNative` 只堵了 build 那条资产拷贝路径）。
   症状是"build 42 MB、publish 81 MB"。csproj 里的
   `DropUnusedWindowsMLPayloadFromPublish` 按**元数据**（`AssetType=native` +
-  `NuGetPackageId`）而非文件名剔除，发布目录因此稳定在 **58 文件 / 42.1 MB**。
+  `NuGetPackageId`）而非文件名剔除，发布目录因此稳定在 **60 文件 / 42.6 MB**
+  （其中 `vocab/seed.json` 是 vendored 的 seed 母本，见「seed 母本进了仓库，词库没有」）。
   这个 target 也按同一套标准验证过**确实在干活**：把它的两个钩子同时改名使其失效后发布为
   62 文件 / 81.5 MB（`onnxruntime.dll` 20.66 + `DirectML.dll` 17.83 回来了）。
 
@@ -673,7 +701,7 @@ HTTP + Edge 双引擎自动降级 + 代理 + 可配的临时目录清理时间�
 联网搜索 / 联网抓取 / 代理令牌 / 词库 / 实时日志）、
 托盘（菜单 + 左键 + 收托盘）、离线回归、端到端联调。
 
-回归现状：**883 项断言全过 / 0 失败**（其中 74 项来自 `mcp` 段：协议层 + 独立服务传输层）；
+回归现状：**1034 项断言全过 / 0 失败**（其中 74 项来自 `mcp` 段：协议层 + 独立服务传输层）；
 含 113 MB 真实词库、两次真实 Kestrel 起停（`server` / `mcp` 各一次）、
 以及一次完整的「客户端 → 代理 → 桩上游」链路，非流式注入与流式分块透传都在内；
 多站点路由那一节用**两个桩站点**验证"请求真的只发到了该去的那个站点、
@@ -691,7 +719,7 @@ HTTP + Edge 双引擎自动降级 + 代理 + 可配的临时目录清理时间�
 `WM_CLOSE` 验证过），退出时端口正常释放。
 
 **发布产物同样实测可运行**（不只是 `build` 能跑）：`dotnet publish -c Release -r win-x64
--p:Platform=x64` 产出 58 文件 / **42.1 MB**，直接启动该产物得 `MainWindowHandle` 非 0、
+-p:Platform=x64` 产出 60 文件 / **42.6 MB**，直接启动该产物得 `MainWindowHandle` 非 0、
 `/health` 正常、未鉴权 `/v1/models` 得 401；`Microsoft.UI.Xaml.dll` 等确认从已安装的
 WindowsAppRuntime 2.5.1 加载。
 
@@ -818,6 +846,15 @@ WindowsAppRuntime 2.5.1 加载。
 同一份代码，打标软件那边同样受益。顺带在上游加了 `PostCount(tag)`：计数取合并表
 `best` 的 Danbooru 帖数（与搜索窗口显示的一致），Anima 索引只作兜底。
 
+**那条断言为什么钉"意图"而不是钉标签名**：`内衣` 同名三行里两行非 junk
+（`lingerie` 6.8 万帖、`underwear` 103 万帖），留哪一条只取决于**词库快照的 rowid
+顺序**——本机 10-05 的快照给 `lingerie`，另一台机器较新的快照给 `underwear`
+（帖数也不同：1,025,803 vs 1,028,051），同一份代码给出两个答案，两者都是真标签。
+所以回归钉的是"必须解析出一条 **non-junk、帖数 ≥ 1 万**的标签，而且状态可用"，
+而不是某一个名字：钉死名字会在换快照时**假红**，而这条断言真正要防的是
+"junk 行顶掉真标签 → 模型拿到'这个词不存在'"。其余六个词（`雨伞`/`长袖`/`荷叶边`/
+`虎牙`/`痣`/`开心`）语义唯一，仍然钉具体标签。
+
 ### 已修：一个中文词对应多个概念（`雨夜` → rain + night）
 
 `Scan` 的动态规划**每段只能给一个标签**，而词库的中文键是"整名"粒度（有 `雨`、
@@ -834,7 +871,8 @@ WindowsAppRuntime 2.5.1 加载。
 `银发` 在词库里同时挂着 `silver hair`（cn=银发）与 `grey hair`（cn=灰发），而
 `seed.json` 里写的是 `银发 → grey hair`——于是 `resolve`/`scan` 走 seed 给灰发、
 `search` 走词库 cn 给银发。中文语境里"银发"几乎总是 `silver hair`（亮银/冷调），
-`grey hair` 会画成灰白、显老。改的是 seed 母本（`vocab/seed.json`），
+`grey hair` 会画成灰白、显老。改的是 seed 母本（`vocab/seed.json`，该母本已 vendored 到
+`Vendor/AnimaCaptioner/seed.json`，见「seed 母本进了仓库，词库没有」），
 `灰发 → grey hair` 保留。同一份 seed 里补了 `咖啡厅 / 咖啡店 → cafe`
 （词库里 cafe 的中文名是"咖啡馆"，"咖啡厅"三个字只挂在
 `cafe (blue archive)`/`cafe maid` 这类长名上，通用词反而是查不到的那个）。

@@ -50,18 +50,50 @@ public sealed class ProxyConfig
         return local;
     }
 
+    /// <summary>
+    /// seed 的候选来源，按可信度从高到低：AnimaCaptioner 的 settings.json（装了上游
+    /// 就与它保持一致，单一真源）→ 用户自己放在本程序数据目录里的一份 → **随程序
+    /// 分发的那一份**（<c>Vendor/AnimaCaptioner/seed.json</c>，构建时复制到
+    /// <c>vocab/seed.json</c>）。
+    ///
+    /// 最后一档是必须的，不是锦上添花：seed 是人工整理的"中文概念 → 标签"补充映射，
+    /// 词库里本来查不到的词全靠它。少了它**不会有任何报错**，只会让中文查询悄悄降级
+    /// （`银发` 给出 `grey hair`、`咖啡厅` 直接查不到），而这种降级只有拿两边的输出
+    /// 对比才看得出来。没有这一档时，"只装代理、没装 AnimaCaptioner"的机器正好落进
+    /// 这个静默状态。
+    /// </summary>
     public static string DefaultSeedPath()
     {
         var borrowed = BorrowFromCaptioner("SeedPath");
         if (borrowed is not null) return borrowed;
-        return Path.Combine(Dir, "vocab", "seed.json");
+
+        // 用户自己放的优先于随程序分发的那份：这是显式覆盖。
+        var local = Path.Combine(Dir, "vocab", "seed.json");
+        if (File.Exists(local)) return local;
+
+        var shipped = Path.Combine(AppContext.BaseDirectory, "vocab", "seed.json");
+        if (File.Exists(shipped)) return shipped;
+
+        return local;
     }
+
+    /// <summary>
+    /// 测试用接缝：把"向 AnimaCaptioner 的 settings.json 借路径"那一步重定向。
+    /// 传一个不存在的路径 == 模拟"这台机器没装 AnimaCaptioner"。
+    ///
+    /// 为什么需要这个接缝：`DefaultSeedPath()` 的最后一档（随程序分发的那份 seed）
+    /// 只在"借不到上游配置"时才生效，而这恰恰是**其他所有机器**的常态、本机的例外。
+    /// 没有接缝就只能去装一台没有上游软件的机器上试，那条分支等于没测过；而它出错的
+    /// 症状是静默的（中文映射悄悄变差），正是最该被钉住的一类。
+    /// 与 <see cref="FilePathOverride"/> 同一类接缝，理由也一样。
+    /// </summary>
+    public static string? CaptionerSettingsPathOverride { get; set; }
 
     private static string? BorrowFromCaptioner(string property)
     {
         try
         {
-            var file = Path.Combine(
+            var file = CaptionerSettingsPathOverride ?? Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "AnimaCaptioner", "settings.json");
             if (!File.Exists(file)) return null;
