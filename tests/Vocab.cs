@@ -165,63 +165,99 @@ public static class Vocab
                    TagSearch.SuspiciousMentions("用 `best quality` 吧。", vocab).Count, 0);
 
         // ---- 代理对用户的保证：工具层把内核那个括号缺口补上 ----
-        Harness.Section("6. 工具层的中文解析回落（补上内核的括号限定缺口）");
+        //
+        // 三个工具都已经改成**批量入参**（数组），所以这一节同时钉两件事：
+        // 批量形态本身（一次调用查一串），以及每一行的输出形状。
+        Harness.Section("6. 工具层：批量解析 + 中文括号限定缺口");
 
         var host = new ToolHost(new VocabService());
         var toolCfg = new ProxyConfig { VocabDbPath = db };
 
-        // 工具执行体已经改成异步的（web_search 要发 HTTP），测试是同步的口径，
-        // 所以在这里统一收口成一次阻塞等待。**只在这一个辅助函数里阻塞**，
-        // 免得每个断言各写一遍 GetAwaiter，将来改签名会漏掉一处。
-        ToolHost.ToolResult Resolve(string tag) =>
-            host.ExecuteAsync(toolCfg, ToolKind.Resolve, "{\"tag\":\"" + tag + "\"}")
-                .GetAwaiter().GetResult();
+        ToolHost.ToolResult Run(ToolKind kind, string args) =>
+            host.ExecuteAsync(toolCfg, kind, args).GetAwaiter().GetResult();
 
-        // 裸形式不是精确键、类别又不是 junk 的那 11,138 条：代理要能直接解析出来。
-        // 挑的都是**没被 Anima 索引或别名表接住**的（否则走的是别的路，测不到回落）。
-        var bow = Resolve("弓");
-        Harness.True("danbooru_resolve_tag 能解析裸形式「弓」（内核落空 → 回落 Search）",
-                     bow.Text.Contains("result: FOUND", StringComparison.Ordinal) &&
-                     bow.Text.Contains("tag=bow (weapon)", StringComparison.Ordinal));
-        Harness.Info("resolve_tag(弓) → " + bow.Summary);
-
-        var arrow = Resolve("箭头");
-        Harness.True("「箭头」→ arrow (symbol)",
-                     arrow.Text.Contains("tag=arrow (symbol)", StringComparison.Ordinal));
-        Harness.Info("resolve_tag(箭头) → " + arrow.Summary);
+        // 一次调用里混着英文 / 中文 / 括号限定 / 查不到 四种情况——这是模型
+        // 真实会发出来的形状（"把我手上这串标签名验一遍"）。
+        var batch = Run(ToolKind.Resolve,
+                        "{\"tags\":[\"blush\",\"white_dress\",\"弓\",\"qqzzxx_not_a_tag\"]}");
+        Harness.Dump("批量核对原文（会被原样回灌给模型）", batch.Text);
+        Harness.True("英文标签命中", batch.Text.Contains("tag=blush", StringComparison.Ordinal));
+        Harness.True("拼写被规范化时带一句备注",
+                     batch.Text.Contains("tag=white dress", StringComparison.Ordinal) &&
+                     batch.Text.Contains("(spelling normalized)", StringComparison.Ordinal));
+        Harness.True("裸形式「弓」命中（内核落空 → 回落 Search）",
+                     batch.Text.Contains("tag=bow (weapon)", StringComparison.Ordinal));
+        Harness.True("中文回落带上命中的完整中文名，模型才知道匹配的是括号形式",
+                     batch.Text.Contains("matched cn \"弓（武器）\"", StringComparison.Ordinal));
+        Harness.True("行里同时给出帖数——工具说明承诺了 posts，就必须真的给",
+                     batch.Text.Contains("posts=", StringComparison.Ordinal));
+        Harness.True("未命中的那一行是 NOT FOUND", batch.Text.Contains("NOT FOUND", StringComparison.Ordinal));
+        Harness.True("未命中的名字在结尾统一列一次（不再每行重复三句英文）",
+                     batch.Text.Contains("not tags: qqzzxx_not_a_tag", StringComparison.Ordinal));
+        Harness.Eq("摘要只列第一个 + 总数", batch.Summary, "核对「blush」等 4 个 → 3 命中");
 
         // 回落必须收窄，而且类别要由**内核**来裁：
         // `少女（mokufuu）` 的形状和 `弓（武器）` 一模一样，差别只在类别
         // （character vs general）。实测不审类别的话 `少女` 会解析到
         // `girl (mokufuu)` —— 正是内核注释里点名的那个坑。
-        var shojo = Resolve("少女");
+        var shojo = Run(ToolKind.Resolve, "{\"tags\":[\"少女\",\"初音未\"]}");
         Harness.True("`少女` 仍是 NOT FOUND（回落让内核裁类别，不吃角色标签）",
-                     shojo.Text.Contains("result: NOT FOUND", StringComparison.Ordinal));
-
-        // 形状不对（多出来的是普通字而不是括号限定）也不算命中
-        var partial = Resolve("初音未");
+                     shojo.Text.Contains("少女 → NOT FOUND", StringComparison.Ordinal));
         Harness.True("前缀相似不算命中（`初音未` 仍是 NOT FOUND）",
-                     partial.Text.Contains("result: NOT FOUND", StringComparison.Ordinal));
+                     shojo.Text.Contains("初音未 → NOT FOUND", StringComparison.Ordinal));
 
         // 人物名与内核保持一致（不绕过 JunkCategories），但必须把模型引到
         // search 那条好路上——否则模型会以为"这个词库连初音未来都没有"。
-        //
-        // 这一条还钉着一个更隐蔽的陷阱：`初音未来` 的头号变体
-        // `初音未来（VOCALOID）`（146,936 帖）是 character 会被拒，但
-        // `初音未来（Cosplay）`（2,728 帖）是 general **能过审**。若回落写成
-        // "往后继续挑"，就会把 `初音未来` 解析成 `hatsune miku (cosplay)`——
-        // 一个自信的错答案，比查不到更糟。所以下面同时断言它**没有**变成那个。
-        var miku = Resolve("初音未来");
-        Harness.True("人物名与内核保持一致（NOT FOUND），并把模型引向 search",
-                     miku.Text.Contains("result: NOT FOUND", StringComparison.Ordinal) &&
-                     miku.Text.Contains(ToolCatalog.SearchName, StringComparison.Ordinal));
+        var miku = Run(ToolKind.Resolve, "{\"tags\":[\"初音未来\"]}");
+        Harness.True("人物名与内核保持一致（NOT FOUND）",
+                     miku.Text.Contains("初音未来 → NOT FOUND", StringComparison.Ordinal));
         Harness.True("没有退而求其次挑一个冷门同名变体（不许变成 hatsune miku (cosplay)）",
                      !miku.Text.Contains("tag=hatsune miku (cosplay)", StringComparison.Ordinal));
 
-        // 英文那条路没有被回落影响
-        var en = Resolve("hatsune miku");
-        Harness.True("英文标签仍然照常解析",
-                     en.Text.Contains("tag=hatsune miku", StringComparison.Ordinal));
+        // ---- 上游 VocabDb 那个"中文键被 junk 行顶掉"的 bug（AddCnKey）----
+        //
+        // 这批词以前**一律查不到**：`best` 里同名的第一行是画师 / 作品
+        // （`@amagasa` 49 帖、`lingeries` 14 帖），精确中文键先到先得就记住了
+        // 那一条，随后被 JunkCategories 拒掉，模型拿到的是"这个词不存在"——
+        // 而真标签有上百万帖（内衣 103 万、长袖 239 万）。
+        // 修法是建表时"非 junk 优先"，改在上游 VocabDb，两处共用同一份代码。
+        var cnFix = Run(ToolKind.Resolve,
+                        "{\"tags\":[\"内衣\",\"雨伞\",\"长袖\",\"荷叶边\",\"虎牙\",\"痣\",\"开心\"]}");
+        Harness.Dump("常见中文词（以前全查不到）", cnFix.Text);
+        var cnExpect = new (string Input, string Tag)[]
+        {
+            ("内衣", "underwear"), ("雨伞", "umbrella"), ("长袖", "long sleeves"),
+            ("荷叶边", "frills"), ("虎牙", "fang"), ("痣", "mole"), ("开心", "happy"),
+        };
+        foreach (var (input, tag) in cnExpect)
+            Harness.True($"{input} → {tag}（junk 行不再顶掉真标签）",
+                         cnFix.Text.Contains($"{input} → tag={tag} ", StringComparison.Ordinal));
+
+        // ---- scan：批量 + 去重 + 长词优先 ----
+        var scan = Run(ToolKind.Scan,
+                       "{\"texts\":[\"黑色雨伞，站在雨里，背景模糊\",\"银发少女站在雨中\"]}");
+        Harness.Dump("批量切分原文", scan.Text);
+        Harness.Eq("两段描述各自成段", CountOf(scan.Text, "text "), 2);
+        Harness.True("雨伞 → umbrella（长词优先，不再退化成单字「雨」）",
+                     scan.Text.Contains("tag=umbrella", StringComparison.Ordinal));
+        // 去重是**分段内**的：两段各有一处「雨」本来就应该各出一行 rain。
+        // 单段里「雨伞」和「雨里」两处都退化成「雨」才是那个 bug。
+        var scanDedup = Run(ToolKind.Scan, "{\"texts\":[\"黑色雨伞，站在雨里\"]}");
+        Harness.Eq("同一段里同一个标签不重复输出（rain 只出现一次）",
+                   CountOf(scanDedup.Text, "tag=rain"), 1);
+        Harness.True("scan 的结果行也带状态", scan.Text.Contains("| status=", StringComparison.Ordinal));
+
+        // ---- search：批量 + 每查询分段 + 图例只写一次 ----
+        var searched = Run(ToolKind.Search, "{\"queries\":[\"white dress\",\"蕾丝\"],\"limit\":5}");
+        Harness.Dump("批量搜索原文", searched.Text);
+        Harness.Eq("两个查询各自成段", CountOf(searched.Text, "query "), 2);
+        Harness.True("行首是 `N. tag=`（模型靠它认标签名的边界）",
+                     searched.Text.Contains("1. tag=", StringComparison.Ordinal));
+        Harness.True("行里带帖数与状态",
+                     searched.Text.Contains("posts=", StringComparison.Ordinal) &&
+                     searched.Text.Contains("status=", StringComparison.Ordinal));
+        Harness.Eq("图例只出现一次", CountOf(searched.Text, "format:"), 1);
+        Harness.True("摘要带上词数", searched.Summary.Contains("等 2 个", StringComparison.Ordinal));
 
         // ---- 摘要前缀是 Core 与回归共用的契约 ----
         Harness.Section("7. 工具摘要前缀（回归靠它数「执行了几次」，新增工具必须同步）");
@@ -236,9 +272,9 @@ public static class Vocab
         // web_search 由 Search.cs 那一节覆盖（它要桩后端才跑得起来）。
         var samples = new (ToolKind Kind, string Args)[]
         {
-            (ToolKind.Search,  "{\"query\":\"lace\"}"),
-            (ToolKind.Resolve, "{\"tag\":\"弓\"}"),
-            (ToolKind.Scan,    "{\"text\":\"1girl, lace\"}"),
+            (ToolKind.Search,  "{\"queries\":[\"lace\"]}"),
+            (ToolKind.Resolve, "{\"tags\":[\"弓\"]}"),
+            (ToolKind.Scan,    "{\"texts\":[\"1girl, lace\"]}"),
         };
         foreach (var (kind, callArgs) in samples)
         {
@@ -246,6 +282,23 @@ public static class Vocab
             Harness.True($"{kind} 的摘要被前缀表认出（{r.Summary}）",
                          ToolHost.SummaryPrefixes.Any(p => r.Summary.StartsWith(p, StringComparison.Ordinal)));
         }
+    }
+
+    /// <summary>
+    /// 数一个子串在文本里出现几次。批量输出里"每段一行 / 每行一条"这类断言
+    /// 靠它，比写一串 Contains 精确（能发现"同一行被写了两遍"）。
+    /// </summary>
+    private static int CountOf(string haystack, string needle)
+    {
+        if (needle.Length == 0) return 0;
+        var n = 0;
+        var i = 0;
+        while ((i = haystack.IndexOf(needle, i, StringComparison.Ordinal)) >= 0)
+        {
+            n++;
+            i += needle.Length;
+        }
+        return n;
     }
 }
 

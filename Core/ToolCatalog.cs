@@ -44,8 +44,8 @@ public sealed record ToolDecl(string Name, string Description, JsonObject Parame
 public static class ToolCatalog
 {
     public const string SearchName = "danbooru_search_tags";
-    public const string ResolveName = "danbooru_resolve_tag";
-    public const string ScanName = "danbooru_scan_text";
+    public const string ResolveName = "danbooru_resolve_tags";
+    public const string ScanName = "danbooru_scan_texts";
 
     /// <summary>
     /// 联网搜索。**刻意不带 <c>danbooru_</c> 前缀**：它查的是整个互联网，
@@ -68,87 +68,116 @@ public static class ToolCatalog
     /// <summary>
     /// 查词库。说明沿用 AnimaCaptioner 里那条实测过的措辞（短查询、不许凭记忆、
     /// 整串查不到就拆词），因为踩过的坑是同一个。
+    ///
+    /// **入参从"一个查询"改成了"查询数组"。** 把一张图的二三十个概念逐个查，
+    /// 每个都要一次模型回合；批量化之后一次调用就能查完，而"只查一个"不过是
+    /// 数组里只有一个元素。`limit` 的默认值也跟着降到 8：25 行里绝大多数是
+    /// 同名变体（`smile` 搜出来 24 行噪声），对模型只有干扰。
     /// </summary>
     public static ToolDecl SearchTool => new(
         SearchName,
         "Search a local Danbooru/Anima tag database (330k tags, with Chinese " +
-        "translations, categories and usage counts). Tags are EXACT strings: `blush` " +
-        "and `blushing` are different things and the second one does not exist, so never " +
-        "name a tag from memory - call this and copy the name out of the result. Use SHORT " +
-        "queries of one or two words, one concept at a time (\"white dress\", \"lace\", " +
-        "\"shy\"); the query is matched against tag names AND their Chinese meanings, so " +
-        "English or Chinese both work. Never pass a whole sentence: split \"white lace " +
-        "dress\" into \"white dress\" and \"lace\" and search both. If a long query returns " +
-        "nothing, split it and search the parts.",
+        "translations, categories and usage counts). Pass SEVERAL short queries in one call " +
+        "(up to 12, one or two words each, one concept per entry) - never a whole sentence. " +
+        "Tags are EXACT strings: `blush` and `blushing` are different things and the " +
+        "second one does not exist, so never name a tag from memory - copy it out of the " +
+        "result. Each row reads `N. tag=<exact tag name> | cn=<meaning> | posts=<usage> | " +
+        "status=<anima|valid|retired|unknown>`; the tag name is the part between `tag=` and " +
+        "the next ` | ` (status=retired means deprecated, status=unknown means no usage). " +
+        "An empty result means this database has no such tag - try fewer or more general " +
+        "words, or the Chinese equivalent. The query is matched against tag names AND " +
+        "their Chinese meanings, so English or Chinese both work.",
         new JsonObject
         {
             ["type"] = "object",
             ["properties"] = new JsonObject
             {
-                ["query"] = new JsonObject
+                ["queries"] = new JsonObject
                 {
-                    ["type"] = "string",
-                    ["description"] = "One or two words, one concept. English or Chinese. " +
+                    ["type"] = "array",
+                    ["items"] = new JsonObject { ["type"] = "string" },
+                    ["minItems"] = 1,
+                    ["maxItems"] = 12,
+                    ["description"] = "1-12 short queries, e.g. [\"white dress\", \"lace\", " +
+                                      "\"蕾丝\"]. One concept per entry; English or Chinese. " +
                                       "Not a sentence."
                 },
                 ["limit"] = new JsonObject
                 {
                     ["type"] = "integer",
-                    ["description"] = "How many tags to return, 1-25. Default 25."
+                    ["description"] = "Max tags to return per query, 1-25. Default 8."
                 }
             },
-            ["required"] = new JsonArray { "query" }
+            ["required"] = new JsonArray { "queries" }
         });
 
     /// <summary>
-    /// 核对单个写法。搜索是"找候选"，这个是"判定某一个写法到底成不成立"——
-    /// 模型经常需要问"我手上这个字符串是合法标签吗、它的规范形式是什么"。
+    /// 核对写法。搜索是"找候选"，这个是"判定某一个写法到底成不成立"——
+    /// 模型经常需要问"我手上这串标签名合法吗、规范形式是什么"。
+    ///
+    /// **同样是数组。** 核对的典型场景是"把这张图的 caption 整条验一遍"，
+    /// 那动辄二三十个名字；逐个调用会把一个请求的工具预算（默认 12 次）
+    /// 直接烧光，而批量化之后一次就够。
     /// </summary>
     public static ToolDecl ResolveTool => new(
         ResolveName,
-        "Check ONE exact spelling against the tag database: is it a real tag, what is its " +
-        "canonical form, is it deprecated/banned, how many posts use it, and what does it " +
-        "mean in Chinese. Input may be an English tag (`white_dress` and `white dress` are " +
-        "both accepted) or a Chinese meaning. Use this to verify a tag you already have " +
-        "rather than to explore - use " + SearchName + " for exploring.",
+        "Check several spellings at once (up to 40): is each one a real tag, what is its " +
+        "canonical form, how many posts use it, and what does it mean in Chinese. One line " +
+        "per input, e.g. `2. 弓 → tag=bow (weapon) | cn=弓（武器） | posts=12,345 | " +
+        "status=anima`. `NOT FOUND` means that exact spelling is not a tag, so do not use " +
+        "it as one - say the concept in prose or search for a different name. Input may be " +
+        "an English tag (`white_dress` and `white dress` are both accepted) or a Chinese " +
+        "meaning. Use this to verify tags you already have; use " + SearchName + " to " +
+        "explore.",
         new JsonObject
         {
             ["type"] = "object",
             ["properties"] = new JsonObject
             {
-                ["tag"] = new JsonObject
+                ["tags"] = new JsonObject
                 {
-                    ["type"] = "string",
-                    ["description"] = "One tag name or one Chinese meaning, e.g. " +
-                                      "\"white dress\" or \"白色连衣裙\"."
+                    ["type"] = "array",
+                    ["items"] = new JsonObject { ["type"] = "string" },
+                    ["minItems"] = 1,
+                    ["maxItems"] = 40,
+                    ["description"] = "1-40 tag names or Chinese meanings, e.g. " +
+                                      "[\"blush\", \"white dress\", \"白色连衣裙\"]. The whole " +
+                                      "caption at once is the normal case."
                 }
             },
-            ["required"] = new JsonArray { "tag" }
+            ["required"] = new JsonArray { "tags" }
         });
 
     /// <summary>
     /// 中文描述 → 标签。走的是词库里的最优切分（动态规划），不调模型。
     /// 给"把一段中文描述变成标签列表"这类需求用。
+    ///
+    /// **数组**：一次可以切多段（比如同一次对话里的几张图）。
     /// </summary>
     public static ToolDecl ScanTool => new(
         ScanName,
-        "Convert a Chinese description into the tags the database recognizes, without " +
-        "calling a model. Useful for turning an image description into a tag list. It only " +
-        "recognizes concepts that exist in the database; anything it cannot match is simply " +
-        "omitted from the result, so an empty result means \"none of these words are tags\", " +
-        "not \"the input was bad\".",
+        "Convert up to 8 Chinese descriptions into the tags the database recognizes, " +
+        "without calling a model. Useful for turning an image description into a tag list; " +
+        "pass one description per entry. It only recognizes concepts that exist in the " +
+        "database; anything it cannot match is simply omitted from the result, so an empty " +
+        "result means \"none of these words are tags\", not \"the input was bad\". " +
+        "Duplicate tags are collapsed - one line per tag.",
         new JsonObject
         {
             ["type"] = "object",
             ["properties"] = new JsonObject
             {
-                ["text"] = new JsonObject
+                ["texts"] = new JsonObject
                 {
-                    ["type"] = "string",
-                    ["description"] = "A Chinese description, e.g. \"一个女孩在笑，白色连衣裙\"."
+                    ["type"] = "array",
+                    ["items"] = new JsonObject { ["type"] = "string" },
+                    ["minItems"] = 1,
+                    ["maxItems"] = 8,
+                    ["description"] = "1-8 Chinese descriptions, e.g. " +
+                                      "[\"一个女孩在笑，白色连衣裙\"]."
                 }
             },
-            ["required"] = new JsonArray { "text" }
+            ["required"] = new JsonArray { "texts" }
         });
 
     /// <summary>

@@ -1,4 +1,5 @@
 using AnimaCaptioner.Core;
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 
@@ -111,102 +112,206 @@ public sealed class ToolHost
         return db;
     }
 
+    // ---------------- 批量入参的上限 ----------------
+
+    /// <summary>一次调用最多几个查询 / 标签 / 描述。上限是**输出体积**的闸门，不是能力的边界。</summary>
+    internal const int MaxQueries = 12;
+    internal const int MaxTags = 40;
+    internal const int MaxTexts = 8;
+
+    /// <summary>
+    /// 每个查询默认回几条。**从 25 降到 8**：25 行里绝大多数是同名变体
+    /// （`smile` 搜出来只有第 1 行是那个标签，其余 24 行是 `smiley face hat ornament`
+    /// 这种），对模型是纯干扰，而多出来的 17 行要占掉六七百 token。
+    /// </summary>
+    internal const int DefaultSearchLimit = 8;
+
+    /// <summary>一次调用最多回多少行命中（跨查询合计）。超出就截断并**说明**。</summary>
+    private const int MaxHitRows = 60;
+
     // ---------------- danbooru_search_tags ----------------
 
     private ToolResult Search(ProxyConfig cfg, string arguments)
     {
-        var (query, limit) = ReadQueryAndLimit(arguments);
-        if (query.Length == 0)
+        var queries = ReadStringList(arguments, "queries", "query", MaxQueries);
+        if (queries.Count == 0)
         {
             return new ToolResult(
-                "The query was empty. Call this tool again with one or two words, " +
-                "for example \"white dress\" or \"蕾丝\".",
+                "No query was given. Pass an array of one or two word queries, for example " +
+                "{\"queries\":[\"white dress\",\"蕾丝\"]}.",
                 "查（空查询）");
         }
 
         var db = TryVocab(cfg, out var err);
         if (db is null) return Fail(err);
 
-        var res = TagSearch.QueryDetailed(db, query, Math.Clamp(limit, 1, TagSearch.ToolLimit));
+        // 每个查询多要一条：**只为判断"还有更多"，不交给模型**。
+        // 让模型知道结果被截断了，比让它以为"库里只有这三条"重要——后者会
+        // 让它断定这个词库里没有别的近义标签，转而去凭记忆编。
+        var limit = Math.Clamp(ReadInt(arguments, "limit", DefaultSearchLimit), 1, TagSearch.ToolLimit);
 
-        // remaining 传 0：预算这件事由**我们**的循环掌握，而模型看到的这一轮
-        // 之外还有没有下一轮，取决于它自己有没有别的工具要调。给它一个具体的
-        // "还剩几次"是编的，不如统一说 0（"这是本轮的最后信息"），
-        // 系统提示里另外交代它"需要更多就再调一次"。
-        var text = TagSearch.ToToolContent(res.Hits, query, 0, res.SplitMatch);
-        var summary = res.Hits.Count > 0
-            ? $"查「{query}」→ {res.Hits.Count} 条"
-            : $"查「{query}」→ 无结果";
-        return new ToolResult(text, summary);
+        var sb = new StringBuilder();
+        var shown = 0;
+        var found = 0;
+        var legend = false;
+        var truncated = false;
+
+        for (var i = 0; i < queries.Count && !truncated; i++)
+        {
+            var query = queries[i];
+            var res = TagSearch.QueryDetailed(db, query, limit + 1);
+            var more = res.Hits.Count > limit;
+
+            sb.Append("query ").Append(i + 1).Append('/').Append(queries.Count)
+              .Append(": ").Append(query).Append(" → ");
+
+            if (res.Hits.Count == 0)
+            {
+                sb.Append("none (no tag matches this; try fewer or more general words)\n");
+                continue;
+            }
+
+            sb.Append(Math.Min(res.Hits.Count, limit));
+            if (more) sb.Append('+');
+            sb.Append(" tag(s)");
+            if (res.SplitMatch)
+                sb.Append(" (nothing matched the whole query, so it was split into words; " +
+                          "only partly related)");
+            sb.Append('\n');
+
+            if (!legend)
+            {
+                // 图例只写一次。原先每个结果都重复一遍，25 行时那 150 字符就是白烧的。
+                sb.Append("format: N. tag=<exact tag name> | cn=<meaning> | posts=<usage> | ")
+                  .Append("status=<anima|valid|retired|unknown>\n");
+                legend = true;
+            }
+
+            var perQuery = 0;
+            foreach (var h in res.Hits)
+            {
+                if (shown >= MaxHitRows)
+                {
+                    sb.Append("(output limit reached at ").Append(MaxHitRows)
+                      .Append(" rows; narrow the queries or lower limit)\n");
+                    truncated = true;
+                    break;
+                }
+                if (perQuery >= limit) break;
+                perQuery++;
+                shown++;
+                found++;
+                sb.Append(shown).Append(". tag=").Append(h.Tag)
+                  .Append(" | cn=").Append(h.HasCn ? h.Cn : "-")
+                  .Append(" | posts=").Append(h.PostCount.ToString("N0", CultureInfo.InvariantCulture))
+                  .Append(" | status=").Append(StatusOf(h))
+                  .Append('\n');
+            }
+        }
+
+        return new ToolResult(sb.ToString(), QuerySummary("查", queries, found, "条"));
     }
 
-    // ---------------- danbooru_resolve_tag ----------------
+    // ---------------- danbooru_resolve_tags ----------------
 
     private ToolResult Resolve(ProxyConfig cfg, string arguments)
     {
-        var tag = ReadString(arguments, "tag");
-        if (tag.Length == 0)
+        var tags = ReadStringList(arguments, "tags", "tag", MaxTags);
+        if (tags.Count == 0)
         {
             return new ToolResult(
-                "The tag was empty. Call this tool again with one tag name or one " +
-                "Chinese meaning.",
+                "No tag was given. Pass an array of tag names or Chinese meanings, for " +
+                "example {\"tags\":[\"blush\",\"white dress\",\"白色连衣裙\"]}.",
                 "核对（空输入）");
         }
 
         var db = TryVocab(cfg, out var err);
         if (db is null) return Fail(err);
 
-        // 先当英文标签解析，不成立再当中文释义解析。这条顺序与
-        // AnimaCaptioner 的 SuspiciousMentions 判据一致——两处不一致的话，
-        // 代理说"这个词库认得"、而打标软件说"查不到"，用户会不知道信谁。
+        var sb = new StringBuilder();
+        var found = 0;
+        var misses = new List<string>();
+
+        for (var i = 0; i < tags.Count; i++)
+        {
+            var input = tags[i];
+            var (resolved, note) = ResolveOne(db, input);
+
+            sb.Append(i + 1).Append(". ").Append(input).Append(" → ");
+            if (resolved is null)
+            {
+                sb.Append("NOT FOUND\n");
+                misses.Add(input);
+                continue;
+            }
+
+            found++;
+            var cnText = db.LookupCn(resolved);
+            sb.Append("tag=").Append(resolved)
+              .Append(" | cn=").Append(cnText.Length > 0 ? cnText : "-")
+              .Append(" | posts=").Append(db.PostCount(resolved).ToString("N0", CultureInfo.InvariantCulture))
+              .Append(" | status=").Append(db.Status(resolved));
+            if (note.Length > 0) sb.Append(" (").Append(note).Append(')');
+            sb.Append('\n');
+        }
+
+        // 未命中的话只写一遍。原先每个 miss 后面都跟三句英文（153 字符），
+        // 十个拼错的标签就是 1.5 KB 的同一段话。
+        sb.Append("resolved ").Append(found).Append(" of ").Append(tags.Count);
+        if (misses.Count > 0)
+        {
+            sb.Append(". not tags: ").Append(string.Join(", ", misses))
+              .Append(". Do not use those as tags - say the concept in prose instead, or ")
+              .Append("search for a different name.");
+        }
+        sb.Append('\n');
+
+        return new ToolResult(sb.ToString(), QuerySummary("核对", tags, found, "命中"));
+    }
+
+    /// <summary>
+    /// 解析一个写法，返回 (规范标签, 备注)。备注只在值得告诉模型时非空：拼写被
+    /// 规范化、或中文是连括号一起命中的——模型据此知道"这不是我写的那串字，
+    /// 但它指向同一个标签"。
+    ///
+    /// 先 <see cref="VocabDb.ResolveEnglish"/>，不成立再
+    /// <see cref="VocabDb.ResolveChinese"/>。这条顺序与 AnimaCaptioner 的
+    /// SuspiciousMentions 判据一致——两处不一致的话，代理说"这个词库认得"、
+    /// 而打标软件说"查不到"，用户会不知道信谁。
+    ///
+    /// 第三层是**中文的括号限定形式回落**：`ResolveChinese` 的精确键只认库里
+    /// 逐字存的那一个中文名，而 33 万条中文名里近一半带「（限定词）」后缀
+    /// （`弓（武器）`、`箭头（符号）`…），用户和 agent 不会连着括号一起打。
+    /// 实测"裸形式不是精确键、且类别不是 junk"的条目有 11,138 条，正是这一层补的。
+    ///
+    /// 修在**这一层而不是 vendored 的 VocabDb 里**：内核的"只允许词库键 ⊂ 用户
+    /// 输入"是它明确记着代价的决定，而 `Search` 那条路本来就是好的
+    /// （`cn.StartsWith(q)` 命中）。
+    ///
+    /// 回落**必须收窄，而且由内核自己来裁**：
+    ///   * 只接受"中文名与输入完全相同"或"中文名 = 输入 + 括号限定"——放宽到任意
+    ///     `Search` 命中就等于把内核特意堵上的坑重新挖开（`少女` 的前几条是
+    ///     `少女前线`、`少女与战车`，全都要拒）；
+    ///   * 就算形状对上了，也把库里那个完整中文名交回 `ResolveChinese` 再审一次：
+    ///     `少女（mokufuu）` 和 `弓（武器）` 的形状一模一样，差别只在类别
+    ///     （character vs general），实测不审类别的话 `少女` 会解析到
+    ///     `girl (mokufuu)`；
+    ///   * 而且**只认第一个形状对上的**：`初音未来` 的头号变体
+    ///     `初音未来（VOCALOID）`（146,936 帖）是 character 被拒，若继续往后挑就会
+    ///     挑到 `初音未来（Cosplay）`（2,728 帖，general，能过审）——一个自信的
+    ///     错答案比查不到更糟，因为模型不会再去 search。
+    ///
+    /// 触发条件含 `fuzzy`：内核那条模糊路在中文里经常给出无关的短词，而
+    /// "同名或同名+括号限定"指向的是同一个名字，可信度严格更高。
+    /// </summary>
+    private static (string? Tag, string Note) ResolveOne(VocabDb db, string tag)
+    {
         var en = db.ResolveEnglish(tag);
         var cn = en.Tag is null ? db.ResolveChinese(tag) : new ResolveResult(null, "");
 
-        // 中文的括号限定形式回落。
-        //
-        // `ResolveChinese` 的精确键只认库里逐字存的那一个中文名，而词库
-        // 331,836 条中文名里有 **163,154 条（49%）带「（限定词）」后缀**：
-        // `弓（武器）`、`箭头（符号）`、`照片（媒介）`、`嘘（手势）`……
-        // 用户和 agent 不会连着括号一起打，于是最常用的那个写法反而查不到。
-        // 实测"裸形式不是精确键、且类别不是 junk"的条目有 **11,138 条**，
-        // 就是这一层要补的那一批。
-        //
-        // 修在**这一层而不是 vendored 的 VocabDb 里**：内核的
-        // "只允许词库键 ⊂ 用户输入"是它明确记着代价的决定，而 `Search` 那条路
-        // 本来就是好的（`cn.StartsWith(q)` 命中）。让内核保持与上游逐字一致、
-        // 把回落放在我们自己的解析工具里，既补上了这个洞，又不用去动一个
-        // 我们已经承诺"只搬运不修改"的依赖。
-        //
-        // 回落**必须收窄，而且要由内核自己来裁**：
-        //
-        //   * 只接受"中文名与输入完全相同"或"中文名 = 输入 + 括号限定"。
-        //     放宽到任意 `Search` 命中，就等于把内核特意堵上的坑重新挖开，
-        //     而且是挖在更外层（实测 `Search("少女")` 的前几条是
-        //     `少女前线`、`少女与战车`，全都要拒掉）。
-        //   * 就算形状对上了，也把**库里那个完整中文名**交回 `ResolveChinese`
-        //     再审一次；它认得，才说明这一条不在它的 JunkCategories
-        //     （artist / character / copyright / 原神角色）里。
-        //
-        //     这一手是必须的，不是保险：`少女（mokufuu）` 和 `弓（武器）`
-        //     的形状**一模一样**，差别只在类别（character vs general）。
-        //     实测不审类别的话 `少女` 会解析到 `girl (mokufuu)` ——
-        //     正是内核注释里点名的那个坑。
-        //
-        //     不自己抄一份类别黑名单：抄了就会和上游走偏，而"这个词库认不认
-        //     这个名字"本来就该由词库自己回答。
-        //   * 而且**只认用得最多的那一个同名变体**：形状对上的第一条如果内核
-        //     不肯认，就到此为止，不去挑一个更冷门的兄弟。这一条也是被实测逼
-        //     出来的——`初音未来` 的头号变体 `初音未来（VOCALOID）`（146,936 帖）
-        //     是 character 被拒，若继续往后挑就会挑到 `初音未来（Cosplay）`
-        //     （2,728 帖，category=general，能过审），于是"初音未来"被解析成
-        //     `hatsune miku (cosplay)`。那比查不到更糟：查不到时模型会去 search，
-        //     而一个**自信的错答案**会被它直接拿去用。
-        //
-        // 触发条件含 `fuzzy`：内核那条模糊路在中文里经常给出无关的短词，
-        // 而"同名或同名+括号限定"指向的是**同一个名字**，可信度严格更高。
         if (en.Tag is null && (cn.Tag is null || cn.Status == "fuzzy"))
         {
-            // limit 给大：Search 本身要线性扫完 33 万行，多返回一些几乎不要钱，
+            // limit 给大：Search 本身要线性扫完 33 万行，多返回几乎不要钱，
             // 而少返回会让"最佳候选恰好排在 25 名之后"变成随机失败。
             foreach (var hit in db.Search(tag, 200))
             {
@@ -220,61 +325,43 @@ public sealed class ToolHost
             }
         }
 
-        var sb = new StringBuilder();
-        sb.Append("input: ").Append(tag).Append('\n');
-
         var resolved = en.Tag ?? cn.Tag;
-        if (resolved is null)
-        {
-            sb.Append("result: NOT FOUND in the tag database.\n");
-            sb.Append("Either the spelling is wrong or this concept has no tag. Do not use ").
-              Append("it as a tag; say it in prose instead, or call ").
-              Append(ToolCatalog.SearchName).Append(" with shorter words to look for a ").
-              Append("real one.\n");
-            return new ToolResult(sb.ToString(), $"核对「{tag}」→ 查不到");
-        }
+        if (resolved is null) return (null, "");
 
-        var status = db.Status(resolved);
-        var category = db.CategoryOf(resolved);
-        var cnText = db.LookupCn(resolved);
-        var section = TagSections.Classify(resolved, db);
+        if (en.Tag is not null)
+            return (resolved, string.Equals(en.Tag, tag.Trim(), StringComparison.OrdinalIgnoreCase)
+                ? ""
+                : "spelling normalized");
 
-        sb.Append("result: FOUND\n");
-        sb.Append("tag=").Append(resolved).Append('\n');
-        sb.Append("cn=").Append(cnText.Length > 0 ? cnText : "-").Append('\n');
-        sb.Append("section=").Append(TagSections.Get(section).Title).Append('\n');
-        sb.Append("category=").Append(category.Length > 0 ? category : "-").Append('\n');
-        sb.Append("status=").Append(status).Append('\n');
-        if (en.Tag is not null && !string.Equals(en.Tag, tag.Trim(), StringComparison.OrdinalIgnoreCase))
-            sb.Append("note: your spelling was normalized to the canonical form above.\n");
-
-        // 停用 / 已废弃必须说清楚：这类标签加进提示词里要么不生效、要么被训练器
-        // 当成噪声，而用户从旧的示例里抄来的恰恰是这些。
-        if (status == "retired")
-            sb.Append("warning: this tag is deprecated - prefer a replacement if one exists.\n");
-        else if (status == "unknown")
-            sb.Append("warning: this tag exists in the database but has no usage; treat it " +
-                      "as unverified.\n");
-
-        return new ToolResult(sb.ToString(), $"核对「{tag}」→ {resolved}（{StatusText(status)}）");
+        if (cn.Status != "qualified") return (resolved, "");
+        var cnName = db.LookupCn(resolved);
+        return (resolved, cnName.Length > 0 ? "matched cn \"" + cnName + "\"" : "");
     }
 
     /// <summary>
-    /// 把内核的状态值翻成界面上的说法。
-    ///
-    /// 内核返回的是 <c>anima</c> / <c>valid</c> / <c>retired</c> / <c>unknown</c>
-    /// 这四个英文标识符，它们是给代码看的、不是给人看的。**只在显示这一层翻译**：
-    /// 内核的值原样保留（上面的 status= 行照旧写英文，那是给模型读的协议字段），
-    /// 日志里的摘要才用中文——否则用户会在日志面板上看到一串看不懂的单词。
+    /// 搜索行里的状态。判据与 <see cref="VocabDb.Status"/> 同一口径（Anima 索引优先、
+    /// 废弃次之、无引用最后），但**不查字典**：<see cref="TagSearch.Hit"/> 已经把
+    /// InAnima / Deprecated / PostCount 都带出来了，25 行就是 25 次字典查找的差别，
+    /// 在批量路径上没必要。
     /// </summary>
-    private static string StatusText(string status) => status switch
+    private static string StatusOf(TagSearch.Hit h)
     {
-        "anima" => "Anima 常用",
-        "valid" => "有效",
-        "retired" => "已废弃",
-        "unknown" => "无使用记录",
-        _ => status
-    };
+        if (h.InAnima) return "anima";
+        if (h.PostCount == 0) return "unknown";
+        return h.Deprecated ? "retired" : "valid";
+    }
+
+    /// <summary>
+    /// 一条给人看的摘要（日志面板 / 界面）。单个时原样列出，多个时列第一个 + "等 N 个"：
+    /// 四十个标签全列出来会把日志撑爆，而只写"批量"又不便于事后追查。
+    /// </summary>
+    private static string QuerySummary(string verb, IReadOnlyList<string> items, int count, string unit)
+    {
+        var head = "「" + Cut(items[0], 24) + "」";
+        return items.Count == 1
+            ? $"{verb}{head}→ {count} {unit}"
+            : $"{verb}{head}等 {items.Count} 个 → {count} {unit}";
+    }
 
     /// <summary>
     /// 词库里的中文名是不是**就是**这个词（或者只是多挂了一个括号限定）。
@@ -300,43 +387,67 @@ public sealed class ToolHost
         return rest.StartsWith('（') || rest.StartsWith('(');
     }
 
-    // ---------------- danbooru_scan_text ----------------
+    // ---------------- danbooru_scan_texts ----------------
 
     private ToolResult Scan(ProxyConfig cfg, string arguments)
     {
-        var text = ReadString(arguments, "text");
-        if (text.Length == 0)
+        var texts = ReadStringList(arguments, "texts", "text", MaxTexts);
+        if (texts.Count == 0)
         {
             return new ToolResult(
-                "The text was empty. Call this tool again with a Chinese description.",
+                "No text was given. Pass an array of Chinese descriptions, for example " +
+                "{\"texts\":[\"一个女孩在笑，白色连衣裙\"]}.",
                 "切分（空输入）");
         }
 
         var db = TryVocab(cfg, out var err);
         if (db is null) return Fail(err);
 
-        var hits = db.Scan(text);
         var sb = new StringBuilder();
-        sb.Append("input: ").Append(text).Append('\n');
+        var total = 0;
+        var rows = 0;
+        var truncated = false;
 
-        if (hits.Count == 0)
+        for (var i = 0; i < texts.Count && !truncated; i++)
         {
-            sb.Append("result: no tag matched. None of the words in this description ").
-              Append("correspond to a tag in the database. This is a normal outcome, not an ").
-              Append("error - say the leftover meaning in prose.\n");
-            return new ToolResult(sb.ToString(), "切分 → 无命中");
+            var text = texts[i];
+
+            // 同一个标签只留第一处。DP 是逐位置输出最优选择，`雨` 在「雨中」和
+            // 「雨伞」里各命中一次就会给模型两行一模一样的 `tag=rain`——而模型
+            // 看到重复会以为"有两个都要写"，或者干脆怀疑结果坏了。
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var hits = new List<ScanHit>();
+            foreach (var h in db.Scan(text))
+                if (seen.Add(h.Tag)) hits.Add(h);
+
+            sb.Append("text ").Append(i + 1).Append('/').Append(texts.Count)
+              .Append(": ").Append(text).Append(" → ").Append(hits.Count).Append(" tag(s)\n");
+
+            if (hits.Count == 0)
+            {
+                sb.Append("   none of these words matched a tag (that is a normal outcome, " +
+                          "not an error)\n");
+                continue;
+            }
+
+            foreach (var h in hits)
+            {
+                if (rows >= MaxHitRows)
+                {
+                    sb.Append("   (output limit reached at ").Append(MaxHitRows)
+                      .Append(" rows; scan fewer or shorter descriptions)\n");
+                    truncated = true;
+                    break;
+                }
+                rows++;
+                total++;
+                sb.Append("   tag=").Append(h.Tag);
+                if (!string.IsNullOrEmpty(h.Key)) sb.Append(" | from \"").Append(h.Key).Append('"');
+                sb.Append(" | status=").Append(db.Status(h.Tag)).Append('\n');
+            }
         }
 
-        sb.Append("matched ").Append(hits.Count).Append(" tag(s):\n");
-        var i = 0;
-        foreach (var h in hits)
-        {
-            i++;
-            sb.Append(i).Append(". tag=").Append(h.Tag);
-            if (!string.IsNullOrEmpty(h.Key)) sb.Append(" (from \"").Append(h.Key).Append("\")");
-            sb.Append('\n');
-        }
-        return new ToolResult(sb.ToString(), $"切分 → {hits.Count} 个标签");
+        return new ToolResult(sb.ToString(), QuerySummary("切分", texts, total, "个标签"));
     }
 
     // ---------------- web_search ----------------
@@ -434,30 +545,87 @@ public sealed class ToolHost
     // ---------------- 参数读取 ----------------
 
     /// <summary>
-    /// 从 tool_call 的 arguments 里取 query 与 limit。
-    /// 参数不是合法 JSON 时**返回空查询**而不是抛异常：模型手抖写出
-    /// <c>{query: white dress}</c>（没加引号）是很常见的，此时如实告诉它
-    /// "查询是空的"，比让整轮失败好。
+    /// 取一个整数参数（<c>limit</c> 这类）。非数字或解析失败时返回
+    /// <paramref name="fallback"/>——与 <see cref="ReadString"/> 同样"尽力救，
+    /// 救不回来就用默认值"。
     /// </summary>
-    internal static (string Query, int Limit) ReadQueryAndLimit(string arguments)
+    internal static int ReadInt(string arguments, string field, int fallback)
     {
-        var query = ReadString(arguments, "query");
-        var limit = TagSearch.ToolLimit;
+        try
+        {
+            using var doc = JsonDocument.Parse(arguments ?? "");
+            if (doc.RootElement.ValueKind == JsonValueKind.Object &&
+                doc.RootElement.TryGetProperty(field, out var el))
+            {
+                if (el.ValueKind == JsonValueKind.Number && el.TryGetInt32(out var n)) return n;
+                if (el.ValueKind == JsonValueKind.String &&
+                    int.TryParse(el.GetString(), out var n2)) return n2;
+            }
+        }
+        catch { /* 参数不是合法 JSON：用默认值 */ }
+        return fallback;
+    }
+
+    /// <summary>
+    /// 取一个字符串数组（批量工具的入参）。宽容度是刻意的，逐条对应一种实测见过的
+    /// 模型手抖：
+    ///   * 声明是数组却传了裸字符串（<c>{"queries":"white dress"}</c>）——当单元素；
+    ///   * 整串就是那个值（<c>"white dress"</c>，没有花括号）——同样当单元素；
+    ///   * 字段名写错（<c>{"q":…}</c>、<c>{"keyword":…}</c>）——对象里所有字符串 /
+    ///     字符串数组都收下，反正这类工具的语义就是"给我一串词"；
+    ///   * 传了对象数组（<c>[{"tag":"a"}]</c>）——不收，交给调用方回一句"参数不对"，
+    ///     因为猜它想表达什么比失败更危险。
+    ///
+    /// 去重（大小写不敏感）并保留顺序；超过 <paramref name="cap"/> 的部分丢掉——
+    /// 调用方从返回条数就能看出被截断了。
+    /// </summary>
+    internal static List<string> ReadStringList(string arguments, string primary, string fallback, int cap)
+    {
+        var outp = new List<string>();
+        var raw = (arguments ?? "").Trim();
+        if (raw.Length == 0 || cap <= 0) return outp;
+
+        void Add(string? s)
+        {
+            var v = (s ?? "").Trim();
+            if (v.Length == 0 || outp.Count >= cap) return;
+            if (outp.Any(x => string.Equals(x, v, StringComparison.OrdinalIgnoreCase))) return;
+            outp.Add(v);
+        }
+
+        void AddValue(JsonElement el)
+        {
+            if (el.ValueKind == JsonValueKind.String) Add(el.GetString());
+            else if (el.ValueKind == JsonValueKind.Array)
+                foreach (var item in el.EnumerateArray())
+                    if (item.ValueKind == JsonValueKind.String) Add(item.GetString());
+        }
 
         try
         {
-            using var doc = JsonDocument.Parse(arguments);
-            if (doc.RootElement.ValueKind == JsonValueKind.Object &&
-                doc.RootElement.TryGetProperty("limit", out var el))
-            {
-                if (el.ValueKind == JsonValueKind.Number && el.TryGetInt32(out var n)) limit = n;
-                else if (el.ValueKind == JsonValueKind.String &&
-                         int.TryParse(el.GetString(), out var n2)) limit = n2;
-            }
-        }
-        catch { /* query 已经尽力取过了 */ }
+            using var doc = JsonDocument.Parse(raw);
+            var root = doc.RootElement;
 
-        return (query, limit);
+            if (root.ValueKind == JsonValueKind.String) { Add(root.GetString()); return outp; }
+            if (root.ValueKind == JsonValueKind.Array) { AddValue(root); return outp; }
+            if (root.ValueKind != JsonValueKind.Object) return outp;
+
+            if (root.TryGetProperty(primary, out var el)) AddValue(el);
+            if (outp.Count == 0 && root.TryGetProperty(fallback, out var el2)) AddValue(el2);
+
+            // 字段名写错时：把对象里所有"像一串词"的值都收下。
+            if (outp.Count == 0)
+                foreach (var p in root.EnumerateObject()) AddValue(p.Value);
+
+            return outp;
+        }
+        catch
+        {
+            // 不是合法 JSON。若它看起来就是那个值本身（没有花括号方括号），当裸值用。
+            if (!raw.StartsWith('{') && !raw.StartsWith('['))
+                Add(raw.Trim('"', '\'', '“', '”'));
+            return outp;
+        }
     }
 
     /// <summary>

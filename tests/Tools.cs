@@ -24,8 +24,27 @@ public static class Tools
                      all.All(t => ChatWire.GetString(t.Parameters, "type") == "object"));
         Harness.True("每个工具都写了说明（平台不会替我们介绍它）",
                      all.All(t => t.Description.Length > 60));
-        Harness.True("search 的 required 里确实有 query",
-                     all[0].Parameters["required"]!.AsArray().Any(n => n!.GetValue<string>() == "query"));
+        Harness.True("三个工具都是批量入参（数组），单个只是长度为 1",
+                     all.All(t => t.Parameters["properties"]!.AsObject().All(p =>
+                         ChatWire.GetString(p.Value as JsonObject, "type") == "array"
+                         || ChatWire.GetString(p.Value as JsonObject, "type") == "integer")));
+
+        var required = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            [ToolCatalog.SearchName] = "queries",
+            [ToolCatalog.ResolveName] = "tags",
+            [ToolCatalog.ScanName] = "texts",
+        };
+        foreach (var decl in all)
+        {
+            var want = required[decl.Name];
+            Harness.True($"{decl.Name} 的 required 里确实有 {want}",
+                         decl.Parameters["required"]!.AsArray()
+                             .Any(n => n!.GetValue<string>() == want));
+            Harness.Eq($"{decl.Name} 的 {want} 是 string 数组",
+                       ChatWire.GetString(decl.Parameters["properties"]![want] as JsonObject, "type"),
+                       "array");
+        }
 
         // 包成 OpenAI 的 tools 元素
         var wrapped = all[0].ToOpenAiTool();
@@ -70,32 +89,47 @@ public static class Tools
 
         Harness.Section("工具参数读取（模型的手抖都要接住）");
 
-        Harness.Eq("标准对象", ToolHost.ReadString("{\"query\":\"white dress\"}", "query"), "white dress");
-        Harness.Eq("裸字符串（整个参数就是一个值）",
-                   ToolHost.ReadString("\"white dress\"", "query"), "white dress");
-        Harness.Eq("没加引号的裸值",
-                   ToolHost.ReadString("{query: white dress}", "query"), "");
-        Harness.Eq("纯文本参数", ToolHost.ReadString("white dress", "query"), "white dress");
-        Harness.Eq("字段名写错但只有一个字符串值 → 认它",
-                   ToolHost.ReadString("{\"keyword\":\"lace\"}", "query"), "lace");
-        Harness.Eq("数组包一层 → 取第一个",
-                   ToolHost.ReadString("{\"query\":[\"lace\"]}", "query"), "lace");
-        Harness.Eq("数字字段也认", ToolHost.ReadString("{\"query\":123}", "query"), "123");
-        Harness.Eq("中文引号也剥掉",
-                   ToolHost.ReadString("“lace”", "query"), "lace");
-        Harness.Eq("空参数", ToolHost.ReadString("", "query"), "");
-        Harness.Eq("空对象", ToolHost.ReadString("{}", "query"), "");
-        Harness.Eq("两个字符串字段时不敢猜（宁可为空）",
-                   ToolHost.ReadString("{\"a\":\"x\",\"b\":\"y\"}", "query"), "");
+        Harness.Eq("标准数组",
+                   string.Join(",", ToolHost.ReadStringList("{\"queries\":[\"white dress\",\"lace\"]}",
+                                                             "queries", "query", 12)),
+                   "white dress,lace");
+        Harness.Eq("数组里的空串与非字符串元素被丢掉",
+                   string.Join(",", ToolHost.ReadStringList(
+                       "{\"queries\":[\" a \",\"\",3,\"b\"]}", "queries", "query", 12)),
+                   "a,b");
+        Harness.Eq("重复项按大小写不敏感去重、保留顺序",
+                   string.Join(",", ToolHost.ReadStringList(
+                       "{\"queries\":[\"Lace\",\"lace\",\"dress\"]}", "queries", "query", 12)),
+                   "Lace,dress");
+        Harness.Eq("声明是数组却传裸字符串 → 当单元素",
+                   string.Join(",", ToolHost.ReadStringList("{\"queries\":\"white dress\"}",
+                                                             "queries", "query", 12)),
+                   "white dress");
+        Harness.Eq("整个参数就是裸字符串",
+                   string.Join(",", ToolHost.ReadStringList("\"lace\"", "queries", "query", 12)),
+                   "lace");
+        Harness.Eq("没加引号的裸值也认（小模型常见手抖）",
+                   string.Join(",", ToolHost.ReadStringList("white dress", "queries", "query", 12)),
+                   "white dress");
+        Harness.Eq("字段名写错 → 对象里的字符串数组照收",
+                   string.Join(",", ToolHost.ReadStringList("{\"tags\":[\"blush\"]}",
+                                                             "queries", "query", 12)),
+                   "blush");
+        Harness.Eq("旧字段名（单数）仍然可用",
+                   string.Join(",", ToolHost.ReadStringList("{\"tag\":\"blush\"}",
+                                                             "tags", "tag", 12)),
+                   "blush");
+        Harness.Eq("对象数组不猜（不认识的形状宁可空）",
+                   string.Join(",", ToolHost.ReadStringList("{\"queries\":[{\"q\":\"a\"}]}",
+                                                             "queries", "query", 12)),
+                   "");
+        Harness.Eq("空参数", ToolHost.ReadStringList("", "queries", "query", 12).Count, 0);
+        Harness.Eq("超上限被截到 cap",
+                   ToolHost.ReadStringList("{\"queries\":[\"a\",\"b\",\"c\"]}", "queries", "query", 2).Count, 2);
 
-        var (q, limit) = ToolHost.ReadQueryAndLimit("{\"query\":\"lace\",\"limit\":5}");
-        Harness.Eq("limit 数字", limit, 5);
-        Harness.Eq("query 同时取出", q, "lace");
-
-        var (_, defLimit) = ToolHost.ReadQueryAndLimit("{\"query\":\"lace\"}");
-        Harness.Eq("limit 缺省用 ToolLimit", defLimit, AnimaCaptioner.Core.TagSearch.ToolLimit);
-
-        var (_, strLimit) = ToolHost.ReadQueryAndLimit("{\"query\":\"x\",\"limit\":\"3\"}");
-        Harness.Eq("limit 写成字符串也认", strLimit, 3);
+        Harness.Eq("limit 数字", ToolHost.ReadInt("{\"queries\":[\"x\"],\"limit\":5}", "limit", 8), 5);
+        Harness.Eq("limit 缺省用默认值", ToolHost.ReadInt("{\"queries\":[\"x\"]}", "limit", 8), 8);
+        Harness.Eq("limit 写成字符串也认", ToolHost.ReadInt("{\"limit\":\"3\"}", "limit", 8), 3);
+        Harness.Eq("limit 非法时回落默认值", ToolHost.ReadInt("{\"limit\":\"x\"}", "limit", 8), 8);
     }
 }

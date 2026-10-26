@@ -160,8 +160,8 @@ public static class Mcp
             // 而自动降级在"本机没有浏览器"时依然能用 HTTP 引擎，所以它就该在。
             Harness.Eq("默认 4 个工具（词库三个 + web_fetch）", names.Count, 4);
             Harness.True("有 danbooru_search_tags", names.Contains(ToolCatalog.SearchName));
-            Harness.True("有 danbooru_resolve_tag", names.Contains(ToolCatalog.ResolveName));
-            Harness.True("有 danbooru_scan_text", names.Contains(ToolCatalog.ScanName));
+            Harness.True("有 danbooru_resolve_tags", names.Contains(ToolCatalog.ResolveName));
+            Harness.True("有 danbooru_scan_texts", names.Contains(ToolCatalog.ScanName));
             Harness.True("没配搜索 → 不下发 web_search（下发一个必然失败的工具更糟）",
                          !names.Contains(ToolCatalog.WebSearchName));
             Harness.True("默认带 web_fetch（抓取默认开，auto 不需要本机有浏览器）",
@@ -354,7 +354,8 @@ public static class Mcp
 
             var call = Post(http, mcpBase + "/mcp",
                 "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{" +
-                "\"name\":\"danbooru_scan_text\",\"arguments\":{\"text\":\"一个女孩在笑\"}}}", good);
+                "\"name\":\"" + ToolCatalog.ScanName + "\",\"arguments\":" +
+                "{\"texts\":[\"一个女孩在笑\"]}}}", good);
             Harness.True("tools/call 有 content 数组",
                          (ChatWire.TryParseObject(call.Text)?["result"] as JsonObject)?["content"] is JsonArray);
 
@@ -395,11 +396,11 @@ public static class Mcp
 
             // ---------- 逐工具开关（传输层再确认一次） ----------
             cfg.McpTools[ToolCatalog.ScanName] = false;
-            Harness.Eq("关掉 danbooru_scan_text 后清单只剩 3 个",
+            Harness.Eq("关掉 danbooru_scan_texts 后清单只剩 3 个",
                        ToolCount(http, mcpBase + "/mcp", good), 3);
             var blocked = Post(http, mcpBase + "/mcp",
                 "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{" +
-                "\"name\":\"danbooru_scan_text\",\"arguments\":{\"text\":\"测试\"}}}", good);
+                "\"name\":\"" + ToolCatalog.ScanName + "\",\"arguments\":{\"texts\":[\"测试\"]}}}", good);
             Harness.Eq("关掉的工具调不动（-32602，不是\"能调但看不见\"）",
                        (blocked.Text.Contains("-32602") ? "-32602" : blocked.Text[..0]), "-32602");
             cfg.McpTools.Clear();

@@ -139,6 +139,48 @@
 工具循环"时看到的形状一致，只是少了它自己那一段。usage 跨轮累加后只报一次
 （每轮都报是错的：客户端会在还没结束时就拿到一份"最终用量"）。
 
+## 词库工具（`danbooru_*`）
+
+三个工具都**吃数组**：一次调用查一串，单个只是长度为 1 的数组。转发 API 注入给
+模型的那套和 MCP 对外的那套是同一份 `ToolCatalog` / `ToolHost`。
+
+| 工具 | 入参 | 上限 | 干什么 |
+| --- | --- | --- | --- |
+| `danbooru_search_tags` | `queries: string[]`，可选 `limit` | 12 个查询，每个 ≤25 条（默认 8） | 找候选 |
+| `danbooru_resolve_tags` | `tags: string[]` | 40 | 判定一串写法成不成立 |
+| `danbooru_scan_texts` | `texts: string[]` | 8 | 中文描述 → 标签（不调模型） |
+
+**为什么是数组。** 一张图的 caption 二三十个标签，逐个核对就是二三十次模型回合；
+转发 API 那条路还有硬上限（`MaxToolCallsPerRequest` 默认 12、`MaxToolRounds` 默认 4），
+逐个查根本验不完——模型会在第 12 次收到"用现有信息回答"。批量化之后一次就够，
+而"只查一个"不过是数组里只有一个元素。
+
+**输出形状**（三个工具一致；每行 `tag=` 到下一个 ` | ` 之间就是标签名）：
+
+```
+query 1/2: white dress → 3 tag(s)
+format: N. tag=<exact tag name> | cn=<meaning> | posts=<usage> | status=<anima|valid|retired|unknown>
+1. tag=white dress | cn=白色连衣裙 | posts=462,709 | status=anima
+
+1. 内衣 → tag=underwear | cn=内衣 | posts=1,028,051 | status=anima
+2. qqzzxx → NOT FOUND
+resolved 1 of 2. not tags: qqzzxx. Do not use those as tags - say the concept in prose instead, or search for a different name.
+```
+
+几条被实测逼出来的取舍：
+
+- **`status` 统一四值** `anima` / `valid` / `retired` / `unknown`。此前 `search`
+  行根本不显示状态，模型从结果里抄走一个已废弃标签不会有任何提示。
+- **图例只写一次**（原先每个结果重复约 150 字符），`posts` 与 `status` 进每一行；
+  `resolve` 也真的给出帖数——工具说明一直承诺它，之前却没输出。
+- **不再写 `searches remaining: 0`**。那是给 AnimaCaptioner 自己的 agent 用的预算字段，
+  MCP 里没有预算，模型会把它读成"不能再查了"。
+- **截断要说明。** 每个查询多查一条，只用来判断"还有更多"，写成 `8+ tag(s)`；
+  跨查询合计超过 60 行就停下来并说明。让模型知道结果被截断，比让它以为
+  "库里就这三条"重要得多。
+- **`scan` 去重**：DP 逐位置输出，`雨` 在「雨中」「雨伞」里各命中一次就会给出两行
+  `tag=rain`；现在同一段里同一个标签只留第一处（不同段落之间照旧各留一行）。
+
 ## 联网搜索（`web_search`）
 
 模型可以自己决定上网查。工具名是 `web_search`（**不带 `danbooru_` 前缀**：它查的是
@@ -410,8 +452,8 @@ AnimaCaptioner 里 shim 的密钥是"可选"（有就发、没有就不发）。
   停掉 MCP 也不影响转发 API。
 - **真实客户端实测**：官方 `ModelContextProtocol` C# SDK（2.2.0）的
   `HttpClientTransport` 连上来，`initialize` → `tools/list`（5 个工具）→
-  `tools/call danbooru_resolve_tag("白色连衣裙")` 返回
-  `FOUND / tag=white dress / cn=白色连衣裙 / category=general`。
+  `tools/call danbooru_resolve_tags(["白色连衣裙"])` 返回
+  `1. 白色连衣裙 → tag=white dress | cn=白色连衣裙 | posts=462,709 | status=anima`。
 
 ## 多站点与模型路由
 
@@ -473,7 +515,8 @@ AnimaCaptioner 里 shim 的密钥是"可选"（有就发、没有就不发）。
   - `McpServer`（MCP 独立服务：自己的端口/绑定/令牌/启停）
   - `HttpSecurity`（两个服务共用的三道门：来源过滤 / Origin / 令牌）
   - `McpEndpoint`（MCP 服务端：JSON-RPC 2.0 子集、版本协商、工具映射 —— 不含任何 HTTP 类型，所以回归能直接调协议层）
-- `Vendor/AnimaCaptioner/` —— 从 [AnimaCaptioner] 搬入的词库内核（零 WinUI / Windows API 引用）
+- `Vendor/AnimaCaptioner/` —— 从 [AnimaCaptioner] 搬入的词库内核（零 WinUI / Windows API 引用）。
+  中文键冲突（`AddCnKey`）与 `PostCount` 两处修正**改在上游**再搬回来，两边共用同一份代码
 - `tests/` —— `net10.0` 纯 .NET 回归工程。它同时是一道**守卫**：Core/ 或 Vendor/ 一旦混进 WinUI 类型就编译不过（TFM 代际必须与应用的 `net10.0-windows…` 保持一致，见文末「构建取舍」）
 - `docs/` —— 上游复用面的技术勘察报告（LlmClient、VocabDb）
 
@@ -726,7 +769,30 @@ WindowsAppRuntime 2.5.1 加载。
 - Kestrel 可在 WinUI 进程内运行并被外部客户端访问（含 SSE 回流）。
 - 词库内核在纯 `net10.0`（不带 `-windows`）下编译并查询真实 113 MB 词库成功。
 
-## 词库中文解析的一个已知边界
+## 词库中文解析：两个边界（一个已修）
+
+### 已修：同名中文键被 junk 行顶掉（上游 `VocabDb.AddCnKey`）
+
+`best` 里一个中文名可以对应多行，而 `_cnExact` 原本是"先到者胜"（对齐 Python 的
+`setdefault`，按 rowid 顺序读）：`内衣` 的第一行是作品 `lingeries`（14 帖）、`雨伞`
+的第一行是画师 `@amagasa`（49 帖），而真标签 `underwear`（103 万帖）/ `umbrella`
+（12 万帖）排在几十万行之后。精确键记住了那条 junk 行，随即被 `JunkCategories`
+拒掉，模型拿到的是"这个词不存在"——**一个自信的否定，比查不到更难发现**。
+
+实测 **488 条**中文名被这样顶掉，其中 471 条 seed 也没兜住，66 条对应的真标签
+≥1 万帖：`长袖`（239 万）、`内衣`（103 万）、`荷叶边`（78 万）、`虎牙`、`痣`、
+`开心`、`T恤`、`雨伞`……修法只放宽一处：**当前那行是 junk、新来的不是**才替换；
+两条都 junk 或都不 junk 时仍先到者胜（`少女` → `girl (mokufuu)` 这条坑不能重挖）。
+修完这 471 条全部能解析。
+
+`scan` 也跟着修好：它只在 `ResolveChinese` 认账时才采用长词，所以 `雨伞` 以前
+只能退化成单字 `雨` → `rain`（同一句里出现两次就是两行 `rain`）。
+
+修在**上游 AnimaCaptioner 的 `Core/VocabDb.cs`**，再重新 vendor 到这里——两处共用
+同一份代码，打标软件那边同样受益。顺带在上游加了 `PostCount(tag)`（Anima 索引
+优先，与 `Status` 同口径），工具结果里的 `posts=` 用的就是它。
+
+### 已知边界：人物 / 作品名整体不可用
 
 `Vendor/AnimaCaptioner` 的 `ResolveChinese` 对**人物 / 作品名**整体是不可用的，这是它的设计：
 
@@ -735,7 +801,7 @@ WindowsAppRuntime 2.5.1 加载。
 2. 就算连着括号一起打，`character` / `artist` / `copyright` 也会被 `JunkCategories` 主动拒掉。
 
 代理**不去绕过它**（绕过会让 `少女` 解析到 `girl (mokufuu)` 这类角色标签）。
-代理只补上一条收窄的回落：`danbooru_resolve_tag` 在内核落空后回落到 `Search`，但
+代理只补上一条收窄的回落：`danbooru_resolve_tags` 在内核落空后回落到 `Search`，但
 
 - 只认"同名"或"同名 + 括号限定"，不接受任意模糊命中；
 - 形状对上之后还把完整中文名交回 `ResolveChinese` 再审一次（类别由内核裁，不抄黑名单）；

@@ -128,7 +128,7 @@ public sealed class VocabDb
                 var tl = row.Tag.ToLowerInvariant();
                 if (tl.Length > 0) _byTag.TryAdd(tl, row);
                 if (row.Danbooru.Length > 0) _byDanbooru.TryAdd(row.Danbooru.ToLowerInvariant(), row);
-                if (row.Cn.Length > 0) _cnExact.TryAdd(row.Cn, row);
+                if (row.Cn.Length > 0) AddCnKey(row);
             }
         }
 
@@ -224,6 +224,34 @@ public sealed class VocabDb
         }
     }
 
+    /// <summary>
+    /// 登记一条中文名 → 行。**同名的多行里优先留能用的那一个。**
+    ///
+    /// 原来的规则是"先到者胜"（对齐 Python 的 setdefault），而 `best` 的 rowid
+    /// 顺序既不按引用数也不按类别：`内衣` 的第一行是作品 `lingeries`（14 帖），
+    /// `雨伞` 的第一行是画师 `@amagasa`（49 帖），而它们各自真正的标签
+    /// `underwear`（103 万帖）/ `umbrella`（12 万帖）排在几十万行之后。
+    /// 于是 <see cref="ResolveChinese"/> 精确键命中的是那条 junk 行，再按
+    /// <see cref="JunkCategories"/> 拒掉，回 "wrong-category"——调用方如实报
+    /// "查不到"。实测 488 条中文词被这样顶掉（内衣 / 长袖 / 荷叶边 / 虎牙 /
+    /// 痣 / T恤 …），其中 66 条对应的真标签都在一万帖以上，而 seed 只兜住 17 条。
+    ///
+    /// 放宽的只有一处：**当前那一行是 junk、新来的不是**才替换。
+    /// 两条都 junk 或都不 junk 时仍保持先到者胜——这条不能动，否则
+    /// "同名变体里留着先出现的那一个"的既有行为会悄悄变掉，
+    /// 而 `少女` → `girl (mokufuu)` 正是靠类别裁决挡住的。
+    ///
+    /// 连带修好的是 <see cref="Scan"/>：它只在 <see cref="ResolveChinese"/>
+    /// 认账时才采用长词，所以 `雨伞` 查不到时只能退化成单字 `雨` → `rain`
+    /// （同一条描述里出现两次就是两行 `rain`）。键能解析了，DP 自然选长词。
+    /// </summary>
+    private void AddCnKey(VocabRow row)
+    {
+        if (!_cnExact.TryGetValue(row.Cn, out var cur)) { _cnExact[row.Cn] = row; return; }
+        if (JunkCategories.Contains(cur.Category) && !JunkCategories.Contains(row.Category))
+            _cnExact[row.Cn] = row;
+    }
+
     private void BuildCnKeys()
     {
         // 与 Python 一致：cn_exact 的键 ∪ seed 的键
@@ -290,6 +318,25 @@ public sealed class VocabDb
         if (!_byTag.TryGetValue(low, out var r)) return "unknown";
         if (r.PostCount == 0) return "unknown";
         return r.Deprecated ? "retired" : "valid";
+    }
+
+    /// <summary>
+    /// 标签的引用数（帖子数）。**取值顺序与 <see cref="Status"/> 一致：Anima 索引优先**
+    /// ——同一个标签在两张表里帖数不同，而"Anima 常用"这个判定本来就是按 Anima 的
+    /// 口径给的，两处用不同来源会得到"状态说 anima、帖数却是 Danbooru 的"这种自相矛盾的输出。
+    ///
+    /// 别名与大小写不敏感（`@dairi` / `dairi` 等价）。查不到返回 0——
+    /// 0 在展示层要写成"无引用"，不能写成"0 帖"（那看起来像"这个标签没人用"）。
+    /// </summary>
+    public int PostCount(string tag)
+    {
+        if (string.IsNullOrWhiteSpace(tag)) return 0;
+        var low = tag.Trim().ToLowerInvariant();
+        if (low.StartsWith('@')) low = low[1..];
+
+        if (_anima.TryGetValue(low, out var p) && p > 0) return p;
+        if (_byTag.TryGetValue(low, out var r)) return r.PostCount;
+        return 0;
     }
 
     /// <summary>英文标签 → 规范形式。</summary>
