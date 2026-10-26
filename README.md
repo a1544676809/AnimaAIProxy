@@ -158,8 +158,8 @@
 **输出形状**（三个工具一致；每行 `tag=` 到下一个 ` | ` 之间就是标签名）：
 
 ```
-query 1/2: white dress → 3 tag(s)
-format: N. tag=<exact tag name> | cn=<meaning> | posts=<usage> | status=<anima|valid|retired|unknown>
+query 1/2: white dress → 3 tag(s), 2 of them are character/series/artist tags (not scene tags)
+format: N. tag=<exact tag name> | cn=<meaning> | posts=<usage> | status=<anima|valid|retired|unknown|control>
 1. tag=white dress | cn=白色连衣裙 | posts=462,709 | status=anima
 
 1. 内衣 → tag=underwear | cn=内衣 | posts=1,028,051 | status=anima
@@ -167,19 +167,37 @@ format: N. tag=<exact tag name> | cn=<meaning> | posts=<usage> | status=<anima|v
 resolved 1 of 2. not tags: qqzzxx. Do not use those as tags - say the concept in prose instead, or search for a different name.
 ```
 
-几条被实测逼出来的取舍：
+几条被实测逼出来的取舍（2026-10-26 按一份外部评审逐条修过）：
 
-- **`status` 统一四值** `anima` / `valid` / `retired` / `unknown`。此前 `search`
-  行根本不显示状态，模型从结果里抄走一个已废弃标签不会有任何提示。
+- **`status` 五值** `anima` / `valid` / `retired` / `unknown` / `control`。
+  `control` 是控制词（`masterpiece`、`best quality`、`score_7`、`safe`、`explicit`、
+  `1girl`…）：它们在合并表里 `post_count=0` 是正常的，写 `unknown` 会让模型把它们
+  当废标签删掉。词库里根本没有行的控制词（`explicit`、`score_8`）也照样能查到，
+  `posts` 写 `-`。
+- **精确同名永远第一。** `Search` 原本给"无引用"标签加 10 分惩罚，于是 `masterpiece`
+  排到 `world masterpiece theater` 后面——模型以为库里没有它。
+- **行保持四段**（tag / cn / posts / status），不加第五个字段：下游解析器是按
+  `status=` 到行尾取值的，多一段就会把额外字段读成状态。哪几行是角色/作品标签
+  由**查询标题**说明（`2 of them are character/series/artist tags`），这些行按热度
+  排在 general 之后。
 - **图例只写一次**（原先每个结果重复约 150 字符），`posts` 与 `status` 进每一行；
   `resolve` 也真的给出帖数——工具说明一直承诺它，之前却没输出。
 - **不再写 `searches remaining: 0`**。那是给 AnimaCaptioner 自己的 agent 用的预算字段，
   MCP 里没有预算，模型会把它读成"不能再查了"。
-- **截断要说明。** 每个查询多查一条，只用来判断"还有更多"，写成 `8+ tag(s)`；
-  跨查询合计超过 60 行就停下来并说明。让模型知道结果被截断，比让它以为
-  "库里就这三条"重要得多。
+- **截断与上限都要说明。** 每个查询多查一条，只用来判断"还有更多"，写成 `8+ tag(s)`；
+  60 行总额度**按查询数均分**（12 条查询 × 默认 limit 8 原本是 96 行，后 4 条连标题
+  都印不出来）。超上限时**第一行**就写 `note: only 12 of 14 queries were processed
+  (cap 12); 2 skipped.`——调用方往往只看第一行。
+- **中文整句走词库切分**：查询是中文短句、且整串/拆词都没给出好结果时，用 `Scan`
+  按位置选最长词（`湿漉漉的街道` → `wet floor` + `street`），比逐词搜索准。
+- **拆词兜底只留 general + Anima 常用**：`rain night` 以前会给
+  `whisperain (arknights)`；单个英文词只命中角色名时直接回 none，并说明"这只出现在
+  角色/作品名里"（`refined` → 不再给 `refined barzam`）。
 - **`scan` 去重**：DP 逐位置输出，`雨` 在「雨中」「雨伞」里各命中一次就会给出两行
-  `tag=rain`；现在同一段里同一个标签只留第一处（不同段落之间照旧各留一行）。
+  `tag=rain`；现在同一段里同一个标签只留第一处。
+- **`scan` 报告没匹配上的片段**：写在 `text i/n:` 标题行上
+  （`... → 6 tag(s); unmatched: 少女、霓虹`）。长句里"夜"、"霓虹"悄悄丢掉时，
+  模型会以为已经覆盖完整，于是不再补写——场景氛围就这么从提示词里消失了。
 
 ## 联网搜索（`web_search`）
 
@@ -789,8 +807,27 @@ WindowsAppRuntime 2.5.1 加载。
 只能退化成单字 `雨` → `rain`（同一句里出现两次就是两行 `rain`）。
 
 修在**上游 AnimaCaptioner 的 `Core/VocabDb.cs`**，再重新 vendor 到这里——两处共用
-同一份代码，打标软件那边同样受益。顺带在上游加了 `PostCount(tag)`（Anima 索引
-优先，与 `Status` 同口径），工具结果里的 `posts=` 用的就是它。
+同一份代码，打标软件那边同样受益。顺带在上游加了 `PostCount(tag)`：计数取合并表
+`best` 的 Danbooru 帖数（与搜索窗口显示的一致），Anima 索引只作兜底。
+
+### 已修：一个中文词对应多个概念（`雨夜` → rain + night）
+
+`Scan` 的动态规划**每段只能给一个标签**，而词库的中文键是"整名"粒度（有 `雨`、
+有 `夜晚`，没有 `雨夜`）。实测「银发红瞳的少女，站在雨夜的霓虹街道上」只出
+`rain` + `street`——夜与霓虹全丢，调用方还以为已覆盖完整。
+
+修法是在切分之后补一张**复合词表**（`雨夜`→rain+night、`夜景`→night+scenery、
+`霓虹街道`→neon-lights+street、`湿漉漉`→wet-floor），只收 DP 表达不了的那一类；
+表里的目标标签全部实测存在。它同时也是 `search` 的"中文整句"兜底：
+`湿漉漉的街道` 现在给出 `wet floor` + `street`，而以前只有前者。
+
+### 已修：`银发` 三个工具给两个答案
+
+`银发` 在词库里同时挂着 `silver hair`（cn=银发）与 `grey hair`（cn=灰发），而
+`seed.json` 里写的是 `银发 → grey hair`——于是 `resolve`/`scan` 走 seed 给灰发、
+`search` 走词库 cn 给银发。中文语境里"银发"几乎总是 `silver hair`（亮银/冷调），
+`grey hair` 会画成灰白、显老。改的是 seed 母本（`vocab/seed.json`），
+`灰发 → grey hair` 保留。
 
 ### 已知边界：人物 / 作品名整体不可用
 

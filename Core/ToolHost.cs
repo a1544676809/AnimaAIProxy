@@ -133,7 +133,7 @@ public sealed class ToolHost
 
     private ToolResult Search(ProxyConfig cfg, string arguments)
     {
-        var queries = ReadStringList(arguments, "queries", "query", MaxQueries);
+        var queries = ReadStringList(arguments, "queries", "query", MaxQueries, out var dropped);
         if (queries.Count == 0)
         {
             return new ToolResult(
@@ -145,66 +145,79 @@ public sealed class ToolHost
         var db = TryVocab(cfg, out var err);
         if (db is null) return Fail(err);
 
-        // 每个查询多要一条：**只为判断"还有更多"，不交给模型**。
-        // 让模型知道结果被截断了，比让它以为"库里只有这三条"重要——后者会
-        // 让它断定这个词库里没有别的近义标签，转而去凭记忆编。
         var limit = Math.Clamp(ReadInt(arguments, "limit", DefaultSearchLimit), 1, TagSearch.ToolLimit);
 
+        // 60 行总额度**按查询数均分**（至少 1 行）。不均分的话"12 条查询 × 默认
+        // limit 8"就是 96 行，后 4 条查询连标题都印不出来——调用方无法区分
+        // "没查过"和"查了但没结果"，而这正是这类批量工具最不该含糊的地方。
+        var perQuery = Math.Max(1, Math.Min(limit, MaxHitRows / queries.Count));
+
         var sb = new StringBuilder();
+
+        // 上限相关的说明放**最前面**：调用方往往只看第一行就判断"这次全查了"。
+        if (dropped > 0)
+            sb.Append("note: only ").Append(queries.Count).Append(" of ")
+              .Append(queries.Count + dropped).Append(" queries were processed (cap ")
+              .Append(MaxQueries).Append("); ").Append(dropped).Append(" skipped.\n");
+
         var shown = 0;
         var found = 0;
         var legend = false;
-        var truncated = false;
 
-        for (var i = 0; i < queries.Count && !truncated; i++)
+        for (var i = 0; i < queries.Count; i++)
         {
             var query = queries[i];
-            var res = TagSearch.QueryDetailed(db, query, limit + 1);
-            var more = res.Hits.Count > limit;
+            var (rows, more, mode) = QueryRows(db, query, perQuery);
 
             sb.Append("query ").Append(i + 1).Append('/').Append(queries.Count)
               .Append(": ").Append(query).Append(" → ");
 
-            if (res.Hits.Count == 0)
+            if (rows.Count == 0)
             {
-                sb.Append("none (no tag matches this; try fewer or more general words)\n");
+                sb.Append(mode switch
+                {
+                    "split" => "none (the words matched only character/series/artist tags - not " +
+                               "usable as scene tags; try other words)\n",
+                    "namelike" => "none (this word only appears inside character/series names; " +
+                                  "search the full name or a more general word)\n",
+                    _ => "none (no tag matches this; try fewer or more general words)\n",
+                });
                 continue;
             }
 
-            sb.Append(Math.Min(res.Hits.Count, limit));
+            sb.Append(rows.Count);
             if (more) sb.Append('+');
             sb.Append(" tag(s)");
-            if (res.SplitMatch)
-                sb.Append(" (nothing matched the whole query, so it was split into words; " +
-                          "only partly related)");
+            if (mode == "split") sb.Append(" (split into words; only general tags kept)");
+            if (mode == "phrase") sb.Append(" (matched by splitting the phrase into known concepts)");
+
+            // 行本身保持四段（tag / cn / posts / status），不塞第五个字段：下游解析器
+            // 是按 `status=…` 到行尾取的，多一段就会把 category 读成 status 的一部分。
+            // "这一行是不是角色标签"用**行数说明**给，模型照样能对上（非 general 行
+            // 一律排在后面）。
+            var nonGeneral = rows.Count(x => x.Section != TagSections.General);
+            if (nonGeneral > 0)
+                sb.Append(", ").Append(nonGeneral)
+                  .Append(" of them are character/series/artist tags (not scene tags)");
             sb.Append('\n');
 
             if (!legend)
             {
                 // 图例只写一次。原先每个结果都重复一遍，25 行时那 150 字符就是白烧的。
                 sb.Append("format: N. tag=<exact tag name> | cn=<meaning> | posts=<usage> | ")
-                  .Append("status=<anima|valid|retired|unknown>\n");
+                  .Append("status=<anima|valid|retired|unknown|control>\n");
                 legend = true;
             }
 
-            var perQuery = 0;
-            foreach (var h in res.Hits)
+            foreach (var row in rows)
             {
-                if (shown >= MaxHitRows)
-                {
-                    sb.Append("(output limit reached at ").Append(MaxHitRows)
-                      .Append(" rows; narrow the queries or lower limit)\n");
-                    truncated = true;
-                    break;
-                }
-                if (perQuery >= limit) break;
-                perQuery++;
                 shown++;
                 found++;
-                sb.Append(shown).Append(". tag=").Append(h.Tag)
-                  .Append(" | cn=").Append(h.HasCn ? h.Cn : "-")
-                  .Append(" | posts=").Append(h.PostCount.ToString("N0", CultureInfo.InvariantCulture))
-                  .Append(" | status=").Append(StatusOf(h))
+                sb.Append(shown).Append(". tag=").Append(row.Tag)
+                  .Append(" | cn=").Append(row.Cn)
+                  .Append(" | posts=").Append(row.Posts is { } p
+                      ? p.ToString("N0", CultureInfo.InvariantCulture) : "-")
+                  .Append(" | status=").Append(row.Status)
                   .Append('\n');
             }
         }
@@ -212,11 +225,98 @@ public sealed class ToolHost
         return new ToolResult(sb.ToString(), QuerySummary("查", queries, found, "条"));
     }
 
+    /// <summary>一行结果。`Posts` 为 null 表示"这类词没有帖数"（控制词）。</summary>
+    private sealed record Row(string Tag, string Cn, int? Posts, string Status, string Section);
+
+    /// <summary>
+    /// 一条查询 → 若干行。三种来源，按可信度从高到低：
+    ///
+    /// 1. **词库查询**（精确 / 前缀 / 中文命中）——正常情况，直接用；
+    /// 2. **中文整句切分**（`db.Scan`）——查询是中文短句、整串与拆词都没给出好结果时用。
+    ///    它按位置选最长词，比"拆成单词再搜"准：`湿漉漉的街道` 能同时给出 `wet floor`
+    ///    和 `street`，而拆词只命中前者；
+    /// 3. **拆词兜底**（<see cref="TagSearch.QueryResult.SplitMatch"/>）——最弱，只留
+    ///    general：`rain night` 以前会给 `whisperain (arknights)`。
+    /// </summary>
+    private static (List<Row> Rows, bool More, string Mode) QueryRows(VocabDb db, string query, int perQuery)
+    {
+        var res = TagSearch.QueryDetailed(db, query, perQuery + 1);
+
+        if ((res.Hits.Count == 0 || res.SplitMatch) && query.Any(VocabDb.IsCjk))
+        {
+            var phrase = PhraseRows(db, query);
+            if (phrase.Count > 0)
+                return (phrase.Take(perQuery).ToList(), phrase.Count > perQuery, "phrase");
+        }
+
+        var hits = res.Hits;
+        if (res.SplitMatch)
+        {
+            // 先多取一些再过滤：前 25 条可能全是角色标签。
+            // 门槛收紧到"general + Anima 常用"：拆词本来就是弱匹配，再放冷门
+            // Danbooru 标签进来只会让调用方以为 `night` 之外还有别的场景词。
+            var wide = TagSearch.QueryDetailed(db, query, TagSearch.ToolLimit);
+            hits = wide.Hits.Where(h => SectionOf(h.Tag, db) == TagSections.General
+                                        && db.Status(h.Tag) == "anima").ToList();
+        }
+
+        var rows = new List<Row>(perQuery);
+        foreach (var h in hits.Take(perQuery))
+        {
+            var section = SectionOf(h.Tag, db);
+            rows.Add(new Row(h.Tag, h.HasCn ? h.Cn : "-", db.PostCount(h.Tag),
+                             StatusOfTag(h.Tag, db, section), section));
+        }
+
+        // 查询本身就是控制词（`explicit`、`score_8` 在库里没有行）时，把它自己
+        // 作为一行给出来——否则调用方会以为"这个词库里没有"，转头把它删掉。
+        var control = ControlCanonical(query);
+        if (control is not null &&
+            !rows.Any(r => string.Equals(r.Tag, control, StringComparison.OrdinalIgnoreCase)))
+            rows.Insert(0, new Row(control, "-", null, "control", TagSections.General));
+
+        // 单个英文词、且只命中角色/作品名时，不把这些名字当结果：调用方问的是
+        // "refined 这个概念有没有标签"，给它 `refined barzam`（高达角色）只会被
+        // 抄进提示词。名字搜索请给完整名字（多词，不触发这条）。
+        if (rows.Count > 0 && rows.All(r => r.Section != TagSections.General && r.Status != "control")
+            && IsSingleLatinWord(query))
+            return (new List<Row>(), false, "namelike");
+
+        return (rows, hits.Count > perQuery, res.SplitMatch ? "split" : "");
+    }
+
+    /// <summary>单个拉丁词（不含空格与 CJK）——用来区分"概念词"与"完整名字"。</summary>
+    private static bool IsSingleLatinWord(string query)
+    {
+        var q = query.Trim();
+        return q.Length > 0 && q.All(c => c < 0x80) && !q.Contains(' ', StringComparison.Ordinal);
+    }
+
+    /// <summary>把一句中文按词库切成概念，再翻成标签行（和 scan 工具同一套切分）。</summary>
+    private static List<Row> PhraseRows(VocabDb db, string query)
+    {
+        var rows = new List<Row>();
+        foreach (var h in db.Scan(query))
+        {
+            if (rows.Any(r => string.Equals(r.Tag, h.Tag, StringComparison.OrdinalIgnoreCase))) continue;
+
+            var section = SectionOf(h.Tag, db);
+            // 整句切出来的角色 / 作品名同样不该当场景标签：`银发的少女` 会切出
+            // `jeanne d'arc (girl from orleans) (fate)` 这种。
+            if (section != TagSections.General) continue;
+
+            var cn = db.LookupCn(h.Tag);
+            rows.Add(new Row(h.Tag, cn.Length > 0 ? cn : "-", db.PostCount(h.Tag),
+                             StatusOfTag(h.Tag, db, section), section));
+        }
+        return rows;
+    }
+
     // ---------------- danbooru_resolve_tags ----------------
 
     private ToolResult Resolve(ProxyConfig cfg, string arguments)
     {
-        var tags = ReadStringList(arguments, "tags", "tag", MaxTags);
+        var tags = ReadStringList(arguments, "tags", "tag", MaxTags, out var dropped);
         if (tags.Count == 0)
         {
             return new ToolResult(
@@ -231,6 +331,7 @@ public sealed class ToolHost
         var sb = new StringBuilder();
         var found = 0;
         var misses = new List<string>();
+        var notes = new List<string>();
 
         for (var i = 0; i < tags.Count; i++)
         {
@@ -238,19 +339,38 @@ public sealed class ToolHost
             var (resolved, note) = ResolveOne(db, input);
 
             sb.Append(i + 1).Append(". ").Append(input).Append(" → ");
+
             if (resolved is null)
             {
-                sb.Append("NOT FOUND\n");
-                misses.Add(input);
+                // 词库里查不到，但它可能是**控制词**（质量 / 安全 / 数量…）：
+                // `explicit`、`score_8` 在合并表里根本没有行，可它们在 Anima 的
+                // 提示词里是完全合法的头部词。判"不存在"会让模型把它们删掉。
+                var control = ControlCanonical(input);
+                if (control is null)
+                {
+                    sb.Append("NOT FOUND\n");
+                    misses.Add(input);
+                    continue;
+                }
+
+                found++;
+                sb.Append("tag=").Append(control).Append(" | cn=- | posts=- | status=control\n");
+                // 备注放行尾会破坏 `status=…` 到行尾的解析（下游按这个取状态），
+                // 所以统一收集起来，在 summary 之后单独写。
+                if (!string.Equals(control, input.Trim(), StringComparison.OrdinalIgnoreCase))
+                    notes.Add(input.Trim() + " is written as \"" + control + "\" in Anima prompts.");
+                if (string.Equals(control, "general", StringComparison.OrdinalIgnoreCase))
+                    notes.Add("\"general\" is the Danbooru rating word; Anima prompts use \"safe\".");
                 continue;
             }
 
             found++;
+            var section = SectionOf(resolved, db);
             var cnText = db.LookupCn(resolved);
             sb.Append("tag=").Append(resolved)
               .Append(" | cn=").Append(cnText.Length > 0 ? cnText : "-")
               .Append(" | posts=").Append(db.PostCount(resolved).ToString("N0", CultureInfo.InvariantCulture))
-              .Append(" | status=").Append(db.Status(resolved));
+              .Append(" | status=").Append(StatusOfTag(resolved, db, section));
             if (note.Length > 0) sb.Append(" (").Append(note).Append(')');
             sb.Append('\n');
         }
@@ -265,6 +385,13 @@ public sealed class ToolHost
               .Append("search for a different name.");
         }
         sb.Append('\n');
+
+        foreach (var n in notes) sb.Append("note: ").Append(n).Append('\n');
+
+        if (dropped > 0)
+            sb.Append("note: only ").Append(tags.Count).Append(" of ")
+              .Append(tags.Count + dropped).Append(" tags were checked (cap ")
+              .Append(MaxTags).Append("); ").Append(dropped).Append(" skipped.\n");
 
         return new ToolResult(sb.ToString(), QuerySummary("核对", tags, found, "命中"));
     }
@@ -339,17 +466,143 @@ public sealed class ToolHost
     }
 
     /// <summary>
-    /// 搜索行里的状态。判据与 <see cref="VocabDb.Status"/> 同一口径（Anima 索引优先、
-    /// 废弃次之、无引用最后），但**不查字典**：<see cref="TagSearch.Hit"/> 已经把
-    /// InAnima / Deprecated / PostCount 都带出来了，25 行就是 25 次字典查找的差别，
-    /// 在批量路径上没必要。
+    /// 标签所属的大类（九段之一）。用作输出里的 `category=`，也用来判"是不是控制词"。
+    ///
+    /// 用 <see cref="TagSections.Classify"/> 而不是词库的原始 `category` 列：后者是
+    /// 数据源自己的分类串（`饰品`、`anima-cat6`），而这里要的是与官方大类顺序
+    /// 对齐的那九段，且**不依赖词库**——`explicit`、`score_8` 根本不在库里，
+    /// Classify 仍认得它们是安全词 / 质量词。
     /// </summary>
-    private static string StatusOf(TagSearch.Hit h)
+    private static string SectionOf(string tag, VocabDb db) => TagSections.Classify(tag, db);
+
+    /// <summary>五段头部（质量 / 元信息 / 年代 / 安全 / 数量）——控制词，不是场景标签。</summary>
+    private static bool IsControlSection(string section) =>
+        Array.IndexOf(TagSections.HeadKeys, section) >= 0;
+
+    /// <summary>
+    /// 输出里的状态：`anima` / `valid` / `retired` / `unknown` / `control`。
+    ///
+    /// 判据仍交给 <see cref="VocabDb.Status"/>（Anima 索引优先、废弃次之），
+    /// 只补一条：**词库说"无引用"而它其实是控制词**（`masterpiece`、`safe`、
+    /// `score_7`）时写 `control`。这些词在合并表里 post_count=0 是正常的——
+    /// 按 `unknown`（"没有使用量"）说，模型会把它们当成废标签删掉，而它们
+    /// 恰恰是 Anima 必须写在头部的词。
+    /// </summary>
+    private static string StatusOfTag(string tag, VocabDb db, string section)
     {
-        if (h.InAnima) return "anima";
-        if (h.PostCount == 0) return "unknown";
-        return h.Deprecated ? "retired" : "valid";
+        var st = db.Status(tag);
+        if (st == "unknown" && IsControlSection(section)) return "control";
+        return st;
     }
+
+    /// <summary>
+    /// 控制词的规范写法。命中返回词表里的那个成员（统一大小写），否则 null。
+    ///
+    /// 只认 Anima 官方词表（<see cref="TagSections"/> 的五组数组）+ `score_N`
+    /// + Danbooru 的 `general`（Anima 写 `safe`，见 <see cref="SafetyRating"/>）。
+    /// **它不替代词库查询**：词库里有的（`1girl`、`blurry`）照常解析，只有
+    /// 查不到时才用这张表兜底——否则会把 `unsafe` 这种长得像的词也认成控制词。
+    /// </summary>
+    private static string? ControlCanonical(string input)
+    {
+        var low = input.Trim().ToLowerInvariant();
+        if (low.Length == 0) return null;
+
+        foreach (var list in new[]
+                 {
+                     TagSections.QualityWords, TagSections.MetaWords, TagSections.PeriodWords,
+                     TagSections.SafetyWords, TagSections.CountWords,
+                 })
+            foreach (var w in list)
+                if (string.Equals(w, low, StringComparison.OrdinalIgnoreCase)) return w;
+
+        if (low.Length == 7 && low.StartsWith("score_", StringComparison.Ordinal)
+            && char.IsAsciiDigit(low[6]))
+            return low;
+
+        // Danbooru 的档位词 `general` 在 Anima 里写 `safe`（见 SafetyRating）。
+        // **返回值保持调用方写的写法**：换成 `safe` 会让 search 里 `general` 变成
+        // 另一个标签名，调用方对不上号；提示放在备注里说。
+        if (low == "general") return "general";
+        return null;
+    }
+
+    /// <summary>
+    /// "这段话里哪些字没变成标签"。按 <see cref="ScanHit.Key"/> 在原文里逐段回填覆盖，
+    /// 剩下的连续片段就是没匹配上的部分（去掉标点与"的了在"这类虚词）。
+    ///
+    /// 不给出来会出真问题：长句里"夜"、"霓虹"丢了而输出只写 6 个标签，模型
+    /// 会以为这句已完整解析，于是不再补写——场景氛围就这么从提示词里消失了。
+    /// </summary>
+    private static string UnmatchedSuffix(string text, IReadOnlyList<ScanHit> hits)
+    {
+        var covered = new bool[text.Length];
+        var cursor = 0;
+        foreach (var h in hits)
+        {
+            if (string.IsNullOrEmpty(h.Key)) continue;
+            var at = text.IndexOf(h.Key, cursor, StringComparison.Ordinal);
+            if (at < 0) continue;
+            for (var k = at; k < at + h.Key.Length; k++) covered[k] = true;
+            cursor = at + h.Key.Length;
+        }
+
+        var parts = new List<string>();
+        var start = -1;
+        for (var i = 0; i <= text.Length; i++)
+        {
+            var inside = i < text.Length && !covered[i];
+            if (inside && start < 0) start = i;
+            if (!inside && start >= 0)
+            {
+                // 标点换成空格再收拢，免得报出 `少女，穿` 这种连标点一起的片段；
+                // 首尾的虚词（的 / 了 / 上 / 穿）也剪掉，它们不是"概念"。
+                var raw = text[start..i];
+                start = -1;
+                var cleaned = new string(raw.Select(c =>
+                    char.IsPunctuation(c) || char.IsSymbol(c) ? ' ' : c).ToArray());
+                cleaned = string.Join(" ", cleaned.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+                                 .Trim(Particles)
+                                 .Trim();
+                if (cleaned.Length > 0 && HasContent(cleaned)) parts.Add(cleaned);
+            }
+        }
+
+        if (parts.Count == 0) return "";
+        var shown = string.Join("、", parts.Take(8));
+        if (parts.Count > 8) shown += "…";
+        return "; unmatched: " + shown;
+    }
+
+    /// <summary>只剩标点和虚词的片段不值得报（"的"、"了"、"在"）。</summary>
+    private static bool HasContent(string span)
+    {
+        foreach (var ch in span)
+        {
+            if (char.IsWhiteSpace(ch) || char.IsPunctuation(ch) || char.IsSymbol(ch)) continue;
+            if (Array.IndexOf(Particles, ch) >= 0) continue;
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// 虚词与"没有对应标签的常用动词/方位词"。只用来剪掉未匹配片段的边角——
+    /// `穿`、`上`、`的` 单独成段报出去，只会让模型以为漏了概念。
+    /// </summary>
+    private static readonly char[] Particles =
+    {
+        '的', '了', '着', '在', '和', '与', '把', '被', '给', '对', '从', '向', '到', '于',
+        '而', '或', '及', '地', '得', '过', '吗', '呢', '吧', '啊', '呀', '嘛', '很', '都',
+        '也', '就', '又', '还', '是', '有', '这', '那', '哪', '我', '你', '他', '她', '它', '们',
+        '嗯', '哦', '哈', '咯', '噢',
+        '上', '下', '里', '中', '外', '内', '前', '后', '旁', '边', '处', '间',
+        '穿', '戴', '拿', '举', '抱', '握', '放', '挂', '站', '坐', '躺', '蹲', '跑', '走',
+        '来', '去', '说', '看', '望', '笑', '哭', '想', '让', '使', '做', '用', '变', '起',
+        '开', '关', '收', '加', '减', '至', '往', '沿', '顺', '随', '由', '按', '并', '且',
+        '但', '却', '因', '为', '所', '以', '如', '若', '虽', '然', '之', '其', '此', '该',
+        '每', '各', '某', '些', '什', '么', '怎', '样',
+    };
 
     /// <summary>
     /// 一条给人看的摘要（日志面板 / 界面）。单个时原样列出，多个时列第一个 + "等 N 个"：
@@ -391,7 +644,7 @@ public sealed class ToolHost
 
     private ToolResult Scan(ProxyConfig cfg, string arguments)
     {
-        var texts = ReadStringList(arguments, "texts", "text", MaxTexts);
+        var texts = ReadStringList(arguments, "texts", "text", MaxTexts, out var dropped);
         if (texts.Count == 0)
         {
             return new ToolResult(
@@ -404,6 +657,11 @@ public sealed class ToolHost
         if (db is null) return Fail(err);
 
         var sb = new StringBuilder();
+        if (dropped > 0)
+            sb.Append("note: only ").Append(texts.Count).Append(" of ")
+              .Append(texts.Count + dropped).Append(" texts were scanned (cap ")
+              .Append(MaxTexts).Append("); ").Append(dropped).Append(" skipped.\n");
+
         var total = 0;
         var rows = 0;
         var truncated = false;
@@ -420,15 +678,11 @@ public sealed class ToolHost
             foreach (var h in db.Scan(text))
                 if (seen.Add(h.Tag)) hits.Add(h);
 
+            // 没匹配上的片段写在**标题行**上：调用方解析时看的就是这一行，
+            // 单独一行会被当成无关内容跳过。
             sb.Append("text ").Append(i + 1).Append('/').Append(texts.Count)
-              .Append(": ").Append(text).Append(" → ").Append(hits.Count).Append(" tag(s)\n");
-
-            if (hits.Count == 0)
-            {
-                sb.Append("   none of these words matched a tag (that is a normal outcome, " +
-                          "not an error)\n");
-                continue;
-            }
+              .Append(": ").Append(text).Append(" → ").Append(hits.Count).Append(" tag(s)")
+              .Append(UnmatchedSuffix(text, hits)).Append('\n');
 
             foreach (var h in hits)
             {
@@ -443,7 +697,7 @@ public sealed class ToolHost
                 total++;
                 sb.Append("   tag=").Append(h.Tag);
                 if (!string.IsNullOrEmpty(h.Key)) sb.Append(" | from \"").Append(h.Key).Append('"');
-                sb.Append(" | status=").Append(db.Status(h.Tag)).Append('\n');
+                sb.Append(" | status=").Append(StatusOfTag(h.Tag, db, SectionOf(h.Tag, db))).Append('\n');
             }
         }
 
@@ -576,20 +830,29 @@ public sealed class ToolHost
     ///   * 传了对象数组（<c>[{"tag":"a"}]</c>）——不收，交给调用方回一句"参数不对"，
     ///     因为猜它想表达什么比失败更危险。
     ///
-    /// 去重（大小写不敏感）并保留顺序；超过 <paramref name="cap"/> 的部分丢掉——
-    /// 调用方从返回条数就能看出被截断了。
+    /// 去重（大小写不敏感）并保留顺序；超过 <paramref name="cap"/> 的部分丢掉，
+    /// 并通过 <c>out dropped</c> 告诉调用方丢了几条——**静默截断必须避免**：
+    /// 调用方否则无法区分"查过但没结果"和"根本没查"。
     /// </summary>
     internal static List<string> ReadStringList(string arguments, string primary, string fallback, int cap)
+        => ReadStringList(arguments, primary, fallback, cap, out _);
+
+    /// <summary>同 <see cref="ReadStringList(string,string,string,int)"/>，额外报告被上限丢掉的条数。</summary>
+    internal static List<string> ReadStringList(string arguments, string primary, string fallback, int cap,
+                                                out int dropped)
     {
         var outp = new List<string>();
+        dropped = 0;
+        var dirty = 0;   // out 参数不能进本地函数，先记在这里，出口再写回
         var raw = (arguments ?? "").Trim();
         if (raw.Length == 0 || cap <= 0) return outp;
 
         void Add(string? s)
         {
             var v = (s ?? "").Trim();
-            if (v.Length == 0 || outp.Count >= cap) return;
+            if (v.Length == 0) return;
             if (outp.Any(x => string.Equals(x, v, StringComparison.OrdinalIgnoreCase))) return;
+            if (outp.Count >= cap) { dirty++; return; }
             outp.Add(v);
         }
 
@@ -625,6 +888,10 @@ public sealed class ToolHost
             if (!raw.StartsWith('{') && !raw.StartsWith('['))
                 Add(raw.Trim('"', '\'', '“', '”'));
             return outp;
+        }
+        finally
+        {
+            dropped = dirty;
         }
     }
 

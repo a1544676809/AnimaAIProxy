@@ -259,6 +259,132 @@ public static class Vocab
         Harness.Eq("图例只出现一次", CountOf(searched.Text, "format:"), 1);
         Harness.True("摘要带上词数", searched.Summary.Contains("等 2 个", StringComparison.Ordinal));
 
+        // ---- 外部评审（2026-10-26）指出的四个会直接写坏提示词的缺陷 ----
+        Harness.Section("6b. 评审回归：同义词一致 / 控制词 / 拆词过滤 / 批量反馈");
+
+        // (1) 银发：三个工具必须给同一个答案，而且必须是 silver hair。
+        //     以前 resolve/scan 走 seed（银发 → grey hair）、search 按词库 cn 命中
+        //     silver hair，同一句话在两个工具里得到两个发色。
+        var silverSearch = Run(ToolKind.Search, "{\"queries\":[\"银发\"],\"limit\":1}");
+        var silverResolve = Run(ToolKind.Resolve, "{\"tags\":[\"银发\"]}");
+        var silverScan = Run(ToolKind.Scan, "{\"texts\":[\"银发少女\"]}");
+        Harness.True("search 银发 → silver hair",
+                     silverSearch.Text.Contains("tag=silver hair", StringComparison.Ordinal));
+        Harness.True("resolve 银发 → silver hair",
+                     silverResolve.Text.Contains("tag=silver hair", StringComparison.Ordinal));
+        Harness.True("scan 银发 → silver hair",
+                     silverScan.Text.Contains("tag=silver hair", StringComparison.Ordinal));
+        Harness.True("三处都不再给 grey hair（灰发才是它）",
+                     !silverSearch.Text.Contains("tag=grey hair", StringComparison.Ordinal) &&
+                     !silverResolve.Text.Contains("tag=grey hair", StringComparison.Ordinal) &&
+                     !silverScan.Text.Contains("tag=grey hair", StringComparison.Ordinal));
+
+        // (2) 控制词：`explicit` / `score_8` 在合并表里根本没有行，但它们在 Anima
+        //     的提示词里是完全合法的头部词；说 NOT FOUND 会让模型把它们删掉。
+        var control = Run(ToolKind.Resolve,
+                          "{\"tags\":[\"explicit\",\"score_8\",\"best quality\",\"masterpiece\",\"general\"]}");
+        Harness.Dump("控制词批量核对", control.Text);
+        Harness.True("explicit → status=control（词表里有、库里的行没有）",
+                     control.Text.Contains("explicit → tag=explicit | cn=- | posts=- | status=control",
+                                           StringComparison.Ordinal));
+        Harness.True("score_8 → status=control",
+                     control.Text.Contains("score_8 → tag=score_8 | cn=- | posts=- | status=control",
+                                           StringComparison.Ordinal));
+        Harness.True("masterpiece → tag=masterpiece 且 status=control（不是 unknown）",
+                     control.Text.Contains("tag=masterpiece", StringComparison.Ordinal) &&
+                     control.Text.Contains("status=control", StringComparison.Ordinal) &&
+                     !control.Text.Contains("masterpiece → tag=masterpiece | cn=杰作 | posts=0 | status=unknown",
+                                            StringComparison.Ordinal));
+        Harness.True("Danbooru 的 general 仍是控制词，并说明 Anima 写 safe",
+                     control.Text.Contains("general → tag=general", StringComparison.Ordinal) &&
+                     control.Text.Contains("Anima prompts use \"safe\"", StringComparison.Ordinal));
+
+        // (3) 精确同名不吃"无引用"惩罚：否则 masterpiece 会输给
+        //     `world masterpiece theater` 这种角色/作品标签。
+        var mp = Run(ToolKind.Search, "{\"queries\":[\"masterpiece\"],\"limit\":1}");
+        Harness.True("search masterpiece 第一行就是它自己",
+                     mp.Text.Contains("1. tag=masterpiece", StringComparison.Ordinal));
+
+        // (4) 拆词兜底只留"general + Anima 常用"：`rain night` 以前给出
+        //     whisperain (arknights) 这类角色，现在连冷门 Danbooru 标签也不给。
+        var split = Run(ToolKind.Search, "{\"queries\":[\"rain night\"],\"limit\":5}");
+        Harness.Dump("拆词兜底结果", split.Text);
+        var badRows = split.Text.Split('\n')
+            .Where(l => l.Contains("tag=", StringComparison.Ordinal))
+            .Count(l =>
+            {
+                var a = l.IndexOf("tag=", StringComparison.Ordinal) + 4;
+                var b = l.IndexOf(" |", a, StringComparison.Ordinal);
+                return b > a && l[a..b].Contains('(', StringComparison.Ordinal);
+            });
+        Harness.Eq("拆词结果里没有带括号的角色/作品标签", badRows, 0);
+        Harness.True("拆词结果里不再出现 arknights 角色",
+                     !split.Text.Contains("arknights", StringComparison.OrdinalIgnoreCase));
+        Harness.True("拆词结果只留 status=anima 的 general 标签",
+                     !split.Text.Contains("status=valid", StringComparison.Ordinal) &&
+                     !split.Text.Contains("status=unknown", StringComparison.Ordinal));
+        Harness.True("拆词结果里 rain / night 都在",
+                     split.Text.Contains("tag=night", StringComparison.Ordinal));
+
+        // (4b) 中文整句走"按词库切分"而不是拆词：湿漉漉的街道 → wet floor + street
+        var phrase = Run(ToolKind.Search, "{\"queries\":[\"湿漉漉的街道\"],\"limit\":5}");
+        Harness.Dump("中文整句搜索", phrase.Text);
+        Harness.True("湿漉漉的街道能给出 street",
+                     phrase.Text.Contains("tag=street", StringComparison.Ordinal));
+        Harness.True("并说明是按概念切分出来的（phrase fallback）",
+                     phrase.Text.Contains("splitting the phrase", StringComparison.Ordinal));
+
+        // (4c) 复合词：雨夜 → rain + night（scan），夜景 → night（resolve/scan）
+        var night = Run(ToolKind.Scan, "{\"texts\":[\"少女在雨夜奔跑\"]}");
+        Harness.True("雨夜同时给出 rain 与 night",
+                     night.Text.Contains("tag=rain", StringComparison.Ordinal) &&
+                     night.Text.Contains("tag=night", StringComparison.Ordinal));
+        var nightView = Run(ToolKind.Resolve, "{\"tags\":[\"夜景\"]}");
+        Harness.True("夜景 → night", nightView.Text.Contains("tag=night", StringComparison.Ordinal));
+
+        // (5) 12 条查询 × 默认 limit 不能把后几条查询整段吞掉（60 行额度要均分）。
+        var many = Run(ToolKind.Search,
+                       "{\"queries\":[" + string.Join(",", Enumerable.Range(0, 12)
+                           .Select(i => "\"zzqq" + i + "\"")) + "]}");
+        Harness.Eq("12 条查询全部有标题（一条都不丢）", CountOf(many.Text, "query "), 12);
+
+        // (6) 超过上限要说明丢了几条，而不是静默截断；说明放在第一行。
+        var over = Run(ToolKind.Resolve,
+                       "{\"tags\":[" + string.Join(",", Enumerable.Range(0, 45)
+                           .Select(i => "\"zztt" + i + "\"")) + "]}");
+        Harness.True("超过 40 条会写明丢了几条",
+                     over.Text.Contains("skipped", StringComparison.Ordinal) &&
+                     over.Text.Contains("cap 40", StringComparison.Ordinal));
+
+        var overSearch = Run(ToolKind.Search,
+                             "{\"queries\":[" + string.Join(",", Enumerable.Range(0, 14)
+                                 .Select(i => "\"zzhh" + i + "\"")) + "]}");
+        Harness.True("search 超 12 条的说明在**第一行**（调用方只看第一行）",
+                     overSearch.Text.StartsWith("note: only 12 of 14", StringComparison.Ordinal));
+
+        // (7) scan 必须在标题行报告没匹配上的片段。
+        var unmatched = Run(ToolKind.Scan, "{\"texts\":[\"霓虹街道，雨夜\"]}");
+        Harness.Dump("未匹配片段", unmatched.Text);
+        Harness.True("scan 标题行里有 unmatched",
+                     unmatched.Text.Contains("tag(s); unmatched:", StringComparison.Ordinal));
+
+        // (8) 同一个标签 search 与 resolve 的帖数必须一致（以前 silver hair 一处 0、
+        //     一处 336,802：search 读合并表、resolve 回落到 Anima 索引）。
+        var bloomSearch = Run(ToolKind.Search, "{\"queries\":[\"white dress\"],\"limit\":1}");
+        var bloomResolve = Run(ToolKind.Resolve, "{\"tags\":[\"white dress\"]}");
+        static string PostsOf(string text, string tag)
+        {
+            var i = text.IndexOf("tag=" + tag + " |", StringComparison.Ordinal);
+            if (i < 0) return "";
+            var p = text.IndexOf(" | posts=", i, StringComparison.Ordinal);
+            if (p < 0) return "";
+            var s = p + " | posts=".Length;
+            var e = text.IndexOf(" |", s, StringComparison.Ordinal);
+            return e < 0 ? text[s..].Trim() : text[s..e];
+        }
+        Harness.Eq("search 与 resolve 的帖数一致", PostsOf(bloomSearch.Text, "white dress"),
+                   PostsOf(bloomResolve.Text, "white dress"));
+
         // ---- 摘要前缀是 Core 与回归共用的契约 ----
         Harness.Section("7. 工具摘要前缀（回归靠它数「执行了几次」，新增工具必须同步）");
 

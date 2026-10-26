@@ -458,8 +458,42 @@ public sealed class VocabDb
             }
             else pos++;
         }
+
+        // 复合词补充：词库的中文键是"整名"粒度（有 `雨`、有 `夜晚`），而人写的是
+        // `雨夜`——DP 只能给一个标签，于是 `夜` 就丢了。实测「银发红瞳的少女，站在
+        // 雨夜的霓虹街道上」只出 rain + street，夜与霓虹全没了，调用方还以为已覆盖完整。
+        //
+        // 这一层是一张小表，不是分词器：**一个复合词展开成多个标签**，DP 做不到
+        // （每段只挑一个），所以放在切分之后补。只收"确实存在且常用"的标签，
+        // 表里不存在的一律不写（`ScanHit` 的 Status 会如实报 unknown）。
+        foreach (var (phrase, tags) in ScanCompounds)
+        {
+            if (!text.Contains(phrase, StringComparison.Ordinal)) continue;
+            foreach (var t in tags)
+            {
+                if (outp.Any(h => string.Equals(h.Tag, t, StringComparison.OrdinalIgnoreCase))) continue;
+                outp.Add(new ScanHit(t, Status(t), phrase));
+            }
+        }
+
         return outp;
     }
+
+    /// <summary>
+    /// 复合词 → 多个标签。**只放 DP 表达不了的那一类**（一个词对应两个概念），
+    /// 单概念的同义词走 seed，不要加到这里。
+    ///
+    /// 目标标签全部实测存在：`rain` / `night` / `scenery` / `neon lights` / `street`
+    /// / `wet floor`。加词前先确认标签在库里，否则就是教调用方写一个不存在的标签。
+    /// </summary>
+    private static readonly (string Phrase, string[] Tags)[] ScanCompounds =
+    {
+        ("雨夜", new[] { "rain", "night" }),
+        ("夜景", new[] { "night", "scenery" }),
+        ("霓虹街道", new[] { "neon lights", "street" }),
+        ("霓虹", new[] { "neon lights" }),
+        ("湿漉漉", new[] { "wet floor" }),
+    };
 
     // ---------------- 排序 ----------------
 
@@ -653,7 +687,12 @@ public sealed class VocabDb
             // best 里标了 deprecated、同时 in_anima=1 的标签——不判 InAnima 就惩罚，
             // 会把它们压到 `uniform vest` 这种前缀匹配后面，于是"校验说没问题、
             // 搜索却把它排在别人后面"。
-            if (!inAnima && (deprecated || posts == 0)) score += 10;
+            //
+            // **精确命中（score 0）不吃这条惩罚。** `masterpiece` / `safe` 这类控制词
+            // 在合并表里 post_count=0，一加 10 分就排到 `world masterpiece theater`、
+            // `safety pin` 这种角色/道具标签后面——模型于是以为"库里没有 masterpiece"，
+            // 转而去信那个角色名。名字完全一致就永远是第一位，热度写不写由 status 说。
+            if (score > 0 && !inAnima && (deprecated || posts == 0)) score += 10;
             hits.Add((score, new SearchHit(tag, cn, category, posts, inAnima, deprecated)));
         }
 

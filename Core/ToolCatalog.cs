@@ -82,11 +82,17 @@ public static class ToolCatalog
         "Tags are EXACT strings: `blush` and `blushing` are different things and the " +
         "second one does not exist, so never name a tag from memory - copy it out of the " +
         "result. Each row reads `N. tag=<exact tag name> | cn=<meaning> | posts=<usage> | " +
-        "status=<anima|valid|retired|unknown>`; the tag name is the part between `tag=` and " +
-        "the next ` | ` (status=retired means deprecated, status=unknown means no usage). " +
+        "status=<anima|valid|retired|unknown|control>`; the tag name is the part between " +
+        "`tag=` and the next ` | `. status=retired means deprecated, status=unknown means the " +
+        "database has no usage count, status=control means it is a control word (quality / " +
+        "safety / count) that is valid to write without any usage count. The query header " +
+        "warns when some rows are character/series/artist names rather than scene tags - " +
+        "those rows come last and must not be used unless the image really is that character. " +
         "An empty result means this database has no such tag - try fewer or more general " +
-        "words, or the Chinese equivalent. The query is matched against tag names AND " +
-        "their Chinese meanings, so English or Chinese both work.",
+        "words, or the Chinese equivalent. A Chinese phrase like \"湿漉漉的街道\" is also " +
+        "split into known concepts, which is usually better than word-by-word splitting. " +
+        "The query is matched against tag names AND their Chinese meanings, so English or " +
+        "Chinese both work.",
         new JsonObject
         {
             ["type"] = "object",
@@ -125,10 +131,13 @@ public static class ToolCatalog
         "canonical form, how many posts use it, and what does it mean in Chinese. One line " +
         "per input, e.g. `2. 弓 → tag=bow (weapon) | cn=弓（武器） | posts=12,345 | " +
         "status=anima`. `NOT FOUND` means that exact spelling is not a tag, so do not use " +
-        "it as one - say the concept in prose or search for a different name. Input may be " +
-        "an English tag (`white_dress` and `white dress` are both accepted) or a Chinese " +
-        "meaning. Use this to verify tags you already have; use " + SearchName + " to " +
-        "explore.",
+        "it as one - say the concept in prose or search for a different name. " +
+        "`status=control` marks control words (masterpiece, best quality, score_7, safe, " +
+        "explicit, 1girl...) that are valid to write even though the database has no usage " +
+        "count for them; do not delete them just because posts says 0 or -. Input may be an " +
+        "English tag (`white_dress` and `white dress` are " +
+        "both accepted) or a Chinese meaning. Use this to verify tags you already have; use " +
+        SearchName + " to explore.",
         new JsonObject
         {
             ["type"] = "object",
@@ -159,8 +168,10 @@ public static class ToolCatalog
         "Convert up to 8 Chinese descriptions into the tags the database recognizes, " +
         "without calling a model. Useful for turning an image description into a tag list; " +
         "pass one description per entry. It only recognizes concepts that exist in the " +
-        "database; anything it cannot match is simply omitted from the result, so an empty " +
-        "result means \"none of these words are tags\", not \"the input was bad\". " +
+        "database; anything it cannot match is omitted from the tag list and reported on the " +
+        "`text i/n:` header as `unmatched: ...` - read that, because those words have no tag " +
+        "and must be written as prose if they matter (a short tag list with an unmatched " +
+        "part means the description is only partly covered, not \"the input was bad\"). " +
         "Duplicate tags are collapsed - one line per tag.",
         new JsonObject
         {
